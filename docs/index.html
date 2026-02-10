@@ -318,11 +318,12 @@
     <p>Ključno je kreirati dobre feature-e. Pored sirovih prognoza, dodajem:</p>
 
     <ul>
-        <li>Lag features - prethodne opservacije (temperatura prije 1h, 6h, 24h)</li>
-        <li>Ciklične varijable - sat u danu i dan u godini kao sin/cos funkcije</li>
-        <li>BURA flag - binarna varijabla koja označava da li je trenutno BURA</li>
-        <li>Sezonski faktori - zima/proleće/ljeto/jesen</li>
-        <li>Ensemble - kombinirane prognoze iz više modela</li>
+        <li>Ensemble statistike — prosjek, standardna devijacija, raspon i medijana prognoza sva 4 modela</li>
+        <li>Devijacije — koliko svaki model odstupa od ensemble prosjeka</li>
+        <li>Ciklične varijable — sat u danu i dan u godini kao sin/cos funkcije</li>
+        <li>BURA detekcija — flag iz svakog modela + agreement (koliko modela detektuje buru)</li>
+        <li>Sezonski faktori — zima/proljeće/ljeto/jesen</li>
+        <li>Cross-parameter interakcije — razlika temp/dew point, odnos vjetra i pritiska</li>
     </ul>
 
     <p>Loss funkcija koju minimiziram je također Mean Absolute Error:</p>
@@ -330,6 +331,100 @@
     <img src="https://latex.codecogs.com/svg.image?L=\frac{1}{n}\sum_{i=1}^{n}|f(x_i)-y_i|" alt="Loss function">
 
     <p>Cilj je spustiti MAE ispod 1.0°C. To bi bilo poboljšanje od oko 30-40% u odnosu na najbolji globalni model.</p>
+
+    <h2>Kako XGBoost funkcioniše</h2>
+
+    <p>XGBoost (eXtreme Gradient Boosting) je algoritam mašinskog učenja baziran na ansamblu stabala odlučivanja. Za razliku od klasičnog random foresta koji trenira stabla nezavisno, XGBoost ih gradi <em>sekvencijalno</em> — svako novo stablo pokušava ispraviti greške prethodnih.</p>
+
+    <h3>Osnovna ideja: aditivno treniranje</h3>
+
+    <p>Model se gradi iterativno. Konačna predikcija je suma predikcija svih stabala:</p>
+
+    <img src="https://latex.codecogs.com/svg.image?\hat{y}_i=\sum_{k=1}^{K}f_k(x_i),\quad%20f_k\in\mathcal{F}" alt="XGBoost prediction formula" style="margin: 20px auto; display: block;">
+
+    <p>gdje je <em>K</em> broj stabala, <em>f<sub>k</sub></em> je predikcija k-tog stabla, a <em>F</em> je prostor svih mogućih stabala odlučivanja (CART stabla).</p>
+
+    <p>U svakoj iteraciji <em>t</em>, dodajemo novo stablo <em>f<sub>t</sub></em> koje minimizira grešku. Predikcija nakon <em>t</em> koraka:</p>
+
+    <img src="https://latex.codecogs.com/svg.image?\hat{y}_i^{(t)}=\hat{y}_i^{(t-1)}+\eta\cdot%20f_t(x_i)" alt="Additive training" style="margin: 20px auto; display: block;">
+
+    <p>gdje je η (eta) <strong>learning rate</strong> — hiperparametar koji kontroliše koliko jako svako novo stablo utiče na konačni rezultat. Manji η znači sporije učenje ali bolju generalizaciju.</p>
+
+    <h3>Objektivna funkcija</h3>
+
+    <p>XGBoost minimizira regularizovanu objektivnu funkciju:</p>
+
+    <img src="https://latex.codecogs.com/svg.image?\mathcal{L}=\sum_{i=1}^{n}\ell(\hat{y}_i,y_i)+\sum_{k=1}^{K}\Omega(f_k)" alt="Objective function" style="margin: 20px auto; display: block;">
+
+    <p>Prvi dio je <strong>loss funkcija</strong> (u našem slučaju MAE), a drugi dio je <strong>regularizacija</strong> koja penalizuje kompleksnost stabala:</p>
+
+    <img src="https://latex.codecogs.com/svg.image?\Omega(f)=\gamma%20T+\frac{1}{2}\lambda\sum_{j=1}^{T}w_j^2+\alpha\sum_{j=1}^{T}|w_j|" alt="Regularization term" style="margin: 20px auto; display: block;">
+
+    <p>gdje je <em>T</em> broj listova u stablu, <em>w<sub>j</sub></em> su težine (vrijednosti) u listovima, γ je penalizacija za broj listova, λ je L2 regularizacija, a α je L1 regularizacija. Ova regularizacija sprečava overfitting i razlikuje XGBoost od klasičnog gradient boostinga.</p>
+
+    <h3>Aproksimacija drugog reda</h3>
+
+    <p>Ključna inovacija XGBoost-a je korištenje Taylor ekspanzije drugog reda za loss funkciju. U koraku <em>t</em>:</p>
+
+    <img src="https://latex.codecogs.com/svg.image?\mathcal{L}^{(t)}\approx\sum_{i=1}^{n}\left[g_i%20f_t(x_i)+\frac{1}{2}h_i%20f_t^2(x_i)\right]+\Omega(f_t)" alt="Second order approximation" style="margin: 20px auto; display: block;">
+
+    <p>gdje su:</p>
+
+    <img src="https://latex.codecogs.com/svg.image?g_i=\frac{\partial\ell(\hat{y}_i^{(t-1)},y_i)}{\partial\hat{y}_i^{(t-1)}},\quad%20h_i=\frac{\partial^2\ell(\hat{y}_i^{(t-1)},y_i)}{\partial(\hat{y}_i^{(t-1)})^2}" alt="Gradients" style="margin: 20px auto; display: block;">
+
+    <p><em>g<sub>i</sub></em> je prvi izvod (gradijent), a <em>h<sub>i</sub></em> drugi izvod (hesijan) loss funkcije. Ovo je ono što daje "Gradient" u imenu — svako novo stablo se uklapa na gradijente grešaka prethodnih stabala.</p>
+
+    <h3>Optimalna težina listova</h3>
+
+    <p>Za dato stablo sa strukturom <em>q</em>, optimalna težina u svakom listu <em>j</em> je:</p>
+
+    <img src="https://latex.codecogs.com/svg.image?w_j^*=-\frac{\sum_{i\in%20I_j}g_i}{\sum_{i\in%20I_j}h_i+\lambda}" alt="Optimal leaf weight" style="margin: 20px auto; display: block;">
+
+    <p>a odgovarajuća optimalna vrijednost loss funkcije:</p>
+
+    <img src="https://latex.codecogs.com/svg.image?\mathcal{L}^*=-\frac{1}{2}\sum_{j=1}^{T}\frac{(\sum_{i\in%20I_j}g_i)^2}{\sum_{i\in%20I_j}h_i+\lambda}+\gamma%20T" alt="Optimal loss" style="margin: 20px auto; display: block;">
+
+    <p>gdje je <em>I<sub>j</sub></em> skup podataka koji pripada listu <em>j</em>.</p>
+
+    <h3>Kako se stablo dijeli (Split Gain)</h3>
+
+    <p>Prilikom gradnje svakog stabla, XGBoost bira optimalni split evaluirajući <strong>gain</strong> za svako moguće dijeljenje:</p>
+
+    <img src="https://latex.codecogs.com/svg.image?Gain=\frac{1}{2}\left[\frac{(\sum_{i\in%20I_L}g_i)^2}{\sum_{i\in%20I_L}h_i+\lambda}+\frac{(\sum_{i\in%20I_R}g_i)^2}{\sum_{i\in%20I_R}h_i+\lambda}-\frac{(\sum_{i\in%20I}g_i)^2}{\sum_{i\in%20I}h_i+\lambda}\right]-\gamma" alt="Split gain formula" style="margin: 20px auto; display: block;">
+
+    <p>Tri člana su: score lijevog djeteta + score desnog djeteta − score bez dijeljenja. Oduzimamo γ kao penalizaciju za dodavanje novog lista. Split se pravi samo ako je gain pozitivan.</p>
+
+    <h3>Naša konfiguracija</h3>
+
+    <p>Za korekciju vremenskih prognoza koristim sljedeće hiperparametre:</p>
+
+    <table>
+        <tr><th>Parametar</th><th>Vrijednost</th><th>Značenje</th></tr>
+        <tr><td><code>n_estimators</code></td><td>800</td><td>Maksimalan broj stabala (sa early stopping)</td></tr>
+        <tr><td><code>max_depth</code></td><td>6</td><td>Maksimalna dubina svakog stabla</td></tr>
+        <tr><td><code>learning_rate</code> (η)</td><td>0.05</td><td>Koliko jako svako novo stablo utiče</td></tr>
+        <tr><td><code>subsample</code></td><td>0.8</td><td>Procenat podataka korišten za svako stablo</td></tr>
+        <tr><td><code>colsample_bytree</code></td><td>0.7</td><td>Procenat feature-a korišten za svako stablo</td></tr>
+        <tr><td><code>reg_alpha</code> (α)</td><td>0.1</td><td>L1 regularizacija (LASSO)</td></tr>
+        <tr><td><code>reg_lambda</code> (λ)</td><td>1.0</td><td>L2 regularizacija (Ridge)</td></tr>
+        <tr><td><code>min_child_weight</code></td><td>5</td><td>Minimalni zbroj hesijana u listu</td></tr>
+    </table>
+
+    <p>Treniram <strong>poseban model za svaki parametar</strong> (temperatura, pritisak, vlažnost, vjetar, tačka rose, udari vjetra), koristeći prognoze sva 4 modela kao input. Na validacionom setu (juli 2025 — februar 2026), rezultati su:</p>
+
+    <table>
+        <tr><th>Parametar</th><th>XGBoost MAE</th><th>Najbolji model MAE</th><th>Poboljšanje</th></tr>
+        <tr><td>Temperatura</td><td>0.98°C</td><td>1.32°C (MétéoFrance)</td><td>+26%</td></tr>
+        <tr><td>Tačka rose</td><td>1.37°C</td><td>2.34°C (MétéoFrance)</td><td>+42%</td></tr>
+        <tr><td>Vlažnost</td><td>6.87%</td><td>10.82% (GFS)</td><td>+37%</td></tr>
+        <tr><td>Brzina vjetra</td><td>0.45 m/s</td><td>1.16 m/s (ICON)</td><td>+62%</td></tr>
+        <tr><td>Udari vjetra</td><td>0.59 m/s</td><td>1.75 m/s (GFS)</td><td>+66%</td></tr>
+        <tr><td>Pritisak</td><td>0.32 hPa</td><td>0.92 hPa (GFS)</td><td>+65%</td></tr>
+    </table>
+
+    <div class="note">
+        <strong>Ključna razlika od prethodnog modela:</strong> Ovaj model NE koristi lag feature-e opservacija (temperatura prije 1h, 6h...) za buduće prognoze — jer u realnom vremenu nemamo buduća mjerenja. Umjesto toga, oslanja se na ensemble statistike (prosjek, standardna devijacija, raspon između modela), ciklične vremenske varijable, i cross-parameter interakcije (npr. razlika temperature i tačke rose za detekciju magle).
+    </div>
 
     <h2>Ukupno rangiranje</h2>
 
@@ -355,9 +450,17 @@
 
     <h2>Šta dalje</h2>
 
-    <p>Sledeći korak je finalizirati i testirati ML model. Takođe planiram da implementiram real-time pipeline koji će automatski preuzimati nove prognoze, prolaziti ih kroz model, i servirati poboljšane prognoze.</p>
+    <p>Production pipeline je <strong>završen</strong>. Sistem sada automatski:</p>
 
-    <p>Ako projekat bude uspio (odnosno, ako dobijem MAE ispod 1.0°C na test setu), planiram napraviti jednostavan web interfejs gdje ljudi mogu vidjeti i obične prognoze i moje ML-korigovane prognoze uporedo.</p>
+    <ol>
+        <li>Preuzima live prognoze sa Open-Meteo API za sva 4 modela (ARPÈGE, GFS, ICON, Météo-France)</li>
+        <li>Primjenjuje trenirane XGBoost modele na svaki parametar (temperatura, vlažnost, vjetar, pritisak, tačka rose)</li>
+        <li>Generiše korigovanu +48h prognozu za Budvu u CSV i JSON formatu</li>
+    </ol>
+
+    <p>Padavine i oblačnost se prikazuju kao prosjek svih modela (ensemble mean), jer za te parametre nemamo pouzdane satne opservacije za trening. Ostali parametri prolaze kroz XGBoost korekciju sa mjerljivim poboljšanjem od 26-66%.</p>
+
+    <p>Sljedeći korak je automatizacija — cron job koji svakih 6 sati generiše novu prognozu i objavljuje je na web interfejsu.</p>
 
     <p>Ako imate pitanja ili prijedloge, slobodno mi pišite na <a href="mailto:ivanovicmatija2007@gmail.com">ivanovicmatija2007@gmail.com</a>.</p>
 </body>
