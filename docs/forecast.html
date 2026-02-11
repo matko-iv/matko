@@ -4,6 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Budva — Korigovana 48h Prognoza – Matija Ivanović</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400;1,500&display=swap" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
     <style>
@@ -14,7 +17,8 @@
         }
 
         body {
-            font-family: "SF Pro Display", "SF Pro Text", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+            font-family: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+            font-weight: 500;
             font-size: 18px;
             line-height: 1.6;
             color: #24292e;
@@ -120,7 +124,10 @@
 
         /* ─── Daily Cards ─── */
         .daily-grid {
-            display: none;
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 16px;
+            margin: 24px 0 32px;
         }
 
         .day-card {
@@ -361,6 +368,7 @@
             .day-card .temp-range { font-size: 22px; }
             .chart-container { height: 280px; }
             .metrics-bar { grid-template-columns: repeat(2, 1fr); }
+            .daily-grid { grid-template-columns: 1fr; }
         }
     </style>
 </head>
@@ -377,7 +385,6 @@
 
     <h1>Budva — Korigovana Prognoza</h1>
     <p>Naredna 48 sata · XGBoost korekcija multi-model ensemble-a</p>
-    <span class="method-badge">6 modela × XGBoost + istorijski bias</span>
 
     <div class="generated-time" id="genTime"></div>
 
@@ -408,6 +415,8 @@ const SVG_ICONS = {
     heavy_rain: `<svg viewBox="0 0 64 64" fill="none" stroke-width="2.5" stroke-linecap="round"><path d="M14 32c0-6.6 5.4-12 12-12 5.5 0 10 3.7 11.4 8.8C43.2 29.3 48 34.4 48 40.5 48 46 43.5 50 38 50H18c-5 0-9-4-9-9s4-9 9-9h.3" stroke="#475569" fill="#475569" opacity="0.12"/><line x1="15" y1="53" x2="11" y2="63" stroke="#2563eb" stroke-width="3"/><line x1="25" y1="53" x2="21" y2="63" stroke="#2563eb" stroke-width="3"/><line x1="35" y1="53" x2="31" y2="63" stroke="#2563eb" stroke-width="3"/><line x1="45" y1="53" x2="41" y2="63" stroke="#2563eb" stroke-width="3"/></svg>`,
     snow: `<svg viewBox="0 0 64 64" fill="none" stroke-width="2.5" stroke-linecap="round"><path d="M16 34c0-6.6 5.4-12 12-12 5.5 0 10 3.7 11.4 8.8C45.2 31.3 50 36.4 50 42.5 50 48 45.5 52 40 52H20c-5 0-9-4-9-9s4-9 9-9h.3" stroke="#64748b" fill="#64748b" opacity="0.08"/><circle cx="20" cy="58" r="2" fill="#93c5fd"/><circle cx="32" cy="60" r="2" fill="#93c5fd"/><circle cx="40" cy="56" r="2" fill="#93c5fd"/></svg>`,
     thunderstorm: `<svg viewBox="0 0 64 64" fill="none" stroke-width="2.5" stroke-linecap="round"><path d="M14 30c0-6.6 5.4-12 12-12 5.5 0 10 3.7 11.4 8.8C43.2 27.3 48 32.4 48 38.5 48 44 43.5 48 38 48H18c-5 0-9-4-9-9s4-9 9-9h.3" stroke="#475569" fill="#475569" opacity="0.12"/><polygon points="30,48 24,58 29,58 26,64 36,54 31,54 34,48" fill="#f59e0b" stroke="#f59e0b" stroke-width="1"/></svg>`,
+    shower_day: `<svg viewBox="0 0 64 64" fill="none" stroke-width="2.5" stroke-linecap="round"><circle cx="20" cy="18" r="7" stroke="#f59e0b"/><line x1="20" y1="5" x2="20" y2="9" stroke="#f59e0b"/><line x1="9" y1="18" x2="13" y2="18" stroke="#f59e0b"/><line x1="12" y1="9" x2="14.5" y2="11.5" stroke="#f59e0b"/><path d="M18 36c0-5.5 4.5-10 10-10 4.8 0 8.8 3.2 10 7.6C43 34 47 38.5 47 44c0 5-4 9-9 9H21c-4 0-7.5-3.5-7.5-7.5S17 38 21 38" stroke="#64748b" fill="#64748b" opacity="0.08"/><line x1="22" y1="56" x2="20" y2="62" stroke="#3b82f6"/><line x1="32" y1="56" x2="30" y2="62" stroke="#3b82f6"/></svg>`,
+    shower_night: `<svg viewBox="0 0 64 64" fill="none" stroke-width="2.5" stroke-linecap="round"><path d="M18 6c-4.5 1-7.5 4.5-7.5 9.5 0 5.5 4.5 9.5 9.5 9.5 2.8 0 5.3-1.2 7-3.2" stroke="#94a3b8" fill="#94a3b8" opacity="0.1"/><path d="M18 36c0-5.5 4.5-10 10-10 4.8 0 8.8 3.2 10 7.6C43 34 47 38.5 47 44c0 5-4 9-9 9H21c-4 0-7.5-3.5-7.5-7.5S17 38 21 38" stroke="#64748b" fill="#64748b" opacity="0.08"/><line x1="22" y1="56" x2="20" y2="62" stroke="#3b82f6"/><line x1="32" y1="56" x2="30" y2="62" stroke="#3b82f6"/></svg>`,
 };
 
 // Map WMO codes → icon key + support night variants
@@ -422,7 +431,9 @@ function getWeatherSvg(code, hour) {
         51: 'light_rain', 53: 'rain', 55: 'rain',
         61: 'light_rain', 63: 'rain', 65: 'heavy_rain',
         71: 'snow', 73: 'snow', 75: 'snow',
-        80: 'light_rain', 81: 'rain', 82: 'heavy_rain',
+        80: isNight ? 'shower_night' : 'shower_day',
+        81: isNight ? 'shower_night' : 'shower_day',
+        82: 'heavy_rain',
         95: 'thunderstorm', 96: 'thunderstorm', 99: 'thunderstorm'
     };
     const key = map[code] || (isNight ? 'clear_night' : 'clear_day');
@@ -476,11 +487,35 @@ function render(data) {
 
     let html = '';
 
-    // ─── Daily cards (hidden via CSS but still generated for data) ───
+    // ─── Daily summary cards ───
     html += '<div class="daily-grid">';
     data.daily_summary.forEach(d => {
         const dayName = DAY_NAMES_SR[d.day_name] || d.day_name;
-        html += `<div class="day-card"><div class="day-name">${dayName} ${formatDate(d.date)}</div></div>`;
+        const icon = SVG_ICONS[d.weather_icon] || SVG_ICONS.cloudy;
+        html += `
+        <div class="day-card">
+            <div class="day-header">
+                <div>
+                    <div class="day-name">${dayName}</div>
+                    <div class="day-date">${formatDate(d.date)}</div>
+                </div>
+            </div>
+            <div style="text-align:center;margin:8px 0">
+                <div style="width:56px;height:56px;margin:0 auto">${icon}</div>
+                <div class="weather-desc">${d.weather_desc}</div>
+            </div>
+            <div class="temp-range">
+                <span class="temp-low">${Math.round(d.temp_min)}°</span>
+                <span style="color:#d1d5db">—</span>
+                <span class="temp-high">${Math.round(d.temp_max)}°</span>
+            </div>
+            <div class="day-details">
+                <div class="detail-item"><span class="detail-icon">💨</span><span class="detail-val">${d.wind_max} m/s</span></div>
+                <div class="detail-item"><span class="detail-icon">🌧️</span><span class="detail-val">${d.precip_total} mm</span></div>
+                <div class="detail-item"><span class="detail-icon">💧</span><span class="detail-val">${d.humidity_avg}%</span></div>
+                <div class="detail-item"><span class="detail-icon">🌡️</span><span class="detail-val">${d.pressure_avg} hPa</span></div>
+            </div>
+        </div>`;
     });
     html += '</div>';
 
@@ -501,47 +536,6 @@ function render(data) {
         </div>`;
     });
     html += '</div></div>';
-
-    // ─── Accuracy & Metrics ───
-    html += '<h2>Tačnost modela</h2>';
-
-    // Calculate overall accuracy
-    const m = data.training_metrics;
-    const keyParams = ['temperature_2m', 'wind_speed_10m', 'pressure_msl', 'relative_humidity_2m', 'precipitation', 'cloud_cover'];
-    let accuracies = [];
-    keyParams.forEach(k => {
-        if (m[k]) accuracies.push(maeToAccuracy(k, m[k].mae));
-    });
-    const overallAccuracy = accuracies.length > 0 ? (accuracies.reduce((a,b)=>a+b,0) / accuracies.length) : 0;
-
-    html += `
-    <div style="text-align:center;margin-bottom:24px;">
-        <div style="font-size:56px;font-weight:800;color:#24292e;line-height:1;">${overallAccuracy.toFixed(1)}%</div>
-        <div style="font-size:15px;color:#586069;margin-top:4px;">prosječna tačnost na validacionom setu</div>
-        <div style="font-size:13px;color:#959da5;margin-top:2px;">izračunato iz MAE-a relativno na tipičan raspon za svaki parametar</div>
-    </div>`;
-
-    html += '<div class="metrics-bar">';
-    const metricsDisplay = [
-        {key:'temperature_2m', label:'Temperatura', unit:'°C', color:'#d73a49'},
-        {key:'wind_speed_10m', label:'Vjetar', unit:'m/s', color:'#0366d6'},
-        {key:'pressure_msl',   label:'Pritisak', unit:'hPa', color:'#28a745'},
-        {key:'relative_humidity_2m', label:'Vlažnost', unit:'%', color:'#6f42c1'},
-        {key:'precipitation',  label:'Padavine', unit:'mm', color:'#0366d6'},
-        {key:'cloud_cover',    label:'Oblačnost', unit:'%', color:'#586069'},
-    ];
-    metricsDisplay.forEach(md => {
-        if (!m[md.key]) return;
-        const acc = maeToAccuracy(md.key, m[md.key].mae);
-        html += `
-        <div class="metric-card">
-            <div class="metric-label">${md.label}</div>
-            <div class="metric-value" style="color:${md.color}">${acc.toFixed(1)}%</div>
-            <div style="font-size:11px;color:#959da5;margin-top:2px">MAE: ${m[md.key].mae}${md.unit}</div>
-            <div class="metric-improvement">+${m[md.key].improvement}% vs best model</div>
-        </div>`;
-    });
-    html += '</div>';
 
     // ─── Charts ───
     html += `
@@ -695,9 +689,9 @@ function drawChart(type) {
             scales: {
                 x: {
                     type: 'time',
-                    time: { unit: 'hour', displayFormats: { hour: 'HH:mm' }, tooltipFormat: 'PPpp' },
+                    time: { unit: 'hour', displayFormats: { hour: 'd.M HH:mm' }, tooltipFormat: 'PPpp' },
                     grid: { color: 'rgba(0,0,0,0.06)' },
-                    ticks: { color: '#586069', font: { size: 11 }, maxRotation: 0, autoSkip: true, maxTicksLimit: 16 }
+                    ticks: { color: '#586069', font: { size: 11 }, maxRotation: 35, autoSkip: true, maxTicksLimit: 24 }
                 },
                 y: {
                     title: { display: true, text: cfg.yTitle, color: '#586069' },

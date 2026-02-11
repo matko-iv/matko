@@ -4,6 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Tačnije Vremenske Prognoze za Budvu – Matija Ivanović</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400;1,500&display=swap" rel="stylesheet">
     <style>
         * {
             margin: 0;
@@ -12,7 +15,8 @@
         }
 
         body {
-            font-family: "SF Pro Display", "SF Pro Text", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+            font-family: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+            font-weight: 500;
             font-size: 18px;
             line-height: 1.6;
             color: #24292e;
@@ -477,6 +481,58 @@
     <p>Živim u Budvi, i kao većina ljudi ovdje, koristim vremensku prognozu svakodnevno. Turizam je ogroman dio ekonomije, i tačna prognoza direktno utiče na odluke turista, lokalnih biznisa, i pomorskog saobraćaja.</p>
 
     <p>Ali isto tako, ovo je fascinantan problem iz perspektive data science-a. Globalni modeli su nevjerovatno sofisticirani - simuliraju cijelu atmosferu koristeći fizičke jednačine. Ali oni ne mogu biti perfektni za svaku pojedinačnu lokaciju. Tu dolazi mašinsko učenje - može naučiti lokalne obrasce bez potrebe da eksplicitno modelira fiziku.</p>
+
+    <h2>Tačnost XGBoost sistema</h2>
+
+    <p>Na osnovu validacionog seta (jul 2025 — januar 2026), XGBoost korekcija postiže sljedeću tačnost u odnosu na mjerenja Weather Underground stanice:</p>
+
+    <div id="liveAccuracy">
+        <p style="color:#586069;font-size:15px;">Učitavanje podataka o tačnosti...</p>
+    </div>
+
+    <script>
+    (async () => {
+        const paths = ['forecast_data/forecast_48h.json', '../forecast_output/forecast_48h.json'];
+        let data = null;
+        for (const p of paths) {
+            try { const r = await fetch(p); if (r.ok) { data = await r.json(); break; } } catch(e) {}
+        }
+        if (!data || !data.training_metrics) {
+            document.getElementById('liveAccuracy').innerHTML =
+                '<p style="color:#586069;font-size:14px;">Podaci o tačnosti su dostupni na <a href="forecast.html">stranici za prognozu</a>.</p>';
+            return;
+        }
+        const m = data.training_metrics;
+        const ranges = {temperature_2m:35,wind_speed_10m:15,pressure_msl:40,relative_humidity_2m:100,precipitation:10,cloud_cover:100};
+        const keys = Object.keys(ranges);
+        let accs = [];
+        keys.forEach(k => { if (m[k]) accs.push(Math.max(0, Math.min(100, (1 - m[k].mae / ranges[k]) * 100))); });
+        const overall = accs.length > 0 ? accs.reduce((a,b) => a+b, 0) / accs.length : 0;
+
+        const colors = {temperature_2m:'#d73a49',wind_speed_10m:'#0366d6',pressure_msl:'#28a745',relative_humidity_2m:'#6f42c1',precipitation:'#0366d6',cloud_cover:'#586069'};
+        const labels = {temperature_2m:'Temperatura',wind_speed_10m:'Vjetar',pressure_msl:'Pritisak',relative_humidity_2m:'Vlažnost',precipitation:'Padavine',cloud_cover:'Oblačnost'};
+        const units = {temperature_2m:'°C',wind_speed_10m:'m/s',pressure_msl:'hPa',relative_humidity_2m:'%',precipitation:'mm',cloud_cover:'%'};
+
+        let cards = '';
+        keys.forEach(k => {
+            if (!m[k]) return;
+            const acc = Math.max(0, Math.min(100, (1 - m[k].mae / ranges[k]) * 100));
+            cards += '<div style="background:#f6f8fa;border:1px solid #e1e4e8;border-radius:10px;padding:16px;text-align:center">'
+                + '<div style="font-size:11px;color:#586069;text-transform:uppercase;letter-spacing:0.5px">' + labels[k] + '</div>'
+                + '<div style="font-size:22px;font-weight:700;margin:4px 0;color:' + colors[k] + '">' + acc.toFixed(1) + '%</div>'
+                + '<div style="font-size:11px;color:#959da5">MAE: ' + m[k].mae + units[k] + '</div>'
+                + '<div style="font-size:12px;color:#28a745;font-weight:500">+' + m[k].improvement + '% vs best model</div></div>';
+        });
+
+        document.getElementById('liveAccuracy').innerHTML =
+            '<div style="text-align:center;margin-bottom:24px">'
+            + '<div style="font-size:56px;font-weight:800;color:#24292e;line-height:1">' + overall.toFixed(1) + '%</div>'
+            + '<div style="font-size:15px;color:#586069;margin-top:4px">prosječna tačnost na validacionom setu</div>'
+            + '<div style="font-size:13px;color:#959da5;margin-top:2px">izračunato iz MAE relativno na tipičan raspon za svaki parametar</div></div>'
+            + '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:16px">' + cards + '</div>'
+            + '<p style="font-size:14px;color:#586069">Generisano: ' + new Date(data.generated).toLocaleDateString('sr-Latn') + ' · ' + data.models.length + ' modela</p>';
+    })();
+    </script>
 
     <h2>Šta dalje</h2>
 
