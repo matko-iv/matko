@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="sr">
 <head>
     <meta charset="UTF-8">
@@ -12,7 +12,7 @@
         }
 
         body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+            font-family: "SF Pro Display", "SF Pro Text", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
             font-size: 18px;
             line-height: 1.6;
             color: #24292e;
@@ -175,7 +175,7 @@
     <div class="site-header">
         <a href="/" class="site-name">Matija Ivanović</a>
         <nav>
-            <a href="forecast.html" style="color:#0366d6;font-weight:600;">🌤️ Live Prognoza</a>
+            <a href="forecast.html" style="color:#0366d6;font-weight:600;">Live Prognoza</a>
             <a href="#">Blog</a>
             <a href="https://github.com/" target="_blank">GitHub</a>
             <a href="mailto:ivanovicmatija2007@gmail.com">Kontakt</a>
@@ -193,13 +193,13 @@
 
     <p>Budva je savršen primjer. Smještena na crnogorskoj obali, okružena planinama, izložena <strong>buri</strong> — jakom sjeveroistočnom vjetru koji drastično mijenja lokalne uslove. Globalni modeli to ne mogu savršeno uhvatiti. Ali mogu naučiti iz svojih grešaka.</p>
 
-    <p>U ovom projektu sam uzeo <strong>3 godine satnih podataka</strong> sa meteo stanice u Budvi (24.000+ mjerenja), uporedio ih sa prognozama 5 globalnih modela, i trenirao XGBoost model koji sistematski ispravlja njihove greške. Rezultat: <strong>temperatura tačnija za 25%</strong>, <strong>vjetar za 62%</strong>, <strong>pritisak za 68%</strong> — mjereno na podacima koje model nikad nije vidio.</p>
+    <p>U ovom projektu sam uzeo <strong>3 godine satnih podataka</strong> sa meteo stanice u Budvi (24.000+ mjerenja), uporedio ih sa prognozama <strong>6 globalnih modela</strong>, i trenirao XGBoost model koji sistematski ispravlja njihove greške. Rezultat: <strong>temperatura tačnija za 25%</strong>, <strong>vjetar za 62%</strong>, <strong>pritisak za 68%</strong> — mjereno na podacima koje model nikad nije vidio.</p>
 
     <h2>Problem</h2>
 
     <p>Globalni meteorološki modeli kao što su ECMWF, GFS ili ICON pokrivaju cijelu planetu i izvrsno rade posao na velikom nivou. Međutim, lokalna geografija, blizina mora, i specifičnosti Budve (kao što je BURA - jak sjeveroistočni vjetar) stvaraju uslove koje globalni modeli ne mogu savršeno uhvatiti.</p>
 
-    <p>Uzeo sam 5 različitih globalnih modela (ECMWF IFS025, ICON Seamless, GFS Seamless, MeteoFrance i ARPEGE Europe) i uporedio njihove prognoze sa stvarnim mjerenjima sa meteo stanice u Budvi tokom posljednje 3 godine. To mi je dalo preko 24,000 satnih tačaka podataka po modelu.</p>
+    <p>Uzeo sam 6 različitih globalnih modela (ECMWF IFS025, ICON Seamless, GFS Seamless, MeteoFrance, ARPEGE Europe i ItaliaMeteo ICON2I) i uporedio njihove prognoze sa stvarnim mjerenjima sa meteo stanice u Budvi tokom posljednje 3 godine. To mi je dalo preko 24,000 satnih tačaka podataka po modelu.</p>
 
     <h2>Metodologija</h2>
 
@@ -442,6 +442,20 @@
         <strong>Ključna razlika od naivnog modela:</strong> Ovaj model NE koristi lag feature-e opservacija (temperatura prije 1h, 6h...) niti rolling error statistike — jer u realnom vremenu nemamo buduća mjerenja. Umjesto toga, oslanja se na: ensemble statistike (prosjek, std, raspon, medijana), ciklične vremenske varijable, cross-parameter interakcije (npr. razlika temp/tačke rose), i <strong>tabele istorijskog biasa</strong> — prosječna greška svakog modela za dati mjesec i sat, izračunata samo na trening podacima. Ove tabele su dostupne i u produkciji jer ne zahtijevaju buduće opservacije.
     </div>
 
+    <h2>Limitacije pristupa</h2>
+
+    <p>Važno je razumjeti šta ovaj sistem <strong>može</strong>, a šta <strong>ne može</strong>. XGBoost korekcija značajno poboljšava prosječnu tačnost — ali bez prisustva <em>tehnički novog vremenskog modela</em>, postoje fundamentalna ograničenja.</p>
+
+    <p><strong>Konvektivne padavine i mini pljuskovi.</strong> Kratkotrajne oluje, iznenadni pljuskovi i lokalne konvektivne ćelije su najteži problem. Ovi događaji se dešavaju na prostornoj skali od nekoliko kilometara i vremenskoj skali od 15-30 minuta. Globalni modeli koje koristimo (ARPÈGE ~10km, GFS ~25km, ICON ~13km, Météo-France ~10km) jednostavno nemaju dovoljnu rezoluciju da ih uhvate. XGBoost može naučiti da prepozna uslove koji favorizuju konvekciju, ali ne može predvidjeti tačnu lokaciju i tajming pljuska — jer ni input modeli to ne vide.</p>
+
+    <p><strong>Rezolucija za Crnu Goru.</strong> Budva leži na obali, sa planinama od 1000+ metara na samo nekoliko kilometara od mora. Ova izuzetna orografska kompleksnost zahtijeva rezoluciju od <2km da bi se adekvatno modelirali lokalni efekti — priobalni brize, orografsko podizanje, i pojačanja vjetra u kanjonima. Nijedan od globalnih modela koje koristimo nema takvu rezoluciju za ovo područje. Ovo važi generalno za citavu Crnu Goru, čija izrazito kompleksna topografija predstavlja poseban izazov za numeričke prognoze.</p>
+
+    <p><strong>Ensemble ≠ novi model.</strong> Naš pristup koristi ansambl postojećih modela — ali 6 modela koji svi griješe na sličan način neće magično dati tačan odgovor. Ansambl smanjuje slučajnu grešku, ali ne može kompenzovati sistematski nedostatak rezolucije. Za zaista novi kvalitet prognoze za Budvu, bio bi potreban high-resolution LAM (Limited Area Model) na ~1km gridu, poput AROME ili ICON-D2 kalibrisan za Jadransku obalu.</p>
+
+    <div class="note">
+        <strong>Ukratko:</strong> Ovaj sistem daje najbolju moguću korekciju postojećih globalnih prognoza — ali ne zamjenjuje potrebu za visoko-rezolutivnim regionalnim modelima. Najveća poboljšanja su na "glatkim" varijablama (temperatura, pritisak, vlažnost), dok padavine i lokalni vjetrovi ostaju fundamentalno limitirani ulaznom rezolucijom.
+    </div>
+
     <h2>Ukupno rangiranje</h2>
 
     <p>Na osnovu svih analiziranih parametara, evo ukupnog rangiranja modela za Budvu:</p>
@@ -469,7 +483,7 @@
     <p>Production pipeline v2 je <strong>završen i operativan</strong>. Sistem sada:</p>
 
     <ol>
-        <li>Preuzima live prognoze sa Open-Meteo API za sva 4 modela (ARPÈGE, GFS, ICON, Météo-France)</li>
+        <li>Preuzima live prognoze sa Open-Meteo API za svih <strong>6 modela</strong> (ARPÈGE, GFS, ICON, Météo-France, ECMWF IFS, ItaliaMeteo)</li>
         <li>Primjenjuje trenirane XGBoost modele na <strong>svih 9 parametara</strong> — uključujući oblačnost, padavine i solarnu radijaciju</li>
         <li>Koristi tabele istorijskog biasa (po mjesecu i satu) kao dodatne feature-e za preciznije korekcije</li>
         <li>Generiše korigovanu +48h prognozu sa interaktivnim web prikazom</li>
