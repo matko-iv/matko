@@ -126,7 +126,8 @@
             display: grid;
             grid-template-columns: repeat(3, 1fr);
             gap: 16px;
-            margin: 24px -60px 32px;
+            width: calc(100% + 120px);
+            margin: 24px 0 32px -60px;
         }
 
         .current-weather {
@@ -474,7 +475,7 @@
             .day-card .temp-range { font-size: 22px; }
             .chart-container { height: 280px; }
             .metrics-bar { grid-template-columns: repeat(2, 1fr); }
-            .daily-grid { grid-template-columns: 1fr; margin-left: 0; margin-right: 0; }
+            .daily-grid { grid-template-columns: 1fr; width: 100%; margin-left: 0; margin-right: 0; }
             .current-weather { margin-left: 0; margin-right: 0; flex-direction: column; text-align: center; }
             .current-weather .cw-details { justify-content: center; }
             .hourly-strip { margin-left: 0; margin-right: 0; }
