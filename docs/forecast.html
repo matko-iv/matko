@@ -748,7 +748,7 @@ function render(data) {
     </div>`;
 
     if (data.long_range && data.long_range.length > 0) {
-        html += '<h2>Dugorocna prognoza</h2>';
+        html += '<h2>Dugoročna prognoza</h2>';
         html += `<div class="note" style="margin-bottom:20px">
             Vremenski modeli gube preciznost sa horizontom prognoze.
             Na 3. dan greška temperature može biti 2x veća nego na 1. dan, a na 7. dan prognoza je tek indikacija generalnog trenda.
@@ -775,7 +775,7 @@ function render(data) {
                 </div>
                 <div class="lr-details">
                     ${d.wind_max != null ? '<span>' + arrow + ' ' + d.wind_max + ' m/s ' + wdText + '</span>' : ''}
-                    ${precipProb ? '<span>Kisa: ' + precipProb + '</span>' : ''}
+                    ${precipProb ? '<span>Kiša: ' + precipProb + '</span>' : ''}
                     ${d.precip_total > 0 ? '<span>' + d.precip_total + ' mm</span>' : ''}
                 </div>
             </div>`;
