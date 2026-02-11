@@ -127,8 +127,7 @@
             display: grid;
             grid-template-columns: repeat(3, 1fr);
             gap: 16px;
-            margin: 24px auto 32px;
-            max-width: 100%;
+            margin: 24px -60px 32px;
         }
 
         /* ─── Current Weather Card ─── */
@@ -137,7 +136,7 @@
             border: 1px solid #e1e4e8;
             border-radius: 12px;
             padding: 28px;
-            margin-bottom: 32px;
+            margin: 0 -60px 32px;
             display: flex;
             align-items: center;
             gap: 28px;
@@ -269,7 +268,7 @@
             border: 1px solid #e1e4e8;
             border-radius: 12px;
             padding: 20px;
-            margin-bottom: 36px;
+            margin: 0 -60px 36px;
             overflow-x: auto;
         }
 
@@ -291,18 +290,18 @@
             display: flex;
             flex-direction: column;
             align-items: center;
-            min-width: 64px;
-            padding: 10px 6px;
+            min-width: 76px;
+            padding: 12px 8px;
             border-right: 1px solid #e1e4e8;
             font-size: 13px;
         }
 
         .hourly-cell:last-child { border-right: none; }
-        .hourly-cell .h-time { color: #586069; margin-bottom: 6px; font-weight: 600; font-size: 13px; }
-        .hourly-cell .h-icon { font-size: 22px; margin-bottom: 4px; }
-        .hourly-cell .h-temp { font-weight: 700; font-size: 16px; color: #24292e; }
-        .hourly-cell .h-rain { color: #0366d6; font-size: 12px; margin-top: 4px; font-weight: 500; }
-        .hourly-cell .h-wind { color: #586069; font-size: 12px; margin-top: 2px; }
+        .hourly-cell .h-time { color: #586069; margin-bottom: 8px; font-weight: 600; font-size: 14px; }
+        .hourly-cell .h-icon { margin-bottom: 6px; }
+        .hourly-cell .h-temp { font-weight: 700; font-size: 18px; color: #24292e; }
+        .hourly-cell .h-rain { color: #0366d6; font-size: 13px; margin-top: 6px; font-weight: 500; }
+        .hourly-cell .h-wind { color: #586069; font-size: 12px; margin-top: 3px; }
 
         /* ─── Chart Tabs ─── */
         .charts-section {
@@ -426,7 +425,10 @@
             .day-card .temp-range { font-size: 22px; }
             .chart-container { height: 280px; }
             .metrics-bar { grid-template-columns: repeat(2, 1fr); }
-            .daily-grid { grid-template-columns: 1fr; }
+            .daily-grid { grid-template-columns: 1fr; margin-left: 0; margin-right: 0; }
+            .current-weather { margin-left: 0; margin-right: 0; flex-direction: column; text-align: center; }
+            .current-weather .cw-details { justify-content: center; }
+            .hourly-strip { margin-left: 0; margin-right: 0; }
         }
     </style>
 </head>
@@ -435,7 +437,7 @@
         <a href="/" class="site-name">Matija Ivanović</a>
         <nav>
             <a href="index.html" style="color:#0366d6;font-weight:600;">Analiza</a>
-            <a href="#">Blog</a>
+            <a href="https://github.com/matko-iv/blog">Blog</a>
             <a href="https://github.com/matko-iv/vrijeme" target="_blank">GitHub</a>
             <a href="mailto:ivanovicmatija2007@gmail.com">Kontakt</a>
         </nav>
@@ -667,7 +669,7 @@ function render(data) {
         html += `
         <div class="hourly-cell" ${isNow ? 'style="background:#f1f8ff;border-radius:8px"' : ''}>
             <span class="h-time">${String(h.hour).padStart(2,'0')}h</span>
-            <span class="h-icon">${weatherIcon(iconKey, 36)}</span>
+            <span class="h-icon">${weatherIcon(iconKey, 42)}</span>
             <span class="h-temp">${t}</span>
             <span class="h-rain">${rain}</span>
             <span class="h-wind">${wind ? wind + ' m/s' : ''}</span>
