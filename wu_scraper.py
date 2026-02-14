@@ -12,11 +12,11 @@ import os
 import re
 import json
 
-# Konfiguracija
 STATION_ID = "IBUDVA5"
 BASE_URL = f"https://www.wunderground.com/dashboard/pws/{STATION_ID}/table"
 OUTPUT_DIR = "wu_data"
 YEARS_BACK = 2
+START_DATE_OVERRIDE = "2020-04-01" 
 
 # Headers da izgleda kao browser
 HEADERS = {
@@ -29,7 +29,6 @@ def parse_value(text):
     """Parsira vrijednost iz teksta (npr. '52.4 °F' -> 52.4)"""
     if not text or text.strip() == '--':
         return None
-    # Izvuci broj
     match = re.search(r'([\d.]+)', text.replace(',', ''))
     if match:
         return float(match.group(1))
@@ -74,11 +73,8 @@ def scrape_day(date_str, session):
             
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # Pronađi tabelu sa podacima
-        # WU koristi Angular, pa podaci mogu biti u JSON-u ili tabeli
         rows = []
         
-        # Traži tabelu
         tables = soup.find_all('table')
         
         for table in tables:
@@ -92,7 +88,6 @@ def scrape_day(date_str, session):
                     try:
                         time_text = tds[0].get_text(strip=True)
                         
-                        # Parsiraj vrijeme
                         if 'AM' in time_text or 'PM' in time_text:
                             try:
                                 time_obj = datetime.strptime(f"{date_str} {time_text}", "%Y-%m-%d %I:%M %p")
@@ -118,7 +113,6 @@ def scrape_day(date_str, session):
                             'solar_wm2': parse_value(tds[11].get_text()) if len(tds) > 11 else None,
                         }
                         
-                        # Konvertuj u metrički sistem
                         row['temp_c'] = f_to_c(row['temp_f'])
                         row['dewpoint_c'] = f_to_c(row['dewpoint_f'])
                         row['wind_ms'] = mph_to_ms(row['wind_mph'])
@@ -134,16 +128,13 @@ def scrape_day(date_str, session):
         if rows:
             return pd.DataFrame(rows)
         else:
-            # Možda stranica koristi JavaScript - probaj izvući iz script tagova
             scripts = soup.find_all('script')
             for script in scripts:
                 if script.string and 'observations' in script.string:
-                    # Probaj parsirati JSON
                     try:
                         match = re.search(r'observations["\s:]+(\[.*?\])', script.string, re.DOTALL)
                         if match:
                             data = json.loads(match.group(1))
-                            # Parsiraj...
                             pass
                     except:
                         pass
@@ -166,18 +157,14 @@ def resample_to_hourly(df):
     df['datetime'] = pd.to_datetime(df['datetime'])
     df.set_index('datetime', inplace=True)
     
-    # Numeričke kolone za prosjek
     numeric_cols = ['temp_c', 'dewpoint_c', 'humidity_pct', 'wind_ms', 'gust_ms', 
                     'pressure_hpa', 'precip_rate_mm', 'uv', 'solar_wm2']
     
-    # Resample na sat
-    hourly = df[numeric_cols].resample('1H').mean()
+    hourly = df[numeric_cols].resample('1h').mean()
     
-    # Padavine - suma umjesto prosjeka za akumulaciju
-    hourly['precip_accum_mm'] = df['precip_accum_mm'].resample('1H').max()
+    hourly['precip_accum_mm'] = df['precip_accum_mm'].resample('1h').max()
     
-    # Smjer vjetra - uzmi modus ili prvi
-    hourly['wind_dir'] = df['wind_dir'].resample('1H').first()
+    hourly['wind_dir'] = df['wind_dir'].resample('1h').first()
     
     return hourly.reset_index()
 
@@ -189,12 +176,13 @@ def main():
     print(f"📅 Period: {YEARS_BACK} godine unazad")
     print("=" * 70)
     
-    # Kreiraj output folder
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
-    # Generiši listu datuma
     end_date = datetime.now()
-    start_date = end_date - timedelta(days=YEARS_BACK * 365)
+    if START_DATE_OVERRIDE:
+        start_date = datetime.strptime(START_DATE_OVERRIDE, "%Y-%m-%d")
+    else:
+        start_date = end_date - timedelta(days=YEARS_BACK * 365)
     
     dates = []
     current = start_date
@@ -206,7 +194,6 @@ def main():
     print(f"📊 Ukupno dana: {total_days}")
     print("-" * 70)
     
-    # Provjeri postojeći progress
     progress_file = os.path.join(OUTPUT_DIR, "progress.json")
     all_data_file = os.path.join(OUTPUT_DIR, "all_data.csv")
     
@@ -217,22 +204,18 @@ def main():
             completed_dates = set(progress.get('completed', []))
         print(f"✅ Pronađen progress: {len(completed_dates)} dana već završeno")
     
-    # Učitaj postojeće podatke
     all_data = []
     if os.path.exists(all_data_file):
         existing_df = pd.read_csv(all_data_file)
         all_data = [existing_df]
         print(f"✅ Postojeći podaci: {len(existing_df)} redova")
     
-    # Session za requests
     session = requests.Session()
     
-    # Scrape
     failed_dates = []
     new_completed = 0
     
     for i, date_str in enumerate(dates):
-        # Preskoči već završene
         if date_str in completed_dates:
             continue
         
@@ -242,7 +225,6 @@ def main():
         df = scrape_day(date_str, session)
         
         if df is not None and not df.empty:
-            # Resample na satnu rezoluciju
             hourly_df = resample_to_hourly(df)
             if hourly_df is not None:
                 all_data.append(hourly_df)
@@ -256,16 +238,13 @@ def main():
             print(f"❌ No data")
             failed_dates.append(date_str)
         
-        # Sačuvaj progress svakih 10 dana
         if new_completed > 0 and new_completed % 10 == 0:
             with open(progress_file, 'w') as f:
                 json.dump({'completed': list(completed_dates)}, f)
             print(f"   💾 Progress saved ({len(completed_dates)} dana)")
         
-        # Rate limiting - pauza između zahtjeva
         time.sleep(2)  # 2 sekunde pauza
     
-    # Finalno čuvanje
     print("\n" + "=" * 70)
     print("💾 Čuvam podatke...")
     
@@ -279,7 +258,6 @@ def main():
         print(f"   Redova: {len(final_df)}")
         print(f"   Period: {final_df['datetime'].min()} - {final_df['datetime'].max()}")
     
-    # Sačuvaj finalni progress
     with open(progress_file, 'w') as f:
         json.dump({
             'completed': list(completed_dates),

@@ -22,9 +22,9 @@ MODEL_DIR = os.path.join(BASE_DIR, "trained_models_v2")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-LAT, LON = 42.29, 18.84  # Budva, Montenegro
+LAT, LON = 42.29, 18.84  # E viva!!
 
-MODELS = ["ARPEGE_EUROPE", "GFS_SEAMLESS", "ICON_SEAMLESS", "METEOFRANCE", "ECMWF_IFS025", "ITALIAMETEO_ICON2I"]
+MODELS = ["ARPEGE_EUROPE", "GFS_SEAMLESS", "ICON_SEAMLESS", "METEOFRANCE", "ECMWF_IFS025", "ITALIAMETEO_ICON2I", "UKMO_SEAMLESS", "BOM_ACCESS"]
 MODEL_IDS = {
     "ARPEGE_EUROPE": "arpege_europe",
     "GFS_SEAMLESS": "gfs_seamless",
@@ -32,6 +32,8 @@ MODEL_IDS = {
     "METEOFRANCE": "meteofrance_seamless",
     "ECMWF_IFS025": "ecmwf_ifs025",
     "ITALIAMETEO_ICON2I": "italia_meteo_arpae_icon_2i",
+    "UKMO_SEAMLESS": "ukmo_seamless",
+    "BOM_ACCESS": "bom_access_global",
 }
 
 HOURLY_VARS = [
@@ -55,10 +57,11 @@ TARGET_PARAMS = {
     "shortwave_radiation":  {"obs": "shortwave_radiation_obs",  "unit": "W/m\u00b2", "display": "Solar. radijacija"},
 }
 
-SPLIT_DATE = pd.Timestamp('2025-03-01')
+SPLIT_DATE = pd.Timestamp('2025-07-01')
 
 print("=" * 72)
-print("  XGBoost +48h v2 --- Bias Correction Pipeline --- Budva")
+print("  XGBoost +48h v3 --- Bias Correction Pipeline --- Budva")
+print("  Models:", len(MODELS), "| Obs: merged (2020-2026) | Split:", SPLIT_DATE.date())
 print("=" * 72)
 
 
@@ -76,17 +79,26 @@ def compute_clear_sky(dt_series):
 def load_historical_data():
     print("\n[1/6] Ucitavanje istorijskih podataka...")
     all_dfs = {}
+    available_models = []
     for m in MODELS:
         path = os.path.join(BASE_DIR, f"budva_{m}_detailed.csv")
+        if not os.path.exists(path):
+            print(f"  {m}: NEMA FAJLA - preskačem (pokreni fetch_new_models.py)")
+            continue
         all_dfs[m] = pd.read_csv(path, parse_dates=['datetime'])
+        available_models.append(m)
         print(f"  {m}: {all_dfs[m].shape[0]} redova")
 
-    forecast_cols = [c for c in all_dfs[MODELS[0]].columns if c.endswith('_model')]
-    base = all_dfs[MODELS[0]].copy()
-    base.rename(columns={c: f"{MODELS[0]}_{c}" for c in forecast_cols}, inplace=True)
-    for m in MODELS[1:]:
-        other = all_dfs[m][['datetime'] + forecast_cols].copy()
-        other.rename(columns={c: f"{m}_{c}" for c in forecast_cols}, inplace=True)
+    if not available_models:
+        raise RuntimeError("Nema nijednog model fajla!")
+
+    forecast_cols = [c for c in all_dfs[available_models[0]].columns if c.endswith('_model')]
+    base = all_dfs[available_models[0]].copy()
+    base.rename(columns={c: f"{available_models[0]}_{c}" for c in forecast_cols}, inplace=True)
+    for m in available_models[1:]:
+        other_cols = [c for c in all_dfs[m].columns if c.endswith('_model')]
+        other = all_dfs[m][['datetime'] + other_cols].copy()
+        other.rename(columns={c: f"{m}_{c}" for c in other_cols}, inplace=True)
         base = base.merge(other, on='datetime', how='left')
     base.sort_values('datetime', inplace=True)
     base.reset_index(drop=True, inplace=True)
@@ -99,11 +111,18 @@ def load_historical_data():
     base['_derived_cloud_obs'] = cloud
     print(f"  Cloud cover derived: {cloud.notna().sum()} valid (daytime)")
 
-    if 'precip_rate_in' in base.columns:
-        base['_derived_precip_obs'] = pd.to_numeric(base['precip_rate_in'], errors='coerce') * 25.4
-        print(f"  Hourly precip derived: {(base['_derived_precip_obs'] > 0).sum()} non-zero hours")
-    else:
+    # Derive hourly precip obs — try multiple column names (merged CSV vs old format)
+    precip_derived = False
+    for precip_col, multiplier in [('precip_rate_in', 25.4), ('precipitation_rate_obs', 1.0), ('precip_rate_mm', 1.0)]:
+        if precip_col in base.columns:
+            base['_derived_precip_obs'] = pd.to_numeric(base[precip_col], errors='coerce') * multiplier
+            n_nonzero = (base['_derived_precip_obs'] > 0).sum()
+            print(f"  Hourly precip derived from '{precip_col}': {n_nonzero} non-zero hours")
+            precip_derived = True
+            break
+    if not precip_derived:
         base['_derived_precip_obs'] = np.nan
+        print("  WARNING: No precip obs column found")
 
     print(f"  Merged: {base.shape[0]} x {base.shape[1]}")
     return base
@@ -156,6 +175,11 @@ def apply_bias_features(df, bias_tables):
 
 def engineer_features(df):
     out = df.copy()
+
+    model_cols = [c for c in out.columns if c.endswith('_model')]
+    for c in model_cols:
+        if out[c].dtype == 'object':
+            out[c] = pd.to_numeric(out[c], errors='coerce')
 
     out['hour'] = out['datetime'].dt.hour
     out['month'] = out['datetime'].dt.month
@@ -316,6 +340,255 @@ def engineer_features(df):
 
     if 'precipitation_ens_std' in out.columns:
         out['precip_model_certainty'] = 1.0 / (1.0 + out['precipitation_ens_std'])
+
+    
+    if 'pressure_msl_ens_mean' in out.columns:
+        pres = out['pressure_msl_ens_mean']
+
+        pres_change_3h = pres.diff(3)
+        pres_change_6h = pres.diff(6)
+        pres_change_12h = pres.diff(12)
+
+        out['pres_change_12h'] = pres_change_12h
+
+        out['pres_rapidly_falling'] = (pres_change_3h < -3.0).astype(float)
+        out['pres_falling'] = (pres_change_3h < -1.0).astype(float)
+        out['pres_rising'] = (pres_change_3h > 1.0).astype(float)
+        out['pres_rapidly_rising'] = (pres_change_3h > 3.0).astype(float)
+
+        out['pres_anomaly'] = pres - 1015.0
+
+        out['low_pressure_regime'] = (pres < 1010.0).astype(float)
+        out['very_low_pressure'] = (pres < 1005.0).astype(float)
+        out['high_pressure_regime'] = (pres > 1020.0).astype(float)
+
+        out['pres_stability_6h'] = pres.rolling(6, min_periods=2).std()
+        out['pres_stability_12h'] = pres.rolling(12, min_periods=3).std()
+
+        if 'pressure_msl_ens_std' in out.columns:
+            out['pres_model_disagreement'] = out['pressure_msl_ens_std']
+            out['pres_high_uncertainty'] = (out['pressure_msl_ens_std'] > 1.5).astype(float)
+
+        if 'cloud_cover_ens_mean' in out.columns:
+            out['frontal_signal'] = (
+                (pres_change_6h < -2.0) &
+                (out['cloud_cover_ens_mean'] > 70)
+            ).astype(float)
+
+            if rain_mcols:
+                out['active_front'] = (
+                    out['frontal_signal'] *
+                    out.get('rain_agreement', 0)
+                )
+
+    if 'relative_humidity_2m_ens_mean' in out.columns:
+        rh = out['relative_humidity_2m_ens_mean']
+
+        out['humidity_above_80'] = (rh > 80).astype(float)
+        out['humidity_above_95'] = (rh > 95).astype(float)
+        out['sustained_humid_6h'] = out['humidity_above_80'].rolling(6, min_periods=1).sum()
+        out['sustained_humid_12h'] = out['humidity_above_80'].rolling(12, min_periods=1).sum()
+        out['sustained_humid_24h'] = out['humidity_above_80'].rolling(24, min_periods=1).sum()
+
+        out['rh_tend_1h'] = rh.diff(1)
+        out['rh_tend_3h'] = rh.diff(3)
+        out['rh_tend_6h'] = rh.diff(6)
+        out['rh_rising'] = (out['rh_tend_3h'] > 3.0).astype(float)
+        out['rh_falling'] = (out['rh_tend_3h'] < -3.0).astype(float)
+
+        if 'relative_humidity_2m_ens_std' in out.columns:
+            out['rh_model_disagreement'] = out['relative_humidity_2m_ens_std']
+
+        if 'cloud_cover_ens_mean' in out.columns:
+            cc = out['cloud_cover_ens_mean']
+            out['humid_overcast'] = (rh * cc / 100.0)
+            out['humid_overcast_flag'] = ((rh > 80) & (cc > 80)).astype(float)
+            out['dry_clear_flag'] = ((rh < 50) & (cc < 30)).astype(float)
+
+        if 'wind_speed_10m_ens_mean' in out.columns:
+            out['rh_wind_interaction'] = rh / (1.0 + out['wind_speed_10m_ens_mean'])
+
+        out['night_humid'] = (
+            out.get('is_daytime', pd.Series(0, index=out.index)).eq(0) &
+            (rh > 75)
+        ).astype(float)
+
+    if 'temperature_2m_ens_mean' in out.columns and 'dew_point_2m_ens_mean' in out.columns:
+        temp = out['temperature_2m_ens_mean']
+        dew = out['dew_point_2m_ens_mean']
+        spread = temp - dew
+
+        out['near_saturation'] = (spread < 1.5).astype(float)
+        out['moderate_spread'] = ((spread >= 1.5) & (spread < 5.0)).astype(float)
+        out['dry_spread'] = (spread >= 8.0).astype(float)
+
+        out['near_sat_6h'] = out['near_saturation'].rolling(6, min_periods=1).sum()
+        out['near_sat_12h'] = out['near_saturation'].rolling(12, min_periods=1).sum()
+
+        if 'wind_speed_10m_ens_mean' in out.columns:
+            out['fog_risk'] = (
+                (spread < 2.0) &
+                (out['wind_speed_10m_ens_mean'] < 3.0)
+            ).astype(float)
+
+        out['spread_tend_3h'] = spread.diff(3)
+        out['spread_closing'] = (out['spread_tend_3h'] < -1.0).astype(float)
+        out['spread_opening'] = (out['spread_tend_3h'] > 1.0).astype(float)
+
+    if 'temperature_2m_ens_mean' in out.columns:
+        temp = out['temperature_2m_ens_mean']
+
+        if 'temperature_2m_ens_std' in out.columns:
+            out['temp_high_uncertainty'] = (out['temperature_2m_ens_std'] > 1.0).astype(float)
+
+        if 'is_daytime' in out.columns:
+            out['dtr_proxy'] = temp.rolling(24, min_periods=6).max() - temp.rolling(24, min_periods=6).min()
+
+            if 'cloud_cover_ens_mean' in out.columns:
+                out['dtr_x_cloud'] = out['dtr_proxy'] * (1.0 - out['cloud_cover_ens_mean'] / 100.0)
+
+        out['temp_near_zero'] = ((temp > -2.0) & (temp < 5.0)).astype(float)
+
+        if 'precipitation_ens_mean' in out.columns:
+            pem = out['precipitation_ens_mean']
+            out['temp_x_precip'] = temp * pem.clip(upper=5.0)
+            out['cold_rain'] = ((temp < 8.0) & (pem > 0.1)).astype(float)
+            out['warm_rain'] = ((temp > 20.0) & (pem > 0.1)).astype(float)
+
+        month = out['month']
+        sea_temp_approx = 13.0 + 6.0 * np.sin(2 * np.pi * (month - 3) / 12)
+        out['sea_air_diff'] = sea_temp_approx - temp
+        out['marine_warming'] = (out['sea_air_diff'] > 3.0).astype(float)  # sea warms air
+        out['marine_cooling'] = (out['sea_air_diff'] < -3.0).astype(float)  # sea cools air
+
+    if all(c in out.columns for c in ['is_winter', 'cloud_cover_ens_mean',
+           'relative_humidity_2m_ens_mean']):
+        cc = out['cloud_cover_ens_mean']
+        rh = out['relative_humidity_2m_ens_mean']
+
+        winter_overcast = (
+            (out['is_winter'] > 0) &
+            (cc > 75) &
+            (rh > 70)
+        ).astype(float)
+        out['winter_overcast_regime'] = winter_overcast
+
+        out['winter_overcast_6h'] = winter_overcast.rolling(6, min_periods=1).sum()
+        out['winter_overcast_12h'] = winter_overcast.rolling(12, min_periods=1).sum()
+
+        if 'precipitation_ens_mean' in out.columns:
+            pem = out['precipitation_ens_mean']
+            out['winter_overcast_rain'] = (
+                winter_overcast *
+                (pem > 0.1).astype(float)
+            )
+            out['winter_overcast_rain_12h'] = out['winter_overcast_rain'].rolling(12, min_periods=1).sum()
+
+        if 'pressure_msl_ens_mean' in out.columns:
+            pres = out['pressure_msl_ens_mean']
+            out['winter_pres_above_1020'] = (
+                (out['is_winter'] > 0) &
+                (pres > 1020.0)
+            ).astype(float)
+
+            out['winter_low_pres_rain'] = (
+                (out['is_winter'] > 0) &
+                (pres < 1010.0) &
+                (out.get('rain_agreement', pd.Series(0, index=out.index)) > 0.3)
+            ).astype(float)
+
+    pres_mcols = [f"{m}_pressure_msl_model" for m in MODELS
+                  if f"{m}_pressure_msl_model" in out.columns]
+    if len(pres_mcols) >= 2 and 'pressure_msl_ens_mean' in out.columns:
+        pres_ens = out['pressure_msl_ens_mean']
+        for m in MODELS:
+            pc = f"{m}_pressure_msl_model"
+            if pc in out.columns:
+                dev = pd.to_numeric(out[pc], errors='coerce') - pres_ens
+                out[f'{m}_pres_bias'] = dev
+
+        pres_vals = out[pres_mcols].apply(pd.to_numeric, errors='coerce')
+        out['pres_max_spread'] = pres_vals.max(axis=1) - pres_vals.min(axis=1)
+
+    rh_mcols = [f"{m}_relative_humidity_2m_model" for m in MODELS
+                if f"{m}_relative_humidity_2m_model" in out.columns]
+    if len(rh_mcols) >= 2 and 'relative_humidity_2m_ens_mean' in out.columns:
+        rh_ens = out['relative_humidity_2m_ens_mean']
+        for m in MODELS:
+            rhc = f"{m}_relative_humidity_2m_model"
+            if rhc in out.columns:
+                dev = pd.to_numeric(out[rhc], errors='coerce') - rh_ens
+                out[f'{m}_rh_bias'] = dev
+
+        rh_vals = out[rh_mcols].apply(pd.to_numeric, errors='coerce')
+        out['rh_max_spread'] = rh_vals.max(axis=1) - rh_vals.min(axis=1)
+
+        out['rh_above85_count'] = (rh_vals > 85).sum(axis=1)
+        out['rh_above85_ratio'] = out['rh_above85_count'] / len(rh_mcols)
+
+    if all(c in out.columns for c in ['cloud_cover_ens_mean',
+           'relative_humidity_2m_ens_mean', 'shortwave_radiation_ens_mean']):
+        cc = out['cloud_cover_ens_mean']
+        rh = out['relative_humidity_2m_ens_mean']
+        sw = out['shortwave_radiation_ens_mean']
+        clear = out.get('clear_sky_rad', pd.Series(1, index=out.index))
+
+        out['cloud_rh_inconsistent'] = ((cc > 80) & (rh < 60)).astype(float)
+
+        out['humid_clear_sky'] = ((cc < 30) & (rh > 85)).astype(float)
+
+        solar_ratio = sw / clear.clip(lower=1)
+        out['solar_cloud_mismatch'] = (
+            (cc > 80) & (solar_ratio > 0.5) |
+            (cc < 20) & (solar_ratio < 0.3)
+        ).astype(float)
+
+    if 'precipitation_ens_mean' in out.columns:
+        pem = out['precipitation_ens_mean']
+
+        out['precip_24h_total'] = pem.rolling(24, min_periods=1).sum()
+        out['precip_48h_total'] = pem.rolling(48, min_periods=1).sum()
+
+        out['heavy_rain_event'] = (pem > 3.0).astype(float)
+        out['heavy_rain_6h'] = out['heavy_rain_event'].rolling(6, min_periods=1).sum()
+
+        out['precip_decreasing'] = (pem.diff(3) < -0.5).astype(float)
+        out['post_rain_clearing'] = (
+            (out['precip_24h_total'] > 5.0) &
+            (pem < 0.1) &
+            out['precip_decreasing'].astype(bool)
+        ).astype(float)
+
+    wd_mcols = [f"{m}_wind_direction_10m_model" for m in MODELS
+                if f"{m}_wind_direction_10m_model" in out.columns]
+    ws_mcols = [f"{m}_wind_speed_10m_model" for m in MODELS
+                if f"{m}_wind_speed_10m_model" in out.columns]
+    if wd_mcols and ws_mcols:
+        wd_vals = out[wd_mcols].apply(pd.to_numeric, errors='coerce')
+        ws_vals = out[ws_mcols].apply(pd.to_numeric, errors='coerce')
+
+        wd_mean = np.degrees(np.arctan2(
+            np.sin(np.radians(wd_vals)).mean(axis=1),
+            np.cos(np.radians(wd_vals)).mean(axis=1)
+        )) % 360
+        ws_mean = ws_vals.mean(axis=1)
+
+        out['is_jugo'] = (
+            ((wd_mean >= 100) & (wd_mean <= 170)) &
+            (ws_mean > 5.0)
+        ).astype(float)
+
+        out['is_maestral'] = (
+            ((wd_mean >= 280) & (wd_mean <= 340)) &
+            (ws_mean > 3.0) &
+            (out['month'].isin([5, 6, 7, 8, 9]).astype(float) > 0)
+        ).astype(float)
+
+        out['jugo_6h'] = out['is_jugo'].rolling(6, min_periods=1).sum()
+
+        out['winter_jugo'] = (
+            out['is_jugo'] * out.get('is_winter', pd.Series(0, index=out.index))
+        )
 
     return out
 
@@ -508,6 +781,71 @@ def fetch_live_forecasts():
     return fc_all
 
 
+def correct_weather_code_row(row, raw_row=None):
+    """
+    Models often report rain (WC >= 51) during winter overcast conditions
+    when it's actually just cloudy. XGBoost precipitation correction is more accurate,
+    so we trust it over the raw weather code mode.
+    
+    This is how we're going to fix:
+    - If XGBoost says precip < 0.1mm AND raw WC is rain/drizzle → downgrade to cloud-based code
+    - If XGBoost says precip > 0 but raw WC is clear → upgrade to appropriate rain code
+    - Use cloud cover to determine the correct non-rain code
+    """
+    wc_raw = int(row.get('weather_code_raw', row.get('weather_code', 0)))
+    if pd.isna(wc_raw):
+        wc_raw = 0
+    wc_raw = int(wc_raw)
+    
+    precip_xgb = row.get('precipitation_xgb', None)
+    cloud_xgb = row.get('cloud_cover_xgb', None)
+    
+    is_rain_code = 51 <= wc_raw <= 82  # drizzle + rain + showers
+    is_snow_code = 71 <= wc_raw <= 77
+    is_thunderstorm = wc_raw >= 95
+    
+    # We don't want to mess with thunderstorm codes, as they are often correct and XGBoost precip can be underestimated in convective events
+    if is_thunderstorm:
+        return wc_raw
+    
+    if is_rain_code and precip_xgb is not None and pd.notna(precip_xgb) and precip_xgb < 0.1:
+        if cloud_xgb is not None and pd.notna(cloud_xgb):
+            if cloud_xgb > 80:
+                return 3   
+            elif cloud_xgb > 50:
+                return 2   
+            elif cloud_xgb > 20:
+                return 1   
+            else:
+                return 0   
+        return 3 
+    
+    if 51 <= wc_raw <= 55 and precip_xgb is not None and pd.notna(precip_xgb):
+        if precip_xgb < 0.2:
+            if cloud_xgb is not None and pd.notna(cloud_xgb) and cloud_xgb > 85:
+                return 3  
+    
+    if wc_raw <= 3 and precip_xgb is not None and pd.notna(precip_xgb) and precip_xgb > 0.5:
+        if precip_xgb > 3.0:
+            return 63  
+        elif precip_xgb > 1.0:
+            return 61  
+        else:
+            return 51  
+    
+    if wc_raw <= 3 and cloud_xgb is not None and pd.notna(cloud_xgb):
+        if cloud_xgb > 80:
+            return 3   
+        elif cloud_xgb > 50:
+            return 2   
+        elif cloud_xgb > 20:
+            return 1  
+        else:
+            return 0   
+    
+    return wc_raw
+
+
 def apply_correction(fc_df, trained, bias_tables):
     print("\n[5/6] Primjena korekcije...")
 
@@ -536,6 +874,10 @@ def apply_correction(fc_df, trained, bias_tables):
                 X[c] = -999
         X = X[features].fillna(-999)
 
+        for c in X.columns:
+            if X[c].dtype == 'object':
+                X[c] = pd.to_numeric(X[c], errors='coerce').fillna(-999)
+
         pred = model.predict(X)
 
         if param == 'relative_humidity_2m':
@@ -552,7 +894,11 @@ def apply_correction(fc_df, trained, bias_tables):
 
     wc_cols = [f"{m}_weather_code_model" for m in MODELS if f"{m}_weather_code_model" in fc.columns]
     if wc_cols:
-        corrected['weather_code'] = fc[wc_cols].apply(pd.to_numeric, errors='coerce').mode(axis=1)[0]
+        corrected['weather_code_raw'] = fc[wc_cols].apply(pd.to_numeric, errors='coerce').mode(axis=1)[0]
+        # Smart weather code: use XGBoost precip + cloud to correct false rain
+        corrected['weather_code'] = corrected.apply(
+            lambda r: correct_weather_code_row(r, fc.loc[r.name] if r.name in fc.index else None), axis=1
+        )
 
     for extra in ['apparent_temperature', 'snowfall', 'rain',
                   'cloud_cover_low', 'cloud_cover_mid', 'cloud_cover_high',
@@ -758,7 +1104,8 @@ def generate_output(corrected, trained, results, fc_raw=None):
         "generated": now_str,
         "location": {"name": "Budva, Crna Gora", "lat": LAT, "lon": LON,
                       "station": "ibudva5 (Weather Underground)"},
-        "method": "XGBoost Multi-Model Ensemble + Historical Bias Correction",
+        "method": "XGBoost Multi-Model Ensemble + Historical Bias Correction v3",
+        "description": "8 modela, 6 godina podataka (2020-2026), pametna korekcija vremena",
         "models": MODELS,
         "training_metrics": results,
         "daily_summary": daily,
