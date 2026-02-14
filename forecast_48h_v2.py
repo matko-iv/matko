@@ -670,6 +670,45 @@ def engineer_features(df):
         if f'{v}_prev_day1_ens_mean' in out.columns and f'{v}_ens_mean' in out.columns:
             out[f'{v}_day0_vs_day1_ens'] = out[f'{v}_ens_mean'] - out[f'{v}_prev_day1_ens_mean']
 
+    for param in ['temperature_2m', 'dew_point_2m', 'pressure_msl', 'wind_speed_10m',
+                  'relative_humidity_2m', 'cloud_cover']:
+        ens_col = f'{param}_ens_mean'
+        if ens_col in out.columns:
+            ser = out[ens_col]
+            out[f'{param}_ens_lag1'] = ser.shift(1)
+            out[f'{param}_ens_lag3'] = ser.shift(3)
+            out[f'{param}_ens_ma6'] = ser.rolling(6, min_periods=1).mean()
+            out[f'{param}_ens_ma12'] = ser.rolling(12, min_periods=1).mean()
+            out[f'{param}_ens_ma24'] = ser.rolling(24, min_periods=1).mean()
+            out[f'{param}_ens_std6'] = ser.rolling(6, min_periods=2).std()
+            out[f'{param}_ens_std24'] = ser.rolling(24, min_periods=3).std()
+            out[f'{param}_ens_anom24'] = ser - out[f'{param}_ens_ma24']
+
+    if 'precipitation_ens_mean' in out.columns:
+        pem = out['precipitation_ens_mean']
+        out['precip_sqrt'] = np.sqrt(pem.clip(lower=0))
+        out['precip_log1p'] = np.log1p(pem.clip(lower=0))
+        out['precip_is_zero'] = (pem < 0.05).astype(float)
+        out['precip_dry_hours'] = out['precip_is_zero'].rolling(12, min_periods=1).sum()
+
+    for param in ['temperature_2m', 'precipitation', 'wind_speed_10m', 'cloud_cover']:
+        mcols = [f"{m}_{param}_model" for m in MODELS if f"{m}_{param}_model" in out.columns]
+        if len(mcols) >= 4:
+            vals = out[mcols].apply(pd.to_numeric, errors='coerce')
+            q25 = vals.quantile(0.25, axis=1)
+            q75 = vals.quantile(0.75, axis=1)
+            out[f'{param}_ens_iqr'] = q75 - q25
+            out[f'{param}_ens_skew'] = vals.skew(axis=1)
+
+    if 'hour_sin' in out.columns and 'season' in out.columns:
+        out['hour_sin_x_season'] = out['hour_sin'] * out['season']
+        out['hour_cos_x_season'] = out['hour_cos'] * out['season']
+    if 'hour_sin' in out.columns and 'doy_sin' in out.columns:
+        out['hour_x_doy'] = out['hour_sin'] * out['doy_sin']
+
+    if 'temperature_2m_ens_std' in out.columns and 'temperature_2m_ens_mean' in out.columns:
+        out['temp_cv'] = out['temperature_2m_ens_std'] / (out['temperature_2m_ens_mean'].abs().clip(lower=0.1))
+
     return out
 
 
@@ -740,13 +779,35 @@ def train_all_models(df):
             print(f"  {info['display']:20s} --- SKIP (train={len(X_tr)}, test={len(X_te)})")
             continue
 
-        model = xgb.XGBRegressor(
-            n_estimators=800, max_depth=6, learning_rate=0.05,
-            subsample=0.8, colsample_bytree=0.7, reg_alpha=0.1,
-            reg_lambda=1.0, min_child_weight=5, gamma=0.05,
-            objective='reg:absoluteerror', random_state=42, n_jobs=-1,
-            early_stopping_rounds=30,
-        )
+        # Per-parameter hyperparameters
+        if param == 'precipitation':
+            # Precipitation: more regularization to avoid overfit on rare events
+            hp = dict(n_estimators=1000, max_depth=4, learning_rate=0.03,
+                      subsample=0.7, colsample_bytree=0.5, reg_alpha=1.0,
+                      reg_lambda=3.0, min_child_weight=15, gamma=0.2,
+                      objective='reg:absoluteerror', random_state=42, n_jobs=-1,
+                      early_stopping_rounds=50)
+        elif param in ('cloud_cover', 'shortwave_radiation'):
+            hp = dict(n_estimators=1000, max_depth=6, learning_rate=0.04,
+                      subsample=0.8, colsample_bytree=0.65, reg_alpha=0.2,
+                      reg_lambda=1.5, min_child_weight=5, gamma=0.05,
+                      objective='reg:absoluteerror', random_state=42, n_jobs=-1,
+                      early_stopping_rounds=40)
+        elif param in ('temperature_2m', 'dew_point_2m', 'pressure_msl'):
+            # Smooth targets: more trees, lower LR
+            hp = dict(n_estimators=1200, max_depth=6, learning_rate=0.03,
+                      subsample=0.8, colsample_bytree=0.7, reg_alpha=0.1,
+                      reg_lambda=1.0, min_child_weight=5, gamma=0.05,
+                      objective='reg:absoluteerror', random_state=42, n_jobs=-1,
+                      early_stopping_rounds=40)
+        else:
+            hp = dict(n_estimators=800, max_depth=6, learning_rate=0.05,
+                      subsample=0.8, colsample_bytree=0.7, reg_alpha=0.1,
+                      reg_lambda=1.0, min_child_weight=5, gamma=0.05,
+                      objective='reg:absoluteerror', random_state=42, n_jobs=-1,
+                      early_stopping_rounds=30)
+
+        model = xgb.XGBRegressor(**hp)
         model.fit(X_tr, y_tr, eval_set=[(X_te, y_te)], verbose=False)
 
         y_pred = model.predict(X_te)

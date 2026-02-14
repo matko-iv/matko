@@ -270,15 +270,15 @@ def plot_diurnal_cycle(reports):
 
 
 def plot_extreme_conditions(reports):
-    if not reports or 'by_wind_conditions' not in reports[0]:
+    if not reports:
         print("⚠️  Preskajem ekstremne uslove (nema podataka)")
         return
 
-    key_conditions = ['Jak vjetar (>8 m/s)', 'BURA (SJ/SJI >8 m/s)']
+    key_conditions = ['Ekstremna hladnoća', 'Ekstremna vrućina']
 
     available_conditions = []
     for cond in key_conditions:
-        if cond in reports[0].get('by_wind_conditions', {}):
+        if cond in reports[0].get('by_extremes', {}):
             available_conditions.append(cond)
 
     if not available_conditions:
@@ -289,7 +289,7 @@ def plot_extreme_conditions(reports):
     colors = get_palette(n_models)
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    fig.suptitle('Performanse u Ekstremnim Uslovima', fontsize=14, fontweight='bold')
+    fig.suptitle('Performanse u Ekstremnim Temperaturnim Uslovima', fontsize=14, fontweight='bold')
 
     x = np.arange(len(available_conditions))
     width = 0.75 / n_models
@@ -297,8 +297,8 @@ def plot_extreme_conditions(reports):
     ax1 = axes[0]
     for i, report in enumerate(reports):
         model_name = report['model_name']
-        by_wind = report.get('by_wind_conditions', {})
-        mae_values = [safe_get(by_wind.get(c, {}).get('temperature_2m', {}), 'mae') for c in available_conditions]
+        by_ext = report.get('by_extremes', {})
+        mae_values = [safe_get(by_ext.get(c, {}).get('temperature_2m', {}), 'mae') for c in available_conditions]
 
         offset = (i - n_models/2 + 0.5) * width
         ax1.bar(x + offset, mae_values, width, label=model_name,
@@ -308,25 +308,25 @@ def plot_extreme_conditions(reports):
     ax1.set_ylabel('MAE (°C)', fontweight='bold')
     ax1.set_title('(A) Temperatura', loc='left', fontweight='bold')
     ax1.set_xticks(x)
-    ax1.set_xticklabels([c.replace(' (>8 m/s)', '').replace(' (SJ/SJI >8 m/s)', '') for c in available_conditions], fontsize=9)
-    ax1.legend(loc='upper right', framealpha=0.95, fontsize=8)
+    ax1.set_xticklabels([c.replace('Ekstremna ', '') for c in available_conditions], fontsize=9)
+    ax1.legend(loc='upper right', framealpha=0.95, fontsize=7, ncol=2)
 
     ax2 = axes[1]
     for i, report in enumerate(reports):
         model_name = report['model_name']
-        by_wind = report.get('by_wind_conditions', {})
-        mae_values = [safe_get(by_wind.get(c, {}).get('precipitation', {}), 'mae') for c in available_conditions]
+        by_ext = report.get('by_extremes', {})
+        mae_values = [safe_get(by_ext.get(c, {}).get('wind_speed_10m', {}), 'mae') for c in available_conditions]
 
         offset = (i - n_models/2 + 0.5) * width
         ax2.bar(x + offset, mae_values, width, label=model_name,
                color=colors[i], alpha=0.85, edgecolor='white', linewidth=0.5)
 
     ax2.set_xlabel('Uslov', fontweight='bold')
-    ax2.set_ylabel('MAE (mm)', fontweight='bold')
-    ax2.set_title('(B) Padavine', loc='left', fontweight='bold')
+    ax2.set_ylabel('MAE (m/s)', fontweight='bold')
+    ax2.set_title('(B) Brzina Vjetra', loc='left', fontweight='bold')
     ax2.set_xticks(x)
-    ax2.set_xticklabels([c.replace(' (>8 m/s)', '').replace(' (SJ/SJI >8 m/s)', '') for c in available_conditions], fontsize=9)
-    ax2.legend(loc='upper right', framealpha=0.95, fontsize=8)
+    ax2.set_xticklabels([c.replace('Ekstremna ', '') for c in available_conditions], fontsize=9)
+    ax2.legend(loc='upper right', framealpha=0.95, fontsize=7, ncol=2)
 
     plt.tight_layout()
     plt.savefig(f'{OUTPUT_DIR}/05_extreme_conditions.png', dpi=300, bbox_inches='tight', facecolor='white')
@@ -397,7 +397,7 @@ def create_summary_report(reports):
 IZVJEŠTAJ O PERFORMANSAMA METEOROLOŠKIH MODELA ZA BUDVU
 
 Analizirano modela: {len(reports)}
-Period: 2020-2026 (6 godina podataka)
+Period: 2021-2026 (različita dostupnost po modelu)
 
 NAJBOLJI MODEL: {best_model['model_name']}
 

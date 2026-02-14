@@ -273,15 +273,16 @@ def plot_diurnal_cycle(reports):
     plt.close()
 
 def plot_extreme_conditions(reports):
-    """5. Ekstremni uslovi"""
-    if not reports or 'by_wind_conditions' not in reports[0]:
+    """5. Ekstremni uslovi (temperatura)"""
+    if not reports:
         print("⚠️ Preskajem ekstremne uslove (nema podataka)")
         return
 
-    key_conditions = ['Jak vjetar (>8 m/s)', 'BURA (SJ/SJI >8 m/s)']
+    # Use by_extremes data (Ekstremna hladnoća, Ekstremna vrućina)
+    key_conditions = ['Ekstremna hladnoća', 'Ekstremna vrućina']
     available_conditions = []
     for cond in key_conditions:
-        if cond in reports[0].get('by_wind_conditions', {}):
+        if cond in reports[0].get('by_extremes', {}):
             available_conditions.append(cond)
 
     if not available_conditions:
@@ -292,7 +293,7 @@ def plot_extreme_conditions(reports):
     colors = get_palette(n_models)
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    fig.suptitle('Performanse u Ekstremnim Uslovima', fontsize=14, fontweight='bold')
+    fig.suptitle('Performanse u Ekstremnim Temperaturnim Uslovima', fontsize=14, fontweight='bold')
 
     x = np.arange(len(available_conditions))
     width = 0.75 / n_models
@@ -300,8 +301,8 @@ def plot_extreme_conditions(reports):
     ax1 = axes[0]
     for i, report in enumerate(reports):
         model_name = report['model_name']
-        by_wind = report.get('by_wind_conditions', {})
-        mae_values = [safe_get(by_wind.get(c, {}).get('temperature_2m', {}), 'mae') for c in available_conditions]
+        by_ext = report.get('by_extremes', {})
+        mae_values = [safe_get(by_ext.get(c, {}).get('temperature_2m', {}), 'mae') for c in available_conditions]
         offset = (i - n_models/2 + 0.5) * width
         ax1.bar(x + offset, mae_values, width, label=model_name,
                color=colors[i], alpha=0.85, edgecolor='white', linewidth=0.5)
@@ -309,23 +310,23 @@ def plot_extreme_conditions(reports):
     ax1.set_ylabel('MAE (°C)', fontweight='bold')
     ax1.set_title('(A) Temperatura', loc='left', fontweight='bold')
     ax1.set_xticks(x)
-    ax1.set_xticklabels([c.replace(' (>8 m/s)', '').replace(' (SJ/SJI >8 m/s)', '') for c in available_conditions], fontsize=9)
-    ax1.legend(loc='upper right', framealpha=0.95, fontsize=8)
+    ax1.set_xticklabels([c.replace('Ekstremna ', '') for c in available_conditions], fontsize=9)
+    ax1.legend(loc='upper right', framealpha=0.95, fontsize=7, ncol=2)
 
     ax2 = axes[1]
     for i, report in enumerate(reports):
         model_name = report['model_name']
-        by_wind = report.get('by_wind_conditions', {})
-        mae_values = [safe_get(by_wind.get(c, {}).get('precipitation', {}), 'mae') for c in available_conditions]
+        by_ext = report.get('by_extremes', {})
+        mae_values = [safe_get(by_ext.get(c, {}).get('wind_speed_10m', {}), 'mae') for c in available_conditions]
         offset = (i - n_models/2 + 0.5) * width
         ax2.bar(x + offset, mae_values, width, label=model_name,
                color=colors[i], alpha=0.85, edgecolor='white', linewidth=0.5)
     ax2.set_xlabel('Uslov', fontweight='bold')
-    ax2.set_ylabel('MAE (mm)', fontweight='bold')
-    ax2.set_title('(B) Padavine', loc='left', fontweight='bold')
+    ax2.set_ylabel('MAE (m/s)', fontweight='bold')
+    ax2.set_title('(B) Brzina Vjetra', loc='left', fontweight='bold')
     ax2.set_xticks(x)
-    ax2.set_xticklabels([c.replace(' (>8 m/s)', '').replace(' (SJ/SJI >8 m/s)', '') for c in available_conditions], fontsize=9)
-    ax2.legend(loc='upper right', framealpha=0.95, fontsize=8)
+    ax2.set_xticklabels([c.replace('Ekstremna ', '') for c in available_conditions], fontsize=9)
+    ax2.legend(loc='upper right', framealpha=0.95, fontsize=7, ncol=2)
 
     plt.tight_layout()
     plt.savefig(f'{OUTPUT_DIR}/05_extreme_conditions.png', dpi=300, bbox_inches='tight', facecolor='white')
@@ -431,45 +432,48 @@ def plot_mae_vs_rmse(reports):
     plt.close()
 
 def plot_bias_heatmap_season_time(reports):
-    """8. Bias heatmap: Sezona x Doba Dana"""
+    """8. Bias heatmap: Sezonski bias temperature SVIH modela"""
     seasons = ['Zima', 'Proleće', 'Leto', 'Jesen']
-    times = ['Noć', 'Jutro', 'Popodne', 'Veče']
 
     if not reports:
         return
 
-    report = reports[0]
-    model_name = report['model_name']
+    models = [r['model_name'] for r in reports]
+    n_models = len(models)
 
-    bias_matrix = np.zeros((len(seasons), len(times)))
+    # Build matrix: models x seasons (actual bias from JSON)
+    bias_matrix = np.zeros((n_models, len(seasons)))
+    for i, report in enumerate(reports):
+        by_season = report.get('by_season', {})
+        for j, season in enumerate(seasons):
+            temp_data = by_season.get(season, {}).get('temperature_2m', {})
+            bias_matrix[i, j] = safe_get(temp_data, 'bias', 0)
 
-    for i, season in enumerate(seasons):
-        by_season = report.get('by_season', {}).get(season, {})
-        temp_data = by_season.get('temperature_2m', {})
-        bias_val = safe_get(temp_data, 'bias', 0)
-        for j in range(len(times)):
-            bias_matrix[i, j] = bias_val + np.random.uniform(-0.2, 0.2)
+    # Find symmetric range
+    abs_max = max(abs(bias_matrix.min()), abs(bias_matrix.max()), 0.5)
 
-    fig, ax = plt.subplots(figsize=(10, 6))
-    im = ax.imshow(bias_matrix, cmap='RdBu_r', aspect='auto', vmin=-1.5, vmax=1.5)
+    fig, ax = plt.subplots(figsize=(10, max(6, n_models * 0.8)))
+    im = ax.imshow(bias_matrix, cmap='RdBu_r', aspect='auto', vmin=-abs_max, vmax=abs_max)
 
-    ax.set_xticks(np.arange(len(times)))
-    ax.set_yticks(np.arange(len(seasons)))
-    ax.set_xticklabels(times)
-    ax.set_yticklabels(seasons)
+    ax.set_xticks(np.arange(len(seasons)))
+    ax.set_yticks(np.arange(n_models))
+    ax.set_xticklabels(seasons, fontsize=11)
+    ax.set_yticklabels(models, fontsize=10)
 
-    for i in range(len(seasons)):
-        for j in range(len(times)):
-            text = ax.text(j, i, f'{bias_matrix[i, j]:.2f}',
-                          ha="center", va="center", color="black", fontsize=10, fontweight='bold')
+    for i in range(n_models):
+        for j in range(len(seasons)):
+            val = bias_matrix[i, j]
+            color = "white" if abs(val) > abs_max * 0.6 else "black"
+            ax.text(j, i, f'{val:+.2f}',
+                   ha="center", va="center", color=color, fontsize=10, fontweight='bold')
 
-    ax.set_title(f'Bias Heatmap: Temperatura ({model_name})\nSezona x Doba Dana',
+    ax.set_title('Bias Heatmap: Temperatura po Sezoni i Modelu',
                 fontsize=13, fontweight='bold', pad=15)
-    ax.set_xlabel('Doba Dana', fontweight='bold')
-    ax.set_ylabel('Sezona', fontweight='bold')
+    ax.set_xlabel('Sezona', fontweight='bold')
+    ax.set_ylabel('Model', fontweight='bold')
 
-    cbar = plt.colorbar(im, ax=ax)
-    cbar.set_label('Bias (°C)\n(negativno=pothlađuje)', rotation=270, labelpad=20, fontweight='bold')
+    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label('Bias (°C)\n(crveno=pregrijava, plavo=pothlađuje)', rotation=270, labelpad=20, fontweight='bold')
 
     plt.tight_layout()
     plt.savefig(f'{OUTPUT_DIR}/08_bias_heatmap.png', dpi=300, bbox_inches='tight', facecolor='white')
@@ -478,11 +482,11 @@ def plot_bias_heatmap_season_time(reports):
 
 def plot_weather_condition_comparison(reports):
     """9. Poređenje po vremenskim uslovima"""
-    conditions = ['Kiša', 'Bez kiše', 'Oblačno', 'Sunčano']
+    conditions = ['Kiša', 'Bez kiše', 'Oblačno', 'Sunčano', 'Slab vjetar']
     n_models = len(reports)
     colors = get_palette(n_models)
 
-    fig, ax = plt.subplots(figsize=(14, 6))
+    fig, ax = plt.subplots(figsize=(16, 6))
 
     x = np.arange(len(conditions))
     width = 0.75 / n_models
@@ -684,7 +688,16 @@ def create_summary_report(reports):
 IZVJEŠTAJ O PERFORMANSAMA METEOROLOŠKIH MODELA ZA BUDVU
 
 Analizirano modela: {len(reports)}
-Period: 2020-2026 (6 godina podataka)
+Period: 2021-2026 (različita dostupnost po modelu)
+
+  GFS_SEAMLESS:       od marta 2021     (~41.500 sati)
+  UKMO_SEAMLESS:      od marta 2022     (~33.700 sati)
+  METEOFRANCE:        od novembra 2022  (~27.800 sati)
+  ARPEGE_EUROPE:      od novembra 2022  (~27.800 sati)
+  ICON_SEAMLESS:      od novembra 2022  (~27.700 sati)
+  ECMWF_IFS025:       od februara 2024  (~17.300 sati)
+  BOM_ACCESS:         jan 2024-jul 2025 (~12.600 sati)
+  ITALIAMETEO_ICON2I: od aprila 2025    (~7.000 sati)
 
 NAJBOLJI MODEL: {best_model['model_name']}
 

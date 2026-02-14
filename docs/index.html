@@ -195,13 +195,13 @@
 
     <p>Globalni i kontinentalni meteorološki modeli — ECMWF, GFS, ICON, Météo-France, UKMO, BOM — simuliraju kompletnu atmosferu i daju prognoze za cijelu planetu. Nevjerovatno su sofisticirani, ali nijedan od njih nije optimizovan za jednu tačku na karti. Svaki pravi sistematske greške koje su specifične za lokalnu geografiju: blizinu mora, okolne planine, dominantne vjetrove.</p>
 
-    <p>Budva je savršen primjer. U ovom projektu sam uzeo <strong>6 godina satnih podataka</strong> sa meteo stanice u Budvi (<strong>50.000+ mjerenja</strong>, od aprila 2020. do danas), uporedio ih sa prognozama <strong>8 globalnih modela</strong>, i trenirao XGBoost model koji sistematski ispravlja njihove greške. Rezultat: <strong>temperatura tačnija za 25%</strong>, <strong>vjetar za 62%</strong>, <strong>pritisak za 68%</strong> — mjereno na podacima koje model nikad nije vidio.</p>
+    <p>Budva je savršen primjer. U ovom projektu sam uzeo <strong>5+ godina satnih opservacija</strong> sa meteo stanice u Budvi (<strong>50.000+ mjerenja</strong>, od aprila 2020. do danas), uporedio ih sa prognozama <strong>8 globalnih modela</strong> (svaki model ima različit period dostupnosti — od 7.000 do 41.500 sati poređenja), i trenirao XGBoost model koji sistematski ispravlja njihove greške. Rezultat: <strong>temperatura tačnija za 25%</strong>, <strong>vjetar za 62%</strong>, <strong>pritisak za 68%</strong> — mjereno na podacima koje model nikad nije vidio.</p>
 
     <h2>Problem</h2>
 
     <p>Globalni meteorološki modeli kao što su ECMWF, GFS ili ICON pokrivaju cijelu planetu i izvrsno rade posao na velikom nivou. Međutim, lokalna geografija, blizina mora, i specifičnosti Budve stvaraju uslove koje globalni modeli ne mogu savršeno uhvatiti.</p>
 
-    <p>Uzeo sam 8 različitih globalnih modela (ECMWF IFS025, ICON Seamless, GFS Seamless, MeteoFrance, ARPEGE Europe, ItaliaMeteo ICON2I, <strong>UK Met Office (UKMO)</strong> i <strong>Bureau of Meteorology ACCESS (BOM)</strong>) i uporedio njihove prognoze sa stvarnim mjerenjima sa meteo stanice u Budvi tokom posljednjih 6 godina. Podatke sam spojio iz dva izvora — stanica ibudva5 (od februara 2023.) i širi all_data set (od aprila 2020.) — što mi je dalo preko <strong>50,000 satnih tačaka podataka po modelu</strong>, dvostruko više nego u prvoj verziji.</p>
+    <p>Uzeo sam 8 različitih globalnih modela (ECMWF IFS025, ICON Seamless, GFS Seamless, MeteoFrance, ARPEGE Europe, ItaliaMeteo ICON2I, <strong>UK Met Office (UKMO)</strong> i <strong>Bureau of Meteorology ACCESS (BOM)</strong>) i uporedio njihove prognoze sa stvarnim mjerenjima. Podatke sam spojio iz dva izvora — stanica ibudva5 (od februara 2023.) i širi all_data set (od aprila 2020.) — što mi je dalo preko <strong>50.000 satnih opservacija</strong>. Svaki model ima različitu dostupnost u Open-Meteo Historical Forecast API-ju: GFS od marta 2021. (~41.500h), UKMO od marta 2022. (~33.700h), MeteoFrance/ARPEGE/ICON od novembra 2022. (~27.700h), ECMWF od februara 2024. (~17.300h), BOM januar 2024.–jul 2025. (~12.600h), ItaliaMeteo od aprila 2025. (~7.000h).</p>
 
     <h2>Metodologija</h2>
 
@@ -305,7 +305,7 @@
     </table>
 
     <div class="note">
-        <strong>Napomena:</strong> Tabela je sortirana po MAE za temperaturu (niži = bolji). Svi modeli su analizirani na 6 godina podataka (2020-2026), ali imaju različit broj sati (n) jer nisu svi modeli bili dostupni u cijelom periodu. UKMO je 4. najbolji za temperaturu, a BOM ima najmanji dewpoint bias.
+        <strong>Napomena:</strong> Tabela je sortirana po MAE za temperaturu (niži = bolji). Modeli imaju različit broj validnih sati (n) jer Open-Meteo Historical Forecast API ima različite početne datume po modelu — od marta 2021. (GFS) do aprila 2025. (ItaliaMeteo). UKMO je 4. najbolji za temperaturu, a BOM ima najmanji dewpoint bias.
     </div>
 
     <h3>Detaljno po varijablama</h3>
@@ -399,9 +399,15 @@
 
     <p>Greške se značajno razlikuju po sezonama. Ljeti su najveće, što je vjerovatno zbog intenzivnijih konvektivnih procesa i lokalne cirkulacije zbog mora.</p>
 
-    <img src="images/08_bias_heatmap.png" alt="Heatmapa sezonskog biasa">
+    <img src="images/08_bias_heatmap.png" alt="Heatmapa sezonskog biasa svih modela">
+
+    <p>Heatmapa iznad prikazuje sistematski bias (pristrasnost) temperature za svih 8 modela po sezonama. Crvena boja znači da model pregrijava, plava da pothlađuje. Većina modela pothlađuje — posebno UKMO i GFS, dok ICON i ItaliaMeteo pregrijavaju.</p>
 
     <img src="images/04_diurnal_cycle.png" alt="Dnevni ciklus grešaka">
+
+    <img src="images/05_extreme_conditions.png" alt="Ekstremni temperaturni uslovi">
+
+    <p>Tokom ekstremnih temperatura (hladnoća ispod 5. percentila ili vrućina iznad 95. percentila), greške modela se povećavaju — što je očekivano jer su to upravo situacije van tipičnog ponašanja.</p>
 
     <img src="images/09_weather_condition_comparison.png" alt="Poređenje po vremenskim uslovima">
 
@@ -438,7 +444,7 @@
 
     <img src="https://latex.codecogs.com/svg.image?L=\frac{1}{n}\sum_{i=1}^{n}|f(x_i)-y_i|" alt="Loss function">
 
-    <p>Cilj je bio spustiti MAE ispod 1.0°C — <strong>postignut: 0.97°C</strong>. To je poboljšanje od 24.3% u odnosu na najbolji globalni model (ARPÈGE Europe). Sa integracijom Previous Runs revizija, model koristi 1,006 feature-a iz 8 modela + 6 godina podataka.</p>
+    <p>Cilj je bio spustiti MAE ispod 1.0°C — <strong>postignut: 0.97°C</strong>. To je poboljšanje od 24.3% u odnosu na najbolji globalni model (ARPÈGE Europe). Sa integracijom Previous Runs revizija, model koristi 1,006 feature-a iz 8 modela + 5 godina opservacija.</p>
 
     <h2>Kako XGBoost funkcioniše</h2>
 
@@ -518,7 +524,7 @@
         <tr><td><code>min_child_weight</code></td><td>5</td><td>Minimalni zbroj hesijana u listu</td></tr>
     </table>
 
-    <p>Treniram poseban model za svaki parametar (temperatura, pritisak, vlažnost, vjetar, tačka rose, udari vjetra, oblačnost, padavine, solarna radijacija), koristeći prognoze svih <strong>8 modela</strong> kao input. Sa 6 godina podataka i train/test splitom na jul 2025., rezultati su:</p>
+    <p>Treniram poseban model za svaki parametar (temperatura, pritisak, vlažnost, vjetar, tačka rose, udari vjetra, oblačnost, padavine, solarna radijacija), koristeći prognoze svih <strong>8 modela</strong> kao input. Sa 5+ godina opservacija (različita dostupnost po modelu) i train/test splitom na jul 2025., rezultati su:</p>
 
     <table>
         <tr><th>Parametar</th><th>XGBoost MAE</th><th>Najbolji model MAE</th><th>Poboljšanje</th></tr>
@@ -713,7 +719,7 @@
             + '<div style="font-size:18px;color:#24292e;font-weight:600">Prosječna greška po parametru (MAE)</div>'
             + '<div style="font-size:14px;color:#586069;margin-top:4px">Niža vrijednost = preciznija prognoza</div></div>'
             + '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:16px">' + cards + '</div>'
-            + '<p style="font-size:14px;color:#586069">Generisano: ' + new Date(data.generated).toLocaleDateString('sr-Latn') + ' · ' + data.models.length + ' modela · 6 godina podataka (2020—2026)</p>';
+            + '<p style="font-size:14px;color:#586069">Generisano: ' + new Date(data.generated).toLocaleDateString('sr-Latn') + ' · ' + data.models.length + ' modela · 5+ godina opservacija (2020—2026)</p>';
     })();
     </script>
 
@@ -729,7 +735,7 @@
         <li>Generiše korigovanu +48h prognozu sa interaktivnim web prikazom</li>
     </ol>
 
-    <p>Model je treniran na <strong>6 godina podataka</strong> (april 2020. — danas) sa 50.000+ satnih tačaka, spojenih iz dva izvora opservacija. Sa 8 modela u ansamblu i pametnom korekcijom vremenskog koda, ovo je značajan korak naprijed u odnosu na prethodnu verziju. Svako mjesečno ažuriranje sa novim podacima donosi marginalna poboljšanja (&lt;1% MAE) s obzirom na već veliku količinu trening podataka.</p>
+    <p>Model je treniran na <strong>5+ godina opservacija</strong> (april 2020. — danas) sa 50.000+ satnih tačaka, spojenih iz dva izvora opservacija. Svaki od 8 modela ima različit period dostupnosti u Open-Meteo API-ju (od 7.000 do 41.500 sati poređenja). Sa 8 modela u ansamblu i pametnom korekcijom vremenskog koda, ovo je značajan korak naprijed u odnosu na prethodnu verziju. Svako mjesečno ažuriranje sa novim podacima donosi marginalna poboljšanja (&lt;1% MAE) s obzirom na već veliku količinu trening podataka.</p>
 
     <p>Linkove korišćenih podataka možete vidjeti na stranici za live prognozu.</p>
 
