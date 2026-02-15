@@ -1,6 +1,6 @@
-# ⛅ Budva Weather — XGBoost korekcija vremenske prognoze
+# Unaprijeđeni vremenski model — XGBoost korekcija vremenske prognoze
 
-Sistem koji koristi **XGBoost** za korekciju grešaka iz **8 NWP modela** na osnovu 6 godina istorijskih podataka, tabela biasa i revizija prognoza (Previous Runs). Trenira poseban model za svaki meteorološki parametar koristeći **1,006 feature-a**.
+Sistem koji koristi **XGBoost** za korekciju grešaka iz **8 NWP modela** na osnovu 6 godina istorijskih podataka, tabela biasa i revizija prognoza (Previous Runs). Trenira poseban model za svaki meteorološki parametar koristeći 1,006 feature-a.
 
 Trenutno radi za **Budvu, Crna Gora** (stanica ibudva5) — ali se lako prilagođava za bilo koju lokaciju sa Weather Underground ličnom meteorološkom stanicom.
 
@@ -261,6 +261,10 @@ pip install -r requirements.txt
 - `matplotlib` — vizualizacija (opciono)
 
 Python 3.10+
+
+## Eksperimentalna v3 verzija modela (zadnji put ažurirana 15.2.2026.)
+
+Ova verzija uključuje dvoprolazno treniranje - koje pokušava da pronađe optimalne `n_estimators` na 5% validacionoj podjeli, a zatim ponovo trenira na svim podacima. Takođe uključuje podjelu na dan i noć, dvostepensku analizu padavina i univerzalno optimalno miješanje, neku vrstu post-processinga za sve dostupne parametre.
 
 ## Napomene
 
