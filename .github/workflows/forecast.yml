@@ -12,7 +12,7 @@ permissions:
 jobs:
   forecast:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
 
     steps:
       - name: Checkout repository
@@ -27,8 +27,8 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run forecast pipeline
-        run: python forecast_48h_v2.py
+      - name: Run forecast pipeline (skip training)
+        run: python forecast_48h_v2.py --skip-training
 
       - name: Copy forecast JSON to docs
         run: cp forecast_output/forecast_48h.json docs/forecast_data/forecast_48h.json

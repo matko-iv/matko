@@ -1101,6 +1101,11 @@ def train_all_models(df):
                 'best_model': best_m, 'best_model_mae': round(best_mae, 3),
                 'ensemble_mae': round(ens_mae, 3),
                 'method': precip_result['best_method'],
+                'is_residual': False,
+                'blend_alpha': float(precip_result.get('blend_alpha', 1.0)),
+                'threshold': float(precip_result['threshold']),
+                'use_sqrt': bool(precip_result.get('use_sqrt', False)),
+                'is_precip': True,
             }
             continue
 
@@ -1207,6 +1212,9 @@ def train_all_models(df):
             'best_model': best_m, 'best_model_mae': round(best_mae, 3),
             'ensemble_mae': round(ens_mae, 3),
             'method': method_str,
+            'is_residual': bool(rb_result['is_residual']),
+            'blend_alpha': float(rb_result['blend_alpha']) if rb_result.get('blend_alpha') is not None else None,
+            'is_precip': False,
         }
 
     with open(os.path.join(MODEL_DIR, 'feature_lists.json'), 'w') as f:
@@ -1215,6 +1223,111 @@ def train_all_models(df):
         json.dump(results, f, indent=2, ensure_ascii=False)
 
     return trained, results
+
+
+def load_trained_models():
+    """Load pre-trained XGBoost models + metadata from disk. No historical data needed."""
+    print("\n[3/6] Ucitavanje SACUVANIH modela (--skip-training)...")
+    results_path = os.path.join(MODEL_DIR, 'training_results.json')
+    features_path = os.path.join(MODEL_DIR, 'feature_lists.json')
+    bias_path = os.path.join(MODEL_DIR, 'bias_tables.json')
+
+    if not os.path.exists(results_path) or not os.path.exists(features_path):
+        raise FileNotFoundError(f"Nema sacuvanih modela u {MODEL_DIR}. Pokrenite prvo bez --skip-training.")
+
+    with open(results_path, 'r', encoding='utf-8') as f:
+        results = json.load(f)
+    with open(features_path, 'r') as f:
+        feature_lists = json.load(f)
+
+    bias_tables = {}
+    if os.path.exists(bias_path):
+        with open(bias_path, 'r') as f:
+            bt_raw = json.load(f)
+        for k, v in bt_raw.items():
+            bias_tables[k] = pd.DataFrame(v)
+
+    trained = {}
+    for param, rinfo in results.items():
+        features = feature_lists.get(param, [])
+        if not features:
+            continue
+
+        if rinfo.get('is_precip', False):
+            # Precipitation: load cls + reg + single models
+            cls_path = os.path.join(MODEL_DIR, f"xgb_{param}_cls.json")
+            reg_path = os.path.join(MODEL_DIR, f"xgb_{param}_reg.json")
+            single_path = os.path.join(MODEL_DIR, f"xgb_{param}.json")
+            if not all(os.path.exists(p) for p in [cls_path, reg_path, single_path]):
+                print(f"  {rinfo['display']:20s} --- SKIP (fajlovi ne postoje)")
+                continue
+
+            cls_model = xgb.XGBClassifier()
+            cls_model.load_model(cls_path)
+            reg_model = xgb.XGBRegressor()
+            reg_model.load_model(reg_path)
+            single_model = xgb.XGBRegressor()
+            single_model.load_model(single_path)
+
+            trained[param] = {
+                'precip_info': {
+                    'cls_model': cls_model,
+                    'reg_model': reg_model,
+                    'single_model': single_model,
+                    'best_method': rinfo['method'],
+                    'threshold': rinfo.get('threshold', 0.35),
+                    'use_sqrt': rinfo.get('use_sqrt', False),
+                    'blend_alpha': rinfo.get('blend_alpha', 1.0),
+                },
+                'features': features,
+                'mae': rinfo['mae'], 'rmse': rinfo['rmse'],
+                'best_model': rinfo.get('best_model', ''),
+                'best_model_mae': rinfo.get('best_model_mae', 0),
+                'ensemble_mae': rinfo.get('ensemble_mae', 0),
+                'improvement': rinfo.get('improvement', 0),
+            }
+            print(f"  {rinfo['display']:20s} loaded (MAE={rinfo['mae']}) [{rinfo['method']}]")
+        else:
+            # Standard params: load direct + optional residual
+            direct_path = os.path.join(MODEL_DIR, f"xgb_{param}.json")
+            resid_path = os.path.join(MODEL_DIR, f"xgb_{param}_resid.json")
+            if not os.path.exists(direct_path):
+                print(f"  {rinfo['display']:20s} --- SKIP (fajl ne postoji)")
+                continue
+
+            direct_model = xgb.XGBRegressor()
+            direct_model.load_model(direct_path)
+
+            is_residual = rinfo.get('is_residual', False)
+            resid_model = None
+            if is_residual and os.path.exists(resid_path):
+                resid_model = xgb.XGBRegressor()
+                resid_model.load_model(resid_path)
+
+            # 'model' points to the one actually used for prediction
+            if is_residual and resid_model is not None:
+                active_model = resid_model
+            else:
+                active_model = direct_model
+
+            trained[param] = {
+                'model': active_model,
+                'direct_model': direct_model,
+                'resid_model': resid_model,
+                'method': rinfo.get('method', 'direct'),
+                'is_residual': is_residual,
+                'blend_alpha': rinfo.get('blend_alpha'),
+                'features': features,
+                'mae': rinfo['mae'], 'rmse': rinfo['rmse'],
+                'best_model': rinfo.get('best_model', ''),
+                'best_model_mae': rinfo.get('best_model_mae', 0),
+                'ensemble_mae': rinfo.get('ensemble_mae', 0),
+                'improvement': rinfo.get('improvement', 0),
+            }
+            print(f"  {rinfo['display']:20s} loaded (MAE={rinfo['mae']}) [{rinfo.get('method', 'direct')}]")
+
+    print(f"  Ucitano {len(trained)}/{len(results)} modela.")
+    return trained, results, bias_tables
 
 
 def fetch_live_forecasts():
@@ -1737,23 +1850,30 @@ def generate_output(corrected, trained, results, fc_raw=None):
 
 
 if __name__ == "__main__":
-    hist = load_historical_data()
+    skip_training = '--skip-training' in sys.argv or '--skip_training' in sys.argv
 
-    print("\n[2/6] Feature engineering + tabele biasa...")
-    bias_tables = compute_bias_tables(hist)
-    hist = apply_bias_features(hist, bias_tables)
-    hist = engineer_features(hist)
-    print(f"  Dimenzije: {hist.shape[0]} x {hist.shape[1]}")
+    if skip_training:
+        print("\n  MODE: --skip-training (ucitavam sacuvane modele)")
+        trained, results, bias_tables = load_trained_models()
+    else:
+        hist = load_historical_data()
 
-    bias_path = os.path.join(MODEL_DIR, 'bias_tables.json')
-    bt_serializable = {}
-    for k, v in bias_tables.items():
-        bt_serializable[k] = v.to_dict(orient='records')
-    with open(bias_path, 'w') as f:
-        json.dump(bt_serializable, f)
-    print(f"  Bias tabele: {bias_path}")
+        print("\n[2/6] Feature engineering + tabele biasa...")
+        bias_tables = compute_bias_tables(hist)
+        hist = apply_bias_features(hist, bias_tables)
+        hist = engineer_features(hist)
+        print(f"  Dimenzije: {hist.shape[0]} x {hist.shape[1]}")
 
-    trained, results = train_all_models(hist)
+        bias_path = os.path.join(MODEL_DIR, 'bias_tables.json')
+        bt_serializable = {}
+        for k, v in bias_tables.items():
+            bt_serializable[k] = v.to_dict(orient='records')
+        with open(bias_path, 'w') as f:
+            json.dump(bt_serializable, f)
+        print(f"  Bias tabele: {bias_path}")
+
+        trained, results = train_all_models(hist)
+
     fc_all = fetch_live_forecasts()
     corrected = apply_correction(fc_all, trained, bias_tables)
     json_path, csv_path = generate_output(corrected, trained, results, fc_raw=fc_all)

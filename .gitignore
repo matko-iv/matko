@@ -1,7 +1,6 @@
 .venv/
 __pycache__/
 *.pyc
-trained_models_v2/
 forecast_output/
 .idea/
 .vscode/
