@@ -1,6 +1,6 @@
 # Unaprijeđeni vremenski model — XGBoost korekcija vremenske prognoze
 
-Sistem koji koristi **XGBoost** za korekciju grešaka iz **8 NWP modela** na osnovu 6 godina istorijskih podataka, tabela biasa i revizija prognoza (Previous Runs). Trenira poseban model za svaki meteorološki parametar koristeći 1,006 feature-a.
+Sistem koji koristi **XGBoost** za korekciju grešaka iz **8 NWP modela** na osnovu 6 godina istorijskih podataka, tabela biasa i revizija prognoza (Previous Runs). Trenira poseban model za svaki meteorološki parametar koristeći 1,100+ feature-a, sa Huber loss i rezidualnim pristupom za temperature i tačku rose.
 
 Trenutno radi za **Budvu, Crna Gora** (stanica ibudva5) — ali se lako prilagođava za bilo koju lokaciju sa Weather Underground ličnom meteorološkom stanicom.
 
@@ -12,17 +12,17 @@ Trenutno radi za **Budvu, Crna Gora** (stanica ibudva5) — ali se lako prilago�
 
 | Parametar | XGBoost MAE | Najbolji model | Poboljšanje |
 |-----------|-------------|----------------|:-----------:|
-| **Temperatura** | **0.97°C** | 1.28°C (ARPÈGE) | **+24.3%** |
-| Tačka rose | 1.17°C | 2.13°C (ECMWF) | +45.3% |
-| Vlažnost | 6.37% | 9.03% (ECMWF) | +29.5% |
-| **Brzina vjetra** | **0.45 m/s** | 0.72 m/s (ECMWF) | **+36.7%** |
-| Udari vjetra | 0.60 m/s | 1.80 m/s (GFS) | +66.6% |
-| **Pritisak** | **0.36 hPa** | 0.70 hPa (ItaliaMeteo) | **+49.0%** |
-| Oblačnost | 9.89% | 27.39% (BOM) | +63.9% |
-| Padavine | 1.61 mm | 1.52 mm (GFS) | −6.2% |
-| Solar. radijacija | 21.45 W/m² | 35.17 W/m² (ItaliaMeteo) | +39.0% |
+| **Temperatura** | **0.89°C** | 1.28°C (ARPÈGE) | **+30.5%** |
+| Tačka rose | 1.07°C | 2.13°C (ECMWF) | +49.8% |
+| Vlažnost | 6.31% | 9.03% (ECMWF) | +30.1% |
+| **Brzina vjetra** | **0.45 m/s** | 0.72 m/s (ECMWF) | **+37.5%** |
+| Udari vjetra | 0.60 m/s | 1.80 m/s (GFS) | +66.7% |
+| **Pritisak** | **0.32 hPa** | 0.70 hPa (ItaliaMeteo) | **+54.3%** |
+| Oblačnost | 9.81% | 27.39% (BOM) | +64.2% |
+| Padavine | 1.54 mm | 1.52 mm (GFS) | −1.3% |
+| Solar. radijacija | 21.46 W/m² | 35.17 W/m² (ItaliaMeteo) | +39.0% |
 
-> Temperatura ispod **1°C MAE**. Oblačnost poboljšana za **64%**. Jedino padavine ostaju na nivou najboljeg modela — precipitacija je inherentno najteža varijabla.
+> Temperatura ispod **0.9°C MAE** zahvaljujući Huber loss + rezidualnom pristupu. Pritisak poboljšan za **54%**. Jedino padavine ostaju na nivou najboljeg modela — precipitacija je inherentno najteža varijabla.
 
 ---
 
@@ -56,8 +56,8 @@ WU Stanica          8 NWP Modela              Previous Runs API
 1. **Scrape opservacije** — satni podaci sa Weather Underground stanice (temperatura, vlažnost, vjetar, pritisak, padavine, solarna radijacija). 6 godina, ~50,000 sati.
 2. **Preuzmi istorijske prognoze** — iz 8 modela preko [Open-Meteo Historical Forecast API](https://open-meteo.com/en/docs/historical-forecast-api)
 3. **Preuzmi Previous Runs** — Day1/Day2 revizije prognoza iz [Previous Runs API](https://previous-runs-api.open-meteo.com) (od jan 2024)
-4. **Feature engineering** — 1,006 feature-a: ensemble statistike, bias tabele, forecast revizije, meteorološki signali
-5. **Treniraj XGBoost** — 9 modela sa `reg:absoluteerror`, early stopping, train/test split na jul 2025
+4. **Feature engineering** — 1,100+ feature-a: ensemble statistike, bias tabele, forecast revizije, meteorološki signali
+5. **Treniraj XGBoost** — 9 modela, dvoprolazno treniranje (5% val → retrain na svim podacima), Huber loss za rezidualne modele, ensemble blending, train/test split na jul 2025
 6. **Generiši prognozu** — live prognoze + Previous Runs → korekcija → pametni vremenski kodovi → JSON za frontend
 
 Pipeline se pokreće automatski preko GitHub Actions i objavljuje na GitHub Pages.
@@ -262,11 +262,15 @@ pip install -r requirements.txt
 
 Python 3.10+
 
-## Eksperimentalna v3 verzija modela (zadnji put ažurirana 15.2.2026.)
+## Huber Loss i rezidualni pristup
 
-Ova verzija uključuje dvoprolazno treniranje - koje pokušava da pronađe optimalne `n_estimators` na 5% validacionoj podjeli, a zatim ponovo trenira na svim podacima. Takođe uključuje podjelu na dan i noć, dvostepensku analizu padavina i univerzalno optimalno miješanje, neku vrstu post-processinga za sve dostupne parametre.
+Umjesto standardnog squared error-a, za temperaturu i tačku rose koristimo rezidualni pristup sa Huber loss funkcijom (`reg:pseudohubererror`).
 
-Realna opipljiva poboljšanja MAE su minimalna u poređenju sa v2 verzijom, ali ovo služi kao sveobuhvatno istraživanje podataka i mogućnosti modeliranja.
+Rezidualni pristup znači da model ne predviđa direktno konačnu vrijednost (npr. 23.5°C), nego korekciju — razliku između ensemble prosjeka i stvarnog mjerenja. Korekcije su mali brojevi (±2-3°C), što olakšava posao modelu.
+
+Huber loss je kompromis između MSE i MAE. Za male greške (ispod praga δ) ponaša se kao MSE — glatki gradijenti, stabilna optimizacija. Za velike greške prelazi u MAE — ne eksplodira na outlierima. Kombinacija reziduala i Huber-a je spustila MAE temperature sa 0.96 na 0.89°C.
+
+Za svaki parametar, pipeline automatski trenira tri varijante (direktni model, rezidualni Huber, ensemble blend) i bira onu sa najnižim MAE na test setu. Padavine koriste dvostepenski pristup — klasifikator (pada/ne pada) + regressor na sqrt(amount).
 
 ## Napomene
 
