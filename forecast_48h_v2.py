@@ -1015,7 +1015,6 @@ def train_all_models(df):
             print(f"  {info['display']:20s} --- SKIP (train={len(X_tr)}, test={len(X_te)})")
             continue
 
-        # --- PRECIPITATION: two-stage + optional blend ---
         if param == 'precipitation':
             X_train_p, y_train_p, X_val_p, y_val_p = _make_val_split(X_tr, y_tr)
             precip_result = _train_precipitation_twostage(
@@ -1109,7 +1108,6 @@ def train_all_models(df):
             }
             continue
 
-        # --- ALL OTHER PARAMS: residual + blended (full 50K) ---
         if param in ('temperature_2m', 'dew_point_2m', 'pressure_msl'):
             hp = dict(n_estimators=1200, max_depth=6, learning_rate=0.03,
                       subsample=0.8, colsample_bytree=0.7, reg_alpha=0.1,
@@ -1254,7 +1252,6 @@ def load_trained_models():
             continue
 
         if rinfo.get('is_precip', False):
-            # Precipitation: load cls + reg + single models
             cls_path = os.path.join(MODEL_DIR, f"xgb_{param}_cls.json")
             reg_path = os.path.join(MODEL_DIR, f"xgb_{param}_reg.json")
             single_path = os.path.join(MODEL_DIR, f"xgb_{param}.json")
@@ -1288,7 +1285,6 @@ def load_trained_models():
             }
             print(f"  {rinfo['display']:20s} loaded (MAE={rinfo['mae']}) [{rinfo['method']}]")
         else:
-            # Standard params: load direct + optional residual
             direct_path = os.path.join(MODEL_DIR, f"xgb_{param}.json")
             resid_path = os.path.join(MODEL_DIR, f"xgb_{param}_resid.json")
             if not os.path.exists(direct_path):
@@ -1304,7 +1300,6 @@ def load_trained_models():
                 resid_model = xgb.XGBRegressor()
                 resid_model.load_model(resid_path)
 
-            # 'model' points to the one actually used for prediction
             if is_residual and resid_model is not None:
                 active_model = resid_model
             else:
@@ -1517,7 +1512,6 @@ def apply_correction(fc_df, trained, bias_tables):
             if X[c].dtype == 'object':
                 X[c] = pd.to_numeric(X[c], errors='coerce').fillna(-999)
 
-        # --- Precipitation: two-stage ---
         if param == 'precipitation' and 'precip_info' in minfo:
             pinfo = minfo['precip_info']
             method = pinfo['best_method']
@@ -1558,7 +1552,6 @@ def apply_correction(fc_df, trained, bias_tables):
             print(f"  {TARGET_PARAMS[param]['display']:20s} (MAE={minfo['mae']:.3f}{TARGET_PARAMS[param]['unit']}) [{method_lbl}]")
             continue
 
-        # --- All other params: direct / residual / blend ---
         method_name = minfo.get('method', 'direct')
         model = minfo['model']
         pred = model.predict(X)
@@ -1577,6 +1570,20 @@ def apply_correction(fc_df, trained, bias_tables):
             pred = np.clip(pred, 0, 100)
         elif param == 'cloud_cover':
             pred = np.clip(pred, 0, 100)
+            # One issue that I've had with clouds is winter morning overcast scenarios, the XGBoost model regularly overpowers, so to fix the XGBoost offset: when ensemble unanimously says clear sky,
+            # don't let XGBoost hallucinate clouds from climatology.
+            ens_col_cc = f'{param}_ens_mean'
+            if ens_col_cc in fc.columns:
+                ens_cc = pd.to_numeric(fc[ens_col_cc], errors='coerce').fillna(0).values
+                # If ensemble < 10%, cap XGBoost at ensemble + 30%
+                low_ens = ens_cc < 10
+                if low_ens.any():
+                    pred[low_ens] = np.minimum(pred[low_ens], ens_cc[low_ens] + 30)
+                # If ensemble > 90%, floor XGBoost at ensemble - 30%
+                high_ens = ens_cc > 90
+                if high_ens.any():
+                    pred[high_ens] = np.maximum(pred[high_ens], ens_cc[high_ens] - 30)
+                pred = np.clip(pred, 0, 100)
         elif param in ['wind_speed_10m', 'wind_gusts_10m', 'shortwave_radiation']:
             pred = np.clip(pred, 0, None)
 
