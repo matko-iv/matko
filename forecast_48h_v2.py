@@ -1636,47 +1636,68 @@ WMO_CODES = {
 
 
 def _daily_narrative(grp):
-    """
+    """Generate AccuWeather-style daily narrative + pick best icon/code.
+
     Expects DataFrame with columns: hour, cloud_cover, precipitation,
-    wind_speed_10m, wind_gusts_10m, temperature_2m, weather_code.
+    wind_speed_10m, wind_gusts_10m, temperature_2m, weather_code,
+    (optional) wind_direction_10m.
+    Returns dict with keys: narrative, weather_code, weather_icon,
+    weather_desc, weather_emoji.
     """
     def _col(name):
-        s = pd.to_numeric(grp.get(name, pd.Series(dtype=float)), errors='coerce')
-        return s
+        return pd.to_numeric(grp.get(name, pd.Series(dtype=float)), errors='coerce')
 
-    hr = grp['hour']
+    hr = grp['hour'].astype(int)
     cc = _col('cloud_cover')
     pr = _col('precipitation')
     ws = _col('wind_speed_10m')
     wg = _col('wind_gusts_10m')
     tp = _col('temperature_2m')
     wc = _col('weather_code')
+    wd = _col('wind_direction_10m')
 
+    # ── Period analysis ────────────────────────────────────────────
     def _period(h0, h1):
         mask = (hr >= h0) & (hr < h1)
         sub_cc = cc[mask].dropna()
         sub_pr = pr[mask].dropna()
         sub_wc = wc[mask].dropna()
+        sub_ws = ws[mask].dropna()
         return {
             'cloud': float(sub_cc.mean()) if len(sub_cc) else None,
             'precip': float(sub_pr.sum()) if len(sub_pr) else 0,
+            'precip_max_h': float(sub_pr.max()) if len(sub_pr) else 0,
             'has_rain': float(sub_pr.sum()) > 0.1 if len(sub_pr) else False,
+            'rain_hours': int((sub_pr > 0.1).sum()) if len(sub_pr) else 0,
             'has_thunder': bool((sub_wc >= 95).any()) if len(sub_wc) else False,
             'has_snow': bool(((sub_wc >= 71) & (sub_wc <= 75)).any()) if len(sub_wc) else False,
             'has_fog': bool(((sub_wc >= 45) & (sub_wc <= 48)).any()) if len(sub_wc) else False,
+            'wind_max': float(sub_ws.max()) if len(sub_ws) else 0,
             'n': int(mask.sum()),
         }
 
+    night = _period(0, 6)
     morn = _period(6, 12)
     aftn = _period(12, 18)
     eve = _period(18, 24)
 
     total_precip = float(pr.sum()) if pr.notna().any() else 0
+    rain_hours_total = int((pr > 0.1).sum()) if pr.notna().any() else 0
     max_wind = float(ws.max()) if ws.notna().any() else 0
     max_gust = float(wg.max()) if wg.notna().any() else 0
-    temp_max = float(tp.max()) if tp.notna().any() else 15
-    temp_min = float(tp.min()) if tp.notna().any() else 10
+    temp_max = float(tp.max()) if tp.notna().any() else None
+    temp_min = float(tp.min()) if tp.notna().any() else None
 
+    # Wind direction (dominant)
+    wind_dir_str = ""
+    if wd.notna().any():
+        rad = np.radians(wd.dropna())
+        avg_deg = float(np.degrees(np.arctan2(np.sin(rad).mean(), np.cos(rad).mean())) % 360)
+        compass = ['S', 'SSI', 'SI', 'ISI', 'I', 'IJI', 'JI', 'JJI',
+                    'J', 'JJZ', 'JZ', 'ZJZ', 'Z', 'ZSZ', 'SZ', 'SSZ']
+        wind_dir_str = compass[round(avg_deg / 22.5) % 16]
+
+    # ── Sky classification ─────────────────────────────────────────
     def sky(c):
         if c is None:
             return 'unknown'
@@ -1692,69 +1713,135 @@ def _daily_narrative(grp):
 
     ms, as_, es = sky(morn['cloud']), sky(aftn['cloud']), sky(eve['cloud'])
     rain_m, rain_a, rain_e = morn['has_rain'], aftn['has_rain'], eve['has_rain']
-    has_thunder = morn['has_thunder'] or aftn['has_thunder'] or eve['has_thunder']
-    has_snow = morn['has_snow'] or aftn['has_snow'] or eve['has_snow']
+    has_thunder = night['has_thunder'] or morn['has_thunder'] or aftn['has_thunder'] or eve['has_thunder']
+    has_snow = night['has_snow'] or morn['has_snow'] or aftn['has_snow'] or eve['has_snow']
     has_fog_morn = morn['has_fog']
 
+    # Daytime cloud average for icon
+    daytime_cc = cc[(hr >= 7) & (hr <= 19)].dropna()
+    cloud_day_avg = float(daytime_cc.mean()) if len(daytime_cc) else 50
+
+    # ── Choose representative daily icon/code ──────────────────────
+    if has_thunder:
+        day_wc = 95
+    elif has_snow and total_precip >= 3:
+        day_wc = 75
+    elif has_snow:
+        day_wc = 73 if total_precip >= 1 else 71
+    elif total_precip >= 10:
+        day_wc = 65
+    elif total_precip >= 3:
+        day_wc = 63
+    elif total_precip >= 0.5:
+        day_wc = 61
+    elif total_precip > 0.1:
+        day_wc = 51
+    elif has_fog_morn:
+        day_wc = 45
+    elif cloud_day_avg >= 80:
+        day_wc = 3
+    elif cloud_day_avg >= 55:
+        day_wc = 2
+    elif cloud_day_avg >= 25:
+        day_wc = 1
+    else:
+        day_wc = 0
+
+    # Brief rain → shower icon
+    if 51 <= day_wc <= 65 and rain_hours_total <= 4:
+        if day_wc >= 63:
+            day_wc = 80
+
+    day_wmo = WMO_CODES.get(day_wc, WMO_CODES[0])
+
+    # ── Build narrative ────────────────────────────────────────────
     parts = []
 
     if has_snow:
-        if rain_m and not rain_a:
+        snow_desc = "snijeg"
+        if total_precip >= 5:
+            snow_desc = "obilniji snijeg"
+        if rain_m and rain_a and rain_e:
+            parts.append(f"Snijeg tokom cijelog dana ({total_precip:.0f} mm)")
+        elif rain_m and not rain_a:
             parts.append("Snijeg ujutru, prestanak poslijepodne")
         elif not rain_m and rain_a:
             parts.append("Suvo ujtro, snijeg poslijepodne")
-        elif rain_m and rain_a and rain_e:
-            parts.append("Snijeg tokom cijelog dana")
-        elif total_precip >= 5:
-            parts.append("Obilniji snijeg")
+        elif not rain_m and not rain_a and rain_e:
+            parts.append("Suvo do uveče, zatim snijeg")
         else:
-            parts.append("Povremeni snijeg")
+            parts.append(f"Povremeni {snow_desc}")
     elif has_thunder:
         if not rain_m and rain_a and not rain_e:
-            parts.append("Sunce pa grmljavina poslijepodne")
+            parts.append("Sunčano pa grmljavinska kiša poslijepodne")
         elif rain_m and not rain_a:
             parts.append("Grmljavina ujutru, razvedravanje poslijepodne")
         elif not rain_m and not rain_a and rain_e:
-            parts.append("Suvo tokom dana, grmljavina uveče")
+            parts.append("Pretežno suvo, grmljavina uveče")
         elif rain_m and rain_a:
             parts.append("Oblačno uz povremenu grmljavinu")
+        elif night['has_thunder'] and not morn['has_thunder'] and not aftn['has_thunder']:
+            parts.append("Grmljavina noću, zatim smirivanje")
         else:
-            parts.append("Oblačno sa grmljavinom")
+            parts.append("Nestabilno uz grmljavinu")
+        if total_precip >= 5:
+            parts[0] += f" ({total_precip:.0f} mm)"
     elif total_precip > 0.2:
+        precip_str = f" ({total_precip:.1f} mm)" if total_precip >= 1 else ""
         if rain_m and rain_a and rain_e:
-            if total_precip >= 10:
-                parts.append("Obilna kiša tokom cijelog dana")
-            elif total_precip >= 3:
-                parts.append("Kiša tokom cijelog dana")
+            if total_precip >= 15:
+                parts.append(f"Obilna kiša tokom cijelog dana ({total_precip:.0f} mm)")
+            elif total_precip >= 5:
+                parts.append(f"Kiša tokom cijelog dana ({total_precip:.0f} mm)")
+            elif total_precip >= 1:
+                parts.append(f"Povremena kiša tokom dana ({total_precip:.1f} mm)")
             else:
                 parts.append("Povremena slaba kiša")
         elif rain_m and rain_a and not rain_e:
-            parts.append("Kiša ujutru i poslijepodne, suvo uveče")
+            parts.append(f"Kiša ujutru i poslijepodne, suvo uveče{precip_str}")
         elif rain_m and not rain_a and not rain_e:
-            parts.append("Kiša ujutru, razvedravanje poslijepodne")
+            if morn['precip'] >= 3:
+                parts.append(f"Jača kiša ujutru ({morn['precip']:.1f} mm), razvedravanje poslijepodne")
+            else:
+                parts.append(f"Kiša ujutru, razvedravanje poslijepodne{precip_str}")
         elif rain_m and not rain_a and rain_e:
-            parts.append("Kiša ujutru i uveče, suvo poslijepodne")
+            parts.append(f"Kiša ujutru i uveče, suvo poslijepodne{precip_str}")
         elif not rain_m and rain_a and rain_e:
             if ms in ('clear', 'mostly_clear'):
-                parts.append("Sunčano ujtro, kiša od poslijepodneva")
+                parts.append(f"Sunčano ujutru, kiša od poslijepodneva{precip_str}")
             else:
-                parts.append("Kiša od poslijepodneva")
+                parts.append(f"Kiša od poslijepodneva{precip_str}")
         elif not rain_m and rain_a and not rain_e:
             if ms in ('clear', 'mostly_clear'):
-                parts.append("Sunčano pa kiša poslijepodne")
+                parts.append(f"Sunčano pa kiša poslijepodne{precip_str}")
             else:
-                parts.append("Oblačno, kiša poslijepodne")
+                parts.append(f"Oblačno, kiša poslijepodne{precip_str}")
         elif not rain_m and not rain_a and rain_e:
-            parts.append("Suvo do večeri, zatim kiša")
+            parts.append(f"suvo do večeri, zatim kiša{precip_str}")
+        elif night['has_rain'] and not rain_m and not rain_a and not rain_e:
+            if ms in ('clear', 'mostly_clear'):
+                parts.append("Kiša noću, sunčano tokom dana")
+            else:
+                parts.append("Kiša noću, suvo tokom dana")
         else:
-            parts.append("Povremena kiša")
+            parts.append(f"Povremena kiša{precip_str}")
     elif has_fog_morn:
-        if aftn['cloud'] is not None and aftn['cloud'] < 40:
+        if as_ in ('clear', 'mostly_clear'):
             parts.append("Magla ujtro, sunčano poslijepodne")
+        elif as_ in ('partly_cloudy',):
+            parts.append("Magla ujtro, djelimično oblačno poslijepodne")
         else:
             parts.append("Magla ujtro, oblačno poslijepodne")
     else:
-        if morn['n'] == 0 and aftn['n'] > 0:
+        # No precipitation — describe sky evolution
+        if morn['n'] == 0 and aftn['n'] == 0 and eve['n'] > 0:
+            sky_labels = {
+                'clear': 'Vedro uveče', 'mostly_clear': 'Pretežno vedro uveče',
+                'partly_cloudy': 'Djelimično oblačno', 'mostly_cloudy': 'Pretežno oblačno',
+                'cloudy': 'Oblačno uveče',
+            }
+            parts.append(sky_labels.get(es, 'Promjenljivo'))
+        elif morn['n'] == 0 and aftn['n'] > 0:
             sky_labels = {
                 'clear': 'Vedro i sunčano', 'mostly_clear': 'Pretežno vedro',
                 'partly_cloudy': 'Djelimično oblačno', 'mostly_cloudy': 'Pretežno oblačno',
@@ -1765,26 +1852,27 @@ def _daily_narrative(grp):
             sky_labels = {
                 'clear': 'Vedro i sunčano tokom dana',
                 'mostly_clear': 'Pretežno vedro i sunčano',
-                'partly_cloudy': 'Smjena sunca i oblaka',
-                'mostly_cloudy': 'Pretežno oblačno',
-                'cloudy': 'Oblačno tokom dana',
+                'partly_cloudy': 'Smjena sunca i oblaka tokom dana',
+                'mostly_cloudy': 'Pretežno oblačno tokom dana',
+                'cloudy': 'Oblačno tokom cijelog dana',
             }
             parts.append(sky_labels.get(ms, 'Promjenljivo'))
         elif ms in ('clear', 'mostly_clear') and as_ in ('mostly_cloudy', 'cloudy'):
-            parts.append("Sunčano ujtro, naoblačenje poslijepodne")
+            parts.append("Sunčano ujutru, naoblačenje poslijepodne")
         elif ms in ('mostly_cloudy', 'cloudy') and as_ in ('clear', 'mostly_clear'):
-            parts.append("Oblačno ujtro, razvedravanje poslijepodne")
+            parts.append("Oblačno ujutru, razvedravanje poslijepodne")
         elif ms in ('clear', 'mostly_clear') and as_ == 'partly_cloudy':
             parts.append("Sunčano uz poneki oblak poslijepodne")
         elif ms == 'partly_cloudy' and as_ in ('clear', 'mostly_clear'):
-            parts.append("Oblaci ujtro, sunčano poslijepodne")
+            parts.append("Oblaci ujutru, sunčano poslijepodne")
         elif ms == 'partly_cloudy' and as_ in ('mostly_cloudy', 'cloudy'):
             parts.append("Sve više oblaka tokom dana")
         elif ms in ('mostly_cloudy', 'cloudy') and as_ == 'partly_cloudy':
-            parts.append("Oblačno ujtro, djelimično razvedravanje")
+            parts.append("Oblačno ujutru, djelimično razvedravanje")
         else:
             parts.append("Promjenljivo oblačno")
 
+        # Evening twist
         if es != 'unknown' and len(parts) > 0:
             curr_end = as_ if as_ != 'unknown' else ms
             if curr_end in ('clear', 'mostly_clear') and es in ('mostly_cloudy', 'cloudy'):
@@ -1792,31 +1880,130 @@ def _daily_narrative(grp):
             elif curr_end in ('mostly_cloudy', 'cloudy') and es in ('clear', 'mostly_clear'):
                 parts[0] += "; razvedravanje uveče"
 
-    if max_wind >= 9.0:
-        parts.append("jak vjetar")
-    elif max_wind >= 6.0:
-        parts.append("vjetrovito")
-    elif max_wind >= 4.0:
-        parts.append("umjeren vjetar")
+    # --- Wind modifier ---
+    wind_part = ""
+    if max_wind >= 10:
+        wind_part = f"jak {wind_dir_str} vjetar" if wind_dir_str else "jak vjetar"
+    elif max_wind >= 7:
+        wind_part = f"vjetrovito ({wind_dir_str})" if wind_dir_str else "vjetrovito"
+    elif max_wind >= 5:
+        wind_part = f"umjeren {wind_dir_str} vjetar" if wind_dir_str else "umjeren vjetar"
 
-    if max_gust >= 15:
-        parts.append(f"udari do {max_gust:.0f} m/s")
+    if wind_part:
+        if max_gust >= 15:
+            wind_part += f", udari do {max_gust:.0f} m/s"
+        parts.append(wind_part)
+    elif max_gust >= 15:
+        parts.append(f"udari vjetra do {max_gust:.0f} m/s")
 
-    if temp_max >= 34:
-        parts.append("izuzetno vruće")
-    elif temp_max >= 30:
-        parts.append("vruće")
-    elif temp_min <= -5:
-        parts.append("jak mraz")
-    elif temp_min <= 0:
-        parts.append("mraz")
+    # --- Temperature context ---
+    if temp_max is not None:
+        if temp_max >= 37:
+            parts.append("izuzetno vruće")
+        elif temp_max >= 33:
+            parts.append("vruće")
+    if temp_min is not None:
+        if temp_min <= -5:
+            parts.append("jak mraz")
+        elif temp_min <= 0:
+            parts.append("mraz")
 
-    if len(parts) == 0:
-        return "Promjenljivo"
-    elif len(parts) == 1:
-        return parts[0]
-    else:
-        return f"{parts[0]}; {'; '.join(parts[1:])}"
+    narrative = "Promjenljivo"
+    if len(parts) == 1:
+        narrative = parts[0]
+    elif len(parts) > 1:
+        narrative = f"{parts[0]}; {'; '.join(parts[1:])}"
+
+    return {
+        'narrative': narrative,
+        'weather_code': day_wc,
+        'weather_desc': day_wmo['desc'],
+        'weather_icon': day_wmo['icon'],
+        'weather_emoji': day_wmo['emoji'],
+    }
+
+
+def _build_daily_summary(date_str, day_name, grp_df, fc_raw=None):
+    """Build a single daily summary dict from a group of hourly forecast rows.
+    Uses _daily_narrative for icon/desc/narrative (unified, not split).
+    grp_df must have 'hour' column and XGBoost/ensemble columns.
+    """
+    def _v(col_xgb, col_ens):
+        c = grp_df.get(col_xgb, grp_df.get(col_ens, pd.Series(dtype=float)))
+        return pd.to_numeric(c, errors='coerce') if isinstance(c, pd.Series) else pd.Series(dtype=float)
+
+    temp = _v('temperature_2m_xgb', 'temperature_2m_ensemble')
+    wind = _v('wind_speed_10m_xgb', 'wind_speed_10m_ensemble')
+    gusts = _v('wind_gusts_10m_xgb', 'wind_gusts_10m_ensemble')
+    precip = _v('precipitation_xgb', 'precipitation_ensemble')
+    humid = _v('relative_humidity_2m_xgb', 'relative_humidity_2m_ensemble')
+    pres = _v('pressure_msl_xgb', 'pressure_msl_ensemble')
+    cloud = _v('cloud_cover_xgb', 'cloud_cover_ensemble')
+
+    ds = {"date": date_str, "day_name": day_name}
+    if temp.notna().any():
+        ds['temp_min'] = round(float(temp.min()), 1)
+        ds['temp_max'] = round(float(temp.max()), 1)
+    if wind.notna().any():
+        ds['wind_max'] = round(float(wind.max()), 1)
+    if gusts.notna().any():
+        ds['gust_max'] = round(float(gusts.max()), 1)
+    ds['precip_total'] = round(float(precip.sum()), 1) if precip.notna().any() else 0
+    if humid.notna().any():
+        ds['humidity_avg'] = round(float(humid.mean()), 0)
+    if pres.notna().any():
+        ds['pressure_avg'] = round(float(pres.mean()), 0)
+
+    # Wind direction
+    wd_s = pd.to_numeric(grp_df.get('wind_direction_10m_ens',
+                         grp_df.get('wind_direction_10m', pd.Series(dtype=float))),
+                         errors='coerce').dropna()
+    if len(wd_s) > 0:
+        rad = np.radians(wd_s)
+        ds['wind_dir_avg'] = round(float(np.degrees(
+            np.arctan2(np.sin(rad).mean(), np.cos(rad).mean())) % 360), 0)
+
+    # Cloud cover (daytime)
+    hr = grp_df['hour'].astype(int)
+    daytime_mask = (hr >= 7) & (hr <= 19)
+    if cloud.notna().any() and daytime_mask.any():
+        dc = cloud[daytime_mask].dropna()
+        if len(dc) > 0:
+            ds['cloud_cover_day'] = round(float(dc.mean()), 0)
+
+    # ── Unified narrative + icon from full day data ──
+    narr_df = pd.DataFrame({
+        'hour': hr.values,
+        'cloud_cover': cloud.values,
+        'precipitation': precip.values,
+        'wind_speed_10m': wind.values,
+        'wind_gusts_10m': gusts.values,
+        'temperature_2m': temp.values,
+        'weather_code': pd.to_numeric(
+            grp_df.get('weather_code', pd.Series(dtype=float)), errors='coerce').values,
+        'wind_direction_10m': wd_s.reindex(grp_df.index).values if len(wd_s) > 0 else np.nan,
+    })
+    narr = _daily_narrative(narr_df)
+    ds.update({
+        'weather_code': narr['weather_code'],
+        'weather_desc': narr['weather_desc'],
+        'weather_icon': narr['weather_icon'],
+        'weather_emoji': narr['weather_emoji'],
+        'day_narrative': narr['narrative'],
+    })
+
+    # Precip probability from raw model data
+    if fc_raw is not None:
+        raw_mask = fc_raw['datetime'].isin(grp_df['datetime'])
+        raw_grp = fc_raw[raw_mask]
+        pcols = [f"{m}_precipitation_model" for m in MODELS
+                 if f"{m}_precipitation_model" in raw_grp.columns]
+        if pcols:
+            has_rain = [(pd.to_numeric(raw_grp[c], errors='coerce').fillna(0) > 0.1).any()
+                        for c in pcols]
+            ds['precip_probability'] = round(sum(has_rain) / len(has_rain) * 100)
+
+    return ds
 
 
 def generate_output(corrected, trained, results, fc_raw=None):
@@ -1825,6 +2012,7 @@ def generate_output(corrected, trained, results, fc_raw=None):
     now_ts = pd.Timestamp.now().floor('h')
     cutoff_48h = now_ts + pd.Timedelta(hours=48)
 
+    # ── Hourly entries (only 48h) ──────────────────────────────────
     forecast_hours = []
     for _, row in corrected.iterrows():
         if row['datetime'] >= cutoff_48h:
@@ -1861,140 +2049,37 @@ def generate_output(corrected, trained, results, fc_raw=None):
 
         forecast_hours.append(entry)
 
-    fc_df = pd.DataFrame(forecast_hours)
+    # ── Build ALL daily summaries from full corrected data ─────────
+    # This ensures the same day gets ONE consistent narrative/icon,
+    # whether it straddles the 48h cutoff or not.
+    all_data = corrected.copy()
+    all_data['_date'] = all_data['datetime'].dt.strftime('%Y-%m-%d')
+    all_data['_day_name'] = all_data['datetime'].dt.strftime('%A')
+    all_data['hour'] = all_data['datetime'].dt.hour
+
+    all_daily = {}  # date_str -> summary dict
+    for date_str, grp in all_data.groupby('_date'):
+        day_name = grp.iloc[0]['_day_name']
+        all_daily[date_str] = _build_daily_summary(
+            date_str, day_name, grp, fc_raw=fc_raw
+        )
+
+    # ── Split into 48h daily and long-range ────────────────────────
+    dates_48h = set()
+    if len(forecast_hours) > 0:
+        fc_df = pd.DataFrame(forecast_hours)
+        dates_48h = set(fc_df['date'].unique())
+
     daily = []
-    for date, grp in fc_df.groupby('date'):
-        ds = {
-            "date": date,
-            "day_name": grp.iloc[0]['day_name'],
-            "temp_min": round(float(grp['temperature_2m'].min()), 1) if 'temperature_2m' in grp else None,
-            "temp_max": round(float(grp['temperature_2m'].max()), 1) if 'temperature_2m' in grp else None,
-            "wind_max": round(float(grp['wind_speed_10m'].max()), 1) if 'wind_speed_10m' in grp else None,
-            "gust_max": round(float(grp['wind_gusts_10m'].max()), 1) if 'wind_gusts_10m' in grp else None,
-            "precip_total": round(float(grp['precipitation'].sum()), 1) if 'precipitation' in grp else 0,
-            "humidity_avg": round(float(grp['relative_humidity_2m'].mean()), 0) if 'relative_humidity_2m' in grp else None,
-            "pressure_avg": round(float(grp['pressure_msl'].mean()), 0) if 'pressure_msl' in grp else None,
-        }
-        if 'wind_direction_10m' in grp.columns:
-            wd = pd.to_numeric(grp['wind_direction_10m'], errors='coerce').dropna()
-            if len(wd) > 0:
-                rad = np.radians(wd)
-                ds['wind_dir_avg'] = round(float(np.degrees(np.arctan2(np.sin(rad).mean(), np.cos(rad).mean())) % 360), 0)
-        cloud_avg = 0
-        if 'cloud_cover' in grp:
-            daytime_cc = grp[(grp['hour'] >= 7) & (grp['hour'] <= 19)]
-            if len(daytime_cc) > 0:
-                cloud_avg = float(daytime_cc['cloud_cover'].mean())
-                ds['cloud_cover_day'] = round(cloud_avg, 0)
-
-        if 'weather_code' in grp:
-            wc_mode = int(grp['weather_code'].mode().iloc[0])
-            precip = ds.get('precip_total', 0)
-            rain_hours = grp[grp['weather_code'] >= 51]
-
-            if wc_mode <= 1 and precip > 0.1:
-                wc_mode = int(rain_hours['weather_code'].mode().iloc[0]) if len(rain_hours) > 0 else 61
-            elif wc_mode == 0 and cloud_avg > 60:
-                wc_mode = 3
-            elif wc_mode == 0 and cloud_avg > 30:
-                wc_mode = 2
-            elif wc_mode == 1 and cloud_avg > 60:
-                wc_mode = 3
-
-            wmo = WMO_CODES.get(wc_mode, WMO_CODES[0])
-            ds.update({"weather_code": wc_mode, "weather_desc": wmo['desc'],
-                       "weather_icon": wmo['icon'], "weather_emoji": wmo['emoji']})
-
-        ds['day_narrative'] = _daily_narrative(grp)
-        daily.append(ds)
-
     long_range = []
-    long_data = corrected[corrected['datetime'] >= cutoff_48h].copy()
-    if len(long_data) > 0:
-        long_data['_date'] = long_data['datetime'].dt.strftime('%Y-%m-%d')
-        long_data['_day_name'] = long_data['datetime'].dt.strftime('%A')
-        long_data['_hour'] = long_data['datetime'].dt.hour
+    for date_str in sorted(all_daily.keys()):
+        ds = all_daily[date_str]
+        if date_str in dates_48h:
+            daily.append(ds)
+        else:
+            long_range.append(ds)
 
-        for ldate, lgrp in long_data.groupby('_date'):
-            def _get(col_xgb, col_ens):
-                c = lgrp.get(col_xgb, lgrp.get(col_ens, pd.Series(dtype=float)))
-                return pd.to_numeric(c, errors='coerce') if isinstance(c, pd.Series) else pd.Series(dtype=float)
-
-            temp = _get('temperature_2m_xgb', 'temperature_2m_ensemble')
-            wind = _get('wind_speed_10m_xgb', 'wind_speed_10m_ensemble')
-            gusts = _get('wind_gusts_10m_xgb', 'wind_gusts_10m_ensemble')
-            precip = _get('precipitation_xgb', 'precipitation_ensemble')
-            humid = _get('relative_humidity_2m_xgb', 'relative_humidity_2m_ensemble')
-            pres = _get('pressure_msl_xgb', 'pressure_msl_ensemble')
-
-            lds = {"date": ldate, "day_name": lgrp.iloc[0]['_day_name']}
-            if temp.notna().any():
-                lds['temp_min'] = round(float(temp.min()), 1)
-                lds['temp_max'] = round(float(temp.max()), 1)
-            if wind.notna().any():
-                lds['wind_max'] = round(float(wind.max()), 1)
-            if gusts.notna().any():
-                lds['gust_max'] = round(float(gusts.max()), 1)
-            lds['precip_total'] = round(float(precip.sum()), 1) if precip.notna().any() else 0
-            if humid.notna().any():
-                lds['humidity_avg'] = round(float(humid.mean()), 0)
-            if pres.notna().any():
-                lds['pressure_avg'] = round(float(pres.mean()), 0)
-
-            wd_s = pd.to_numeric(lgrp.get('wind_direction_10m_ens', pd.Series(dtype=float)), errors='coerce').dropna()
-            if len(wd_s) > 0:
-                rad = np.radians(wd_s)
-                lds['wind_dir_avg'] = round(float(np.degrees(np.arctan2(np.sin(rad).mean(), np.cos(rad).mean())) % 360), 0)
-
-            lr_cloud_avg = 0
-            cloud = _get('cloud_cover_xgb', 'cloud_cover_ensemble')
-            lr_daytime = (lgrp['_hour'] >= 7) & (lgrp['_hour'] <= 19)
-            if cloud.notna().any() and lr_daytime.any():
-                dc = cloud[lr_daytime].dropna()
-                if len(dc) > 0:
-                    lr_cloud_avg = float(dc.mean())
-                    lds['cloud_cover_day'] = round(lr_cloud_avg, 0)
-
-            wc_s = pd.to_numeric(lgrp.get('weather_code', pd.Series(dtype=float)), errors='coerce').dropna()
-            if len(wc_s) > 0:
-                wc_mode = int(wc_s.mode().iloc[0])
-                lr_precip = lds.get('precip_total', 0)
-                lr_rain_codes = wc_s[wc_s >= 51]
-
-                if wc_mode <= 1 and lr_precip > 0.1:
-                    wc_mode = int(lr_rain_codes.mode().iloc[0]) if len(lr_rain_codes) > 0 else 61
-                elif wc_mode == 0 and lr_cloud_avg > 60:
-                    wc_mode = 3
-                elif wc_mode == 0 and lr_cloud_avg > 30:
-                    wc_mode = 2
-                elif wc_mode == 1 and lr_cloud_avg > 60:
-                    wc_mode = 3
-
-                wmo = WMO_CODES.get(wc_mode, WMO_CODES[0])
-                lds.update({"weather_code": wc_mode, "weather_desc": wmo['desc'],
-                           "weather_icon": wmo['icon'], "weather_emoji": wmo['emoji']})
-
-            lr_norm = pd.DataFrame({
-                'hour': lgrp['_hour'].values,
-                'cloud_cover': cloud.values,
-                'precipitation': precip.values,
-                'wind_speed_10m': wind.values,
-                'wind_gusts_10m': gusts.values,
-                'temperature_2m': temp.values,
-                'weather_code': pd.to_numeric(lgrp.get('weather_code', pd.Series(dtype=float)), errors='coerce').values,
-            })
-            lds['day_narrative'] = _daily_narrative(lr_norm)
-
-            if fc_raw is not None:
-                lr_mask = fc_raw['datetime'].isin(lgrp['datetime'])
-                lr_raw = fc_raw[lr_mask]
-                precip_cols = [f"{m}_precipitation_model" for m in MODELS if f"{m}_precipitation_model" in lr_raw.columns]
-                if precip_cols:
-                    model_has_rain = [(pd.to_numeric(lr_raw[c], errors='coerce').fillna(0) > 0.1).any() for c in precip_cols]
-                    lds['precip_probability'] = round(sum(model_has_rain) / len(model_has_rain) * 100)
-
-            long_range.append(lds)
-
+    if long_range:
         print(f"  Long range: {len(long_range)} dana")
 
     output = {
@@ -2002,7 +2087,7 @@ def generate_output(corrected, trained, results, fc_raw=None):
         "location": {"name": "Budva, Crna Gora", "lat": LAT, "lon": LON,
                       "station": "ibudva5 (Weather Underground)"},
         "method": "XGBoost Multi-Model Ensemble + Historical Bias + Forecast Revision v3",
-        "description": "8 modela, 6 godina podataka (2020-2026), pametna korekcija + Day1/Day2 revizije",
+        "description": "11 modela, 6 godina podataka (2020-2026), pametna korekcija + Day1/Day2 revizije",
         "models": MODELS,
         "training_metrics": results,
         "daily_summary": daily,
@@ -2025,9 +2110,9 @@ def generate_output(corrected, trained, results, fc_raw=None):
     for d in daily:
         em = d.get('weather_emoji', '')
         print(f"\n  {em} {d['day_name']} {d['date']}")
-        print(f"     Temp: {d['temp_min']}\u00b0 --- {d['temp_max']}\u00b0C  |  Vlaznost: {d['humidity_avg']}%")
-        print(f"     Vjetar: do {d['wind_max']} m/s (udari {d['gust_max']} m/s)")
-        print(f"     Padavine: {d['precip_total']} mm  |  Pritisak: {d['pressure_avg']} hPa")
+        print(f"     Temp: {d.get('temp_min', '?')}° — {d.get('temp_max', '?')}°C  |  Vlaznost: {d.get('humidity_avg', '?')}%")
+        print(f"     Vjetar: do {d.get('wind_max', '?')} m/s (udari {d.get('gust_max', '?')} m/s)")
+        print(f"     Padavine: {d.get('precip_total', 0)} mm  |  Pritisak: {d.get('pressure_avg', '?')} hPa")
         print(f"     {d.get('day_narrative', d.get('weather_desc', ''))}")
 
     print("\n  " + "-" * 68)
@@ -2044,7 +2129,7 @@ def generate_output(corrected, trained, results, fc_raw=None):
         wc = int(r.get('weather_code', 0)) if pd.notna(r.get('weather_code', np.nan)) else 0
         em = WMO_CODES.get(wc, WMO_CODES[0])['emoji']
 
-        tf = f"{t:5.1f}\u00b0" if pd.notna(t) else "  N/A"
+        tf = f"{t:5.1f}°" if pd.notna(t) else "  N/A"
         hf = f"{h:3.0f}%" if pd.notna(h) else " N/A"
         wf = f"{w:4.1f}" if pd.notna(w) else " N/A"
         pf = f"{p:5.0f}" if pd.notna(p) else "  N/A"

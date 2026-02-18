@@ -795,9 +795,7 @@ function render(data) {
             Na 3. dan greška temperature može biti 2x veća nego na 1. dan, a na 7. dan prognoza je tek indikacija generalnog trenda.
             Koristite ovo kao orijentir za planiranje, ne kao garanciju.
         </p><p style="margin-top:8px">
-            Opis vremena za svaki dan (npr. "Oblačno", "Slaba kiša") bira se na osnovu najčešćeg vremenskog koda tokom 24h,
-            uz korekciju: ako postoje padavine &gt; 0.1 mm, dan ne može biti klasifikovan kao "Vedro";
-            ako je prosječna oblačnost danju &gt; 60%, postaje "Oblačno", a &gt; 30% "Djelimično oblačno".
+            Ikonica i opis za svaki dan biraju se na osnovu ukupnih padavina, prisustva grmljavine/snijega i prosječne oblačnosti tokom dana — ne na osnovu najčešćeg koda. Detaljan opis (npr. "Kiša ujtro, razvedravanje poslijepodne") analizira jutro, poslijepodne i veče zasebno.
         </p></div>`;
         html += '<div class="long-range-grid">';
         data.long_range.forEach(d => {
