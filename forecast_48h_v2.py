@@ -1935,7 +1935,6 @@ def _build_daily_summary(date_str, day_name, grp_df, fc_raw=None):
     if pres.notna().any():
         ds['pressure_avg'] = round(float(pres.mean()), 0)
 
-    # Wind direction
     wd_s = pd.to_numeric(grp_df.get('wind_direction_10m_ens',
                          grp_df.get('wind_direction_10m', pd.Series(dtype=float))),
                          errors='coerce').dropna()
@@ -1944,7 +1943,6 @@ def _build_daily_summary(date_str, day_name, grp_df, fc_raw=None):
         ds['wind_dir_avg'] = round(float(np.degrees(
             np.arctan2(np.sin(rad).mean(), np.cos(rad).mean())) % 360), 0)
 
-    # Cloud cover (daytime)
     hr = grp_df['hour'].astype(int)
     daytime_mask = (hr >= 7) & (hr <= 19)
     if cloud.notna().any() and daytime_mask.any():
@@ -1952,7 +1950,6 @@ def _build_daily_summary(date_str, day_name, grp_df, fc_raw=None):
         if len(dc) > 0:
             ds['cloud_cover_day'] = round(float(dc.mean()), 0)
 
-    # ── Unified narrative + icon from full day data ──
     narr_df = pd.DataFrame({
         'hour': hr.values,
         'cloud_cover': cloud.values,
@@ -1973,7 +1970,6 @@ def _build_daily_summary(date_str, day_name, grp_df, fc_raw=None):
         'day_narrative': narr['narrative'],
     })
 
-    # Precip probability from raw model data
     if fc_raw is not None:
         raw_mask = fc_raw['datetime'].isin(grp_df['datetime'])
         raw_grp = fc_raw[raw_mask]
@@ -1993,7 +1989,6 @@ def generate_output(corrected, trained, results, fc_raw=None):
     now_ts = pd.Timestamp.now().floor('h')
     cutoff_48h = now_ts + pd.Timedelta(hours=48)
 
-    # ── Hourly entries (only 48h) ──────────────────────────────────
     forecast_hours = []
     for _, row in corrected.iterrows():
         if row['datetime'] >= cutoff_48h:
@@ -2030,22 +2025,49 @@ def generate_output(corrected, trained, results, fc_raw=None):
 
         forecast_hours.append(entry)
 
-    # ── Build ALL daily summaries from full corrected data ─────────
-    # This ensures the same day gets ONE consistent narrative/icon,
-    # whether it straddles the 48h cutoff or not.
     all_data = corrected.copy()
     all_data['_date'] = all_data['datetime'].dt.strftime('%Y-%m-%d')
     all_data['_day_name'] = all_data['datetime'].dt.strftime('%A')
     all_data['hour'] = all_data['datetime'].dt.hour
 
+    today_str = pd.Timestamp.now().strftime('%Y-%m-%d')
+    today_cache_path = os.path.join(OUTPUT_DIR, "today_daily_cache.json")
+
     all_daily = {}  # date_str -> summary dict
     for date_str, grp in all_data.groupby('_date'):
         day_name = grp.iloc[0]['_day_name']
-        all_daily[date_str] = _build_daily_summary(
-            date_str, day_name, grp, fc_raw=fc_raw
-        )
 
-    # ── Split into 48h daily and long-range ────────────────────────
+        if date_str == today_str:
+            first_hour = int(grp['hour'].min())
+            if first_hour < 10:
+                ds = _build_daily_summary(date_str, day_name, grp, fc_raw=fc_raw)
+                all_daily[date_str] = ds
+                try:
+                    with open(today_cache_path, 'w', encoding='utf-8') as _cf:
+                        json.dump(ds, _cf, ensure_ascii=False)
+                except Exception:
+                    pass
+            else:
+                cached = None
+                if os.path.exists(today_cache_path):
+                    try:
+                        with open(today_cache_path, 'r', encoding='utf-8') as _cf:
+                            cached = json.load(_cf)
+                        if cached.get('date') != today_str:
+                            cached = None
+                    except Exception:
+                        cached = None
+                if cached:
+                    all_daily[date_str] = cached
+                else:
+                    all_daily[date_str] = _build_daily_summary(
+                        date_str, day_name, grp, fc_raw=fc_raw
+                    )
+        else:
+            all_daily[date_str] = _build_daily_summary(
+                date_str, day_name, grp, fc_raw=fc_raw
+            )
+
     dates_48h = set()
     if len(forecast_hours) > 0:
         fc_df = pd.DataFrame(forecast_hours)
