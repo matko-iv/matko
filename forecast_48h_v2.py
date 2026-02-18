@@ -1636,14 +1636,6 @@ WMO_CODES = {
 
 
 def _daily_narrative(grp):
-    """Generate AccuWeather-style daily narrative + pick best icon/code.
-
-    Expects DataFrame with columns: hour, cloud_cover, precipitation,
-    wind_speed_10m, wind_gusts_10m, temperature_2m, weather_code,
-    (optional) wind_direction_10m.
-    Returns dict with keys: narrative, weather_code, weather_icon,
-    weather_desc, weather_emoji.
-    """
     def _col(name):
         return pd.to_numeric(grp.get(name, pd.Series(dtype=float)), errors='coerce')
 
@@ -1656,7 +1648,6 @@ def _daily_narrative(grp):
     wc = _col('weather_code')
     wd = _col('wind_direction_10m')
 
-    # ── Period analysis ────────────────────────────────────────────
     def _period(h0, h1):
         mask = (hr >= h0) & (hr < h1)
         sub_cc = cc[mask].dropna()
@@ -1688,7 +1679,6 @@ def _daily_narrative(grp):
     temp_max = float(tp.max()) if tp.notna().any() else None
     temp_min = float(tp.min()) if tp.notna().any() else None
 
-    # Wind direction (dominant)
     wind_dir_str = ""
     if wd.notna().any():
         rad = np.radians(wd.dropna())
@@ -1697,13 +1687,12 @@ def _daily_narrative(grp):
                     'J', 'JJZ', 'JZ', 'ZJZ', 'Z', 'ZSZ', 'SZ', 'SSZ']
         wind_dir_str = compass[round(avg_deg / 22.5) % 16]
 
-    # ── Sky classification ─────────────────────────────────────────
     def sky(c):
         if c is None:
             return 'unknown'
-        if c < 20:
+        if c < 30:
             return 'clear'
-        if c < 40:
+        if c < 50:
             return 'mostly_clear'
         if c < 65:
             return 'partly_cloudy'
@@ -1717,11 +1706,9 @@ def _daily_narrative(grp):
     has_snow = night['has_snow'] or morn['has_snow'] or aftn['has_snow'] or eve['has_snow']
     has_fog_morn = morn['has_fog']
 
-    # Daytime cloud average for icon
     daytime_cc = cc[(hr >= 7) & (hr <= 19)].dropna()
     cloud_day_avg = float(daytime_cc.mean()) if len(daytime_cc) else 50
 
-    # ── Choose representative daily icon/code ──────────────────────
     if has_thunder:
         day_wc = 95
     elif has_snow and total_precip >= 3:
@@ -1738,23 +1725,21 @@ def _daily_narrative(grp):
         day_wc = 51
     elif has_fog_morn:
         day_wc = 45
-    elif cloud_day_avg >= 80:
+    elif cloud_day_avg >= 65:
         day_wc = 3
-    elif cloud_day_avg >= 55:
+    elif cloud_day_avg >= 50:
         day_wc = 2
-    elif cloud_day_avg >= 25:
+    elif cloud_day_avg >= 30:
         day_wc = 1
     else:
         day_wc = 0
 
-    # Brief rain → shower icon
     if 51 <= day_wc <= 65 and rain_hours_total <= 4:
         if day_wc >= 63:
             day_wc = 80
 
     day_wmo = WMO_CODES.get(day_wc, WMO_CODES[0])
 
-    # ── Build narrative ────────────────────────────────────────────
     parts = []
 
     if has_snow:
@@ -1764,123 +1749,120 @@ def _daily_narrative(grp):
         if rain_m and rain_a and rain_e:
             parts.append(f"Snijeg tokom cijelog dana ({total_precip:.0f} mm)")
         elif rain_m and not rain_a:
-            parts.append("Snijeg ujutru, prestanak poslijepodne")
+            parts.append("Snijeg prije podne, prestanak od podneva")
         elif not rain_m and rain_a:
-            parts.append("Suvo ujtro, snijeg poslijepodne")
+            parts.append("Suvo ujutru, snijeg od podneva")
         elif not rain_m and not rain_a and rain_e:
-            parts.append("Suvo do uveče, zatim snijeg")
+            parts.append("Suvo tokom dana, snijeg predveče")
         else:
             parts.append(f"Povremeni {snow_desc}")
     elif has_thunder:
         if not rain_m and rain_a and not rain_e:
-            parts.append("Sunčano pa grmljavinska kiša poslijepodne")
+            parts.append("Sunčano prije podne, grmljavinska kiša od podneva")
         elif rain_m and not rain_a:
-            parts.append("Grmljavina ujutru, razvedravanje poslijepodne")
+            parts.append("Grmljavina prije podne, smirivanje od podneva")
         elif not rain_m and not rain_a and rain_e:
-            parts.append("Pretežno suvo, grmljavina uveče")
+            parts.append("Pretežno suvo, grmljavina predveče")
         elif rain_m and rain_a:
-            parts.append("Oblačno uz povremenu grmljavinu")
+            parts.append("Oblačno uz povremenu grmljavinu tokom dana")
         elif night['has_thunder'] and not morn['has_thunder'] and not aftn['has_thunder']:
-            parts.append("Grmljavina noću, zatim smirivanje")
+            parts.append("Grmljavina tokom noći, mirnije tokom dana")
         else:
-            parts.append("Nestabilno uz grmljavinu")
+            parts.append("Nestabilno uz povremenu grmljavinu")
         if total_precip >= 5:
             parts[0] += f" ({total_precip:.0f} mm)"
     elif total_precip > 0.2:
         precip_str = f" ({total_precip:.1f} mm)" if total_precip >= 1 else ""
         if rain_m and rain_a and rain_e:
             if total_precip >= 15:
-                parts.append(f"Obilna kiša tokom cijelog dana ({total_precip:.0f} mm)")
+                parts.append(f"Kiša cijeli dan")
             elif total_precip >= 5:
                 parts.append(f"Kiša tokom cijelog dana ({total_precip:.0f} mm)")
             elif total_precip >= 1:
-                parts.append(f"Povremena kiša tokom dana ({total_precip:.1f} mm)")
+                parts.append(f"Povremena kiša")
             else:
                 parts.append("Povremena slaba kiša")
         elif rain_m and rain_a and not rain_e:
-            parts.append(f"Kiša ujutru i poslijepodne, suvo uveče{precip_str}")
+            parts.append(f"Kiša tokom dana do kasno poslijepodne, suvo predveče")
         elif rain_m and not rain_a and not rain_e:
             if morn['precip'] >= 3:
-                parts.append(f"Jača kiša ujutru ({morn['precip']:.1f} mm), razvedravanje poslijepodne")
+                parts.append(f"Jača kiša prijepodne ({morn['precip']:.1f} mm), suvo i vedrije od podneva")
             else:
-                parts.append(f"Kiša ujutru, razvedravanje poslijepodne{precip_str}")
+                parts.append(f"Kiša prijepodne, suvo od podneva")
         elif rain_m and not rain_a and rain_e:
-            parts.append(f"Kiša ujutru i uveče, suvo poslijepodne{precip_str}")
+            parts.append(f"Kiša ujutru i predveče, suvo od podneva do večeri")
         elif not rain_m and rain_a and rain_e:
             if ms in ('clear', 'mostly_clear'):
-                parts.append(f"Sunčano ujutru, kiša od poslijepodneva{precip_str}")
+                parts.append(f"Sunčano ujutru, kiša od podneva")
             else:
-                parts.append(f"Kiša od poslijepodneva{precip_str}")
+                parts.append(f"Kiša od podneva do kraja dana{precip_str}")
         elif not rain_m and rain_a and not rain_e:
             if ms in ('clear', 'mostly_clear'):
-                parts.append(f"Sunčano pa kiša poslijepodne{precip_str}")
+                parts.append(f"Sunčano ujutru, kiša od podneva do kasno poslijepodne")
             else:
-                parts.append(f"Oblačno, kiša poslijepodne{precip_str}")
+                parts.append(f"Oblačno, kiša od podneva do kasno poslijepodne")
         elif not rain_m and not rain_a and rain_e:
-            parts.append(f"suvo do večeri, zatim kiša{precip_str}")
+            parts.append(f"Suvo tokom dana, kiša predveče")
         elif night['has_rain'] and not rain_m and not rain_a and not rain_e:
             if ms in ('clear', 'mostly_clear'):
-                parts.append("Kiša noću, sunčano tokom dana")
+                parts.append("Kiša tokom noći, sunčano tokom dana")
             else:
-                parts.append("Kiša noću, suvo tokom dana")
+                parts.append("Kiša tokom noći, suvo tokom dana")
         else:
             parts.append(f"Povremena kiša{precip_str}")
     elif has_fog_morn:
         if as_ in ('clear', 'mostly_clear'):
-            parts.append("Magla ujtro, sunčano poslijepodne")
+            parts.append("Magla ujutru, sunčano od podneva")
         elif as_ in ('partly_cloudy',):
-            parts.append("Magla ujtro, djelimično oblačno poslijepodne")
+            parts.append("Magla ujutru, oblaci i sunce od podneva")
         else:
-            parts.append("Magla ujtro, oblačno poslijepodne")
+            parts.append("Magla ujutru, oblačno od podneva")
     else:
-        # No precipitation — describe sky evolution
         if morn['n'] == 0 and aftn['n'] == 0 and eve['n'] > 0:
             sky_labels = {
-                'clear': 'Vedro uveče', 'mostly_clear': 'Pretežno vedro uveče',
-                'partly_cloudy': 'Djelimično oblačno', 'mostly_cloudy': 'Pretežno oblačno',
-                'cloudy': 'Oblačno uveče',
+                'clear': 'Vedro', 'mostly_clear': 'Pretežno vedro',
+                'partly_cloudy': 'Po koji oblak', 'mostly_cloudy': 'Pretežno oblačno',
+                'cloudy': 'Oblačno',
             }
             parts.append(sky_labels.get(es, 'Promjenljivo'))
         elif morn['n'] == 0 and aftn['n'] > 0:
             sky_labels = {
-                'clear': 'Vedro i sunčano', 'mostly_clear': 'Pretežno vedro',
-                'partly_cloudy': 'Djelimično oblačno', 'mostly_cloudy': 'Pretežno oblačno',
+                'clear': 'Vedro i sunčano', 'mostly_clear': 'Pretežno sunčano',
+                'partly_cloudy': 'Po koji oblak', 'mostly_cloudy': 'Pretežno oblačno',
                 'cloudy': 'Oblačno',
             }
             parts.append(sky_labels.get(as_, 'Promjenljivo'))
         elif ms == as_:
             sky_labels = {
                 'clear': 'Vedro i sunčano tokom dana',
-                'mostly_clear': 'Pretežno vedro i sunčano',
-                'partly_cloudy': 'Smjena sunca i oblaka tokom dana',
-                'mostly_cloudy': 'Pretežno oblačno tokom dana',
-                'cloudy': 'Oblačno tokom cijelog dana',
+                'mostly_clear': 'Pretežno sunčano, poneki oblak',
+                'partly_cloudy': 'Oblačno sa sunčanim periodima',
+                'mostly_cloudy': 'Pretežno oblačno, malo sunca',
+                'cloudy': 'Oblačno tokom cijelog dana bez padavina',
             }
             parts.append(sky_labels.get(ms, 'Promjenljivo'))
         elif ms in ('clear', 'mostly_clear') and as_ in ('mostly_cloudy', 'cloudy'):
-            parts.append("Sunčano ujutru, naoblačenje poslijepodne")
+            parts.append("Sunčano prije podne, oblaci od podneva")
         elif ms in ('mostly_cloudy', 'cloudy') and as_ in ('clear', 'mostly_clear'):
-            parts.append("Oblačno ujutru, razvedravanje poslijepodne")
+            parts.append("Oblačno prije podne, sunce od podneva")
         elif ms in ('clear', 'mostly_clear') and as_ == 'partly_cloudy':
-            parts.append("Sunčano uz poneki oblak poslijepodne")
+            parts.append("Sunčano sa ponešto oblaka od podneva")
         elif ms == 'partly_cloudy' and as_ in ('clear', 'mostly_clear'):
-            parts.append("Oblaci ujutru, sunčano poslijepodne")
+            parts.append("Više oblaka prijepodna, sunčano od podneva")
         elif ms == 'partly_cloudy' and as_ in ('mostly_cloudy', 'cloudy'):
-            parts.append("Sve više oblaka tokom dana")
+            parts.append("Sve oblačnije kako dan odmiče")
         elif ms in ('mostly_cloudy', 'cloudy') and as_ == 'partly_cloudy':
-            parts.append("Oblačno ujutru, djelimično razvedravanje")
+            parts.append("Oblačno prijepodne, ponešto sunca od podneva")
         else:
             parts.append("Promjenljivo oblačno")
 
-        # Evening twist
         if es != 'unknown' and len(parts) > 0:
             curr_end = as_ if as_ != 'unknown' else ms
             if curr_end in ('clear', 'mostly_clear') and es in ('mostly_cloudy', 'cloudy'):
-                parts[0] += "; naoblačenje uveče"
+                parts[0] += ". Oblaci predveče"
             elif curr_end in ('mostly_cloudy', 'cloudy') and es in ('clear', 'mostly_clear'):
-                parts[0] += "; razvedravanje uveče"
+                parts[0] += ". Vedrije predveče"
 
-    # --- Wind modifier ---
     wind_part = ""
     if max_wind >= 10:
         wind_part = f"jak {wind_dir_str} vjetar" if wind_dir_str else "jak vjetar"
@@ -1896,11 +1878,10 @@ def _daily_narrative(grp):
     elif max_gust >= 15:
         parts.append(f"udari vjetra do {max_gust:.0f} m/s")
 
-    # --- Temperature context ---
     if temp_max is not None:
-        if temp_max >= 37:
+        if temp_max >= 33:
             parts.append("izuzetno vruće")
-        elif temp_max >= 33:
+        elif temp_max >= 30:
             parts.append("vruće")
     if temp_min is not None:
         if temp_min <= -5:
