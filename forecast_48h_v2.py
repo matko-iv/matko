@@ -25,7 +25,7 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 
 LAT, LON = 42.29, 18.84  # E viva!!
 
-MODELS = ["ARPEGE_EUROPE", "GFS_SEAMLESS", "ICON_SEAMLESS", "METEOFRANCE", "ECMWF_IFS025", "ITALIAMETEO_ICON2I", "UKMO_SEAMLESS", "BOM_ACCESS", "ECMWF_IFS", "KNMI_SEAMLESS", "DMI_SEAMLESS"]
+MODELS = ["ARPEGE_EUROPE", "GFS_SEAMLESS", "ICON_SEAMLESS", "METEOFRANCE", "ECMWF_IFS025", "ITALIAMETEO_ICON2I", "UKMO_SEAMLESS", "BOM_ACCESS", "ECMWF_IFS", "KNMI_SEAMLESS", "DMI_SEAMLESS", "GEM_GLOBAL"]
 MODEL_IDS = {
     "ARPEGE_EUROPE": "arpege_europe",
     "GFS_SEAMLESS": "gfs_seamless",
@@ -38,6 +38,7 @@ MODEL_IDS = {
     "ECMWF_IFS": "ecmwf_ifs",
     "KNMI_SEAMLESS": "knmi_seamless",
     "DMI_SEAMLESS": "dmi_seamless",
+    "GEM_GLOBAL": "gem_seamless",
 }
 
 PREV_RUNS_MODELS = [m for m in MODELS if m not in ("ITALIAMETEO_ICON2I", "ECMWF_IFS")]
@@ -74,7 +75,7 @@ SPLIT_DATE = pd.Timestamp('2025-07-01')
 print("=" * 72)
 print("  XGBoost +48h v3 --- Bias Correction Pipeline --- Budva")
 print("  Models:", len(MODELS), "| Obs: merged (2020-2026) | Split:", SPLIT_DATE.date())
-print("  Previous Runs: +Day1/Day2 forecasts for", len(PREV_RUNS_MODELS), "models")
+print("  Previous Runs: +Day1/Day2 forecasts for", len(PREV_RUNS_MODELS), "models (incl. GEM Global)")
 print("=" * 72)
 
 
@@ -1008,11 +1009,10 @@ def train_all_models(df):
         te = df_v['datetime'] >= SPLIT_DATE
 
         vf = [c for c in feature_cols if c in df_v.columns
-              and df_v[c].notna().sum() > len(df_v) * 0.3]
+              and df_v[c].notna().sum() > len(df_v) * 0.15]
 
-        FILL = -999
-        X_tr, y_tr = df_v.loc[tr, vf].fillna(FILL), y_v[tr]
-        X_te, y_te = df_v.loc[te, vf].fillna(FILL), y_v[te]
+        X_tr, y_tr = df_v.loc[tr, vf].fillna(0), y_v[tr]
+        X_te, y_te = df_v.loc[te, vf].fillna(0), y_v[te]
 
         if len(X_tr) < 300 or len(X_te) < 50:
             print(f"  {info['display']:20s} --- SKIP (train={len(X_tr)}, test={len(X_te)})")
@@ -1111,30 +1111,11 @@ def train_all_models(df):
             }
             continue
 
-        if param in ('temperature_2m', 'dew_point_2m', 'pressure_msl'):
-            hp = dict(n_estimators=1200, max_depth=6, learning_rate=0.03,
-                      subsample=0.8, colsample_bytree=0.7, reg_alpha=0.1,
-                      reg_lambda=1.0, min_child_weight=5, gamma=0.05,
-                      objective='reg:absoluteerror', random_state=42, n_jobs=-1,
-                      early_stopping_rounds=40)
-        elif param in ('cloud_cover', 'shortwave_radiation'):
-            hp = dict(n_estimators=1000, max_depth=6, learning_rate=0.04,
-                      subsample=0.8, colsample_bytree=0.65, reg_alpha=0.2,
-                      reg_lambda=1.5, min_child_weight=5, gamma=0.05,
-                      objective='reg:absoluteerror', random_state=42, n_jobs=-1,
-                      early_stopping_rounds=40)
-        elif param == 'relative_humidity_2m':
-            hp = dict(n_estimators=1000, max_depth=6, learning_rate=0.04,
-                      subsample=0.8, colsample_bytree=0.65, reg_alpha=0.15,
-                      reg_lambda=1.5, min_child_weight=5, gamma=0.05,
-                      objective='reg:absoluteerror', random_state=42, n_jobs=-1,
-                      early_stopping_rounds=40)
-        else:
-            hp = dict(n_estimators=800, max_depth=6, learning_rate=0.05,
-                      subsample=0.8, colsample_bytree=0.7, reg_alpha=0.1,
-                      reg_lambda=1.0, min_child_weight=5, gamma=0.05,
-                      objective='reg:absoluteerror', random_state=42, n_jobs=-1,
-                      early_stopping_rounds=30)
+        hp = dict(n_estimators=1000, max_depth=6, learning_rate=0.04,
+                  subsample=0.8, colsample_bytree=0.6, reg_alpha=0.3,
+                  reg_lambda=1.5, min_child_weight=8,
+                  objective='reg:absoluteerror', random_state=42, n_jobs=-1,
+                  early_stopping_rounds=50)
 
         ens_col = f'{param}_ens_mean'
         rb_result = _train_residual_blended(
@@ -1508,12 +1489,12 @@ def apply_correction(fc_df, trained, bias_tables):
         X = fc[available].copy()
         for c in features:
             if c not in X.columns:
-                X[c] = -999
-        X = X[features].fillna(-999)
+                X[c] = 0
+        X = X[features].fillna(0)
 
         for c in X.columns:
             if X[c].dtype == 'object':
-                X[c] = pd.to_numeric(X[c], errors='coerce').fillna(-999)
+                X[c] = pd.to_numeric(X[c], errors='coerce').fillna(0)
 
         if param == 'precipitation' and 'precip_info' in minfo:
             pinfo = minfo['precip_info']
