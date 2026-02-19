@@ -497,8 +497,8 @@ def engineer_features(df):
         month = out['month']
         sea_temp_approx = 13.0 + 6.0 * np.sin(2 * np.pi * (month - 3) / 12)
         out['sea_air_diff'] = sea_temp_approx - temp
-        out['marine_warming'] = (out['sea_air_diff'] > 3.0).astype(float)  # sea warms air
-        out['marine_cooling'] = (out['sea_air_diff'] < -3.0).astype(float)  # sea cools air
+        out['marine_warming'] = (out['sea_air_diff'] > 3.0).astype(float)  # more otopli vazduh
+        out['marine_cooling'] = (out['sea_air_diff'] < -3.0).astype(float)  # more oladi vazduh
 
     if all(c in out.columns for c in ['is_winter', 'cloud_cover_ens_mean',
            'relative_humidity_2m_ens_mean']):
@@ -1658,8 +1658,8 @@ def _daily_narrative(grp):
             'cloud': float(sub_cc.mean()) if len(sub_cc) else None,
             'precip': float(sub_pr.sum()) if len(sub_pr) else 0,
             'precip_max_h': float(sub_pr.max()) if len(sub_pr) else 0,
-            'has_rain': float(sub_pr.sum()) > 0.1 if len(sub_pr) else False,
-            'rain_hours': int((sub_pr > 0.1).sum()) if len(sub_pr) else 0,
+            'has_rain': float(sub_pr.sum()) > 0.5 if len(sub_pr) else False,
+            'rain_hours': int((sub_pr > 0.3).sum()) if len(sub_pr) else 0,
             'has_thunder': bool((sub_wc >= 95).any()) if len(sub_wc) else False,
             'has_snow': bool(((sub_wc >= 71) & (sub_wc <= 75)).any()) if len(sub_wc) else False,
             'has_fog': bool(((sub_wc >= 45) & (sub_wc <= 48)).any()) if len(sub_wc) else False,
@@ -1673,7 +1673,7 @@ def _daily_narrative(grp):
     eve = _period(18, 24)
 
     total_precip = float(pr.sum()) if pr.notna().any() else 0
-    rain_hours_total = int((pr > 0.1).sum()) if pr.notna().any() else 0
+    rain_hours_total = int((pr > 0.3).sum()) if pr.notna().any() else 0
     max_wind = float(ws.max()) if ws.notna().any() else 0
     max_gust = float(wg.max()) if wg.notna().any() else 0
     temp_max = float(tp.max()) if tp.notna().any() else None
@@ -1719,10 +1719,10 @@ def _daily_narrative(grp):
         day_wc = 65
     elif total_precip >= 3:
         day_wc = 63
-    elif total_precip >= 0.5:
+    elif total_precip >= 1 and rain_hours_total >= 2:
         day_wc = 61
-    elif total_precip > 0.1:
-        day_wc = 51
+    elif total_precip >= 1:
+        day_wc = 80
     elif has_fog_morn:
         day_wc = 45
     elif cloud_day_avg >= 65:
@@ -1734,9 +1734,8 @@ def _daily_narrative(grp):
     else:
         day_wc = 0
 
-    if 51 <= day_wc <= 65 and rain_hours_total <= 4:
-        if day_wc >= 63:
-            day_wc = 80
+    if 61 <= day_wc <= 65 and rain_hours_total <= 3:
+        day_wc = 80
 
     day_wmo = WMO_CODES.get(day_wc, WMO_CODES[0])
 
@@ -1771,17 +1770,15 @@ def _daily_narrative(grp):
             parts.append("Nestabilno uz povremenu grmljavinu")
         if total_precip >= 5:
             parts[0] += f" ({total_precip:.0f} mm)"
-    elif total_precip > 0.2:
+    elif total_precip >= 2:
         precip_str = f" ({total_precip:.1f} mm)" if total_precip >= 1 else ""
         if rain_m and rain_a and rain_e:
             if total_precip >= 15:
                 parts.append(f"Kiša cijeli dan")
             elif total_precip >= 5:
                 parts.append(f"Kiša tokom cijelog dana ({total_precip:.0f} mm)")
-            elif total_precip >= 1:
-                parts.append(f"Povremena kiša")
             else:
-                parts.append("Povremena slaba kiša")
+                parts.append(f"Povremena kiša tokom dana")
         elif rain_m and rain_a and not rain_e:
             parts.append(f"Kiša tokom dana do kasno poslijepodne, suvo predveče")
         elif rain_m and not rain_a and not rain_e:
@@ -1810,6 +1807,39 @@ def _daily_narrative(grp):
                 parts.append("Kiša tokom noći, suvo tokom dana")
         else:
             parts.append(f"Povremena kiša{precip_str}")
+    elif total_precip >= 0.5:
+        _marginal_rain_note = ""
+        if rain_m and not rain_a:
+            _marginal_rain_note = "moguća kratka kiša prijepodne"
+        elif not rain_m and rain_a:
+            _marginal_rain_note = "moguća kratka kiša od podneva"
+        elif not rain_m and not rain_a and rain_e:
+            _marginal_rain_note = "moguća kratka kiša predveče"
+        elif rain_hours_total <= 2:
+            _marginal_rain_note = "moguće par kapi kiše"
+        else:
+            _marginal_rain_note = "slaba kiša povremeno"
+        _sky_part = ""
+        if ms == as_:
+            _sky_map = {
+                'clear': 'Vedro i sunčano',
+                'mostly_clear': 'Pretežno sunčano',
+                'partly_cloudy': 'Oblačno sa sunčanim periodima',
+                'mostly_cloudy': 'Pretežno oblačno',
+                'cloudy': 'Oblačno',
+            }
+            _sky_part = _sky_map.get(ms, 'Promjenljivo oblačno')
+        elif ms in ('clear', 'mostly_clear') and as_ in ('mostly_cloudy', 'cloudy'):
+            _sky_part = "Sunčano prije podne, oblaci od podneva"
+        elif ms in ('mostly_cloudy', 'cloudy') and as_ in ('clear', 'mostly_clear'):
+            _sky_part = "Oblačno prije podne, sunce od podneva"
+        elif ms in ('clear', 'mostly_clear'):
+            _sky_part = "Pretežno sunčano"
+        elif ms in ('mostly_cloudy', 'cloudy'):
+            _sky_part = "Pretežno oblačno"
+        else:
+            _sky_part = "Promjenljivo oblačno"
+        parts.append(f"{_sky_part}, {_marginal_rain_note}")
     elif has_fog_morn:
         if as_ in ('clear', 'mostly_clear'):
             parts.append("Magla ujutru, sunčano od podneva")
@@ -1854,7 +1884,14 @@ def _daily_narrative(grp):
         elif ms in ('mostly_cloudy', 'cloudy') and as_ == 'partly_cloudy':
             parts.append("Oblačno prijepodne, ponešto sunca od podneva")
         else:
-            parts.append("Promjenljivo oblačno")
+            if cloud_day_avg < 30:
+                parts.append("Pretežno vedro")
+            elif cloud_day_avg < 50:
+                parts.append("Sunčano sa ponešto oblaka")
+            elif cloud_day_avg < 65:
+                parts.append("Promjenljiva oblačnost")
+            else:
+                parts.append("Pretežno oblačno")
 
         if es != 'unknown' and len(parts) > 0:
             curr_end = as_ if as_ != 'unknown' else ms
@@ -2033,7 +2070,7 @@ def generate_output(corrected, trained, results, fc_raw=None):
     today_str = pd.Timestamp.now().strftime('%Y-%m-%d')
     today_cache_path = os.path.join(OUTPUT_DIR, "today_daily_cache.json")
 
-    all_daily = {}  # date_str -> summary dict
+    all_daily = {}
     for date_str, grp in all_data.groupby('_date'):
         day_name = grp.iloc[0]['_day_name']
 
