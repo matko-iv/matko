@@ -25,7 +25,7 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 
 LAT, LON = 42.29, 18.84  # E viva!!
 
-MODELS = ["ARPEGE_EUROPE", "GFS_SEAMLESS", "ICON_SEAMLESS", "METEOFRANCE", "ECMWF_IFS025", "ITALIAMETEO_ICON2I", "UKMO_SEAMLESS", "ECMWF_IFS", "KNMI_SEAMLESS", "DMI_SEAMLESS", "GEM_GLOBAL"]
+MODELS = ["ARPEGE_EUROPE", "GFS_SEAMLESS", "ICON_SEAMLESS", "METEOFRANCE", "ECMWF_IFS025", "ITALIAMETEO_ICON2I", "UKMO_SEAMLESS", "BOM_ACCESS", "ECMWF_IFS", "KNMI_SEAMLESS", "DMI_SEAMLESS"]
 MODEL_IDS = {
     "ARPEGE_EUROPE": "arpege_europe",
     "GFS_SEAMLESS": "gfs_seamless",
@@ -34,10 +34,10 @@ MODEL_IDS = {
     "ECMWF_IFS025": "ecmwf_ifs025",
     "ITALIAMETEO_ICON2I": "italia_meteo_arpae_icon_2i",
     "UKMO_SEAMLESS": "ukmo_seamless",
+    "BOM_ACCESS": "bom_access_global",
     "ECMWF_IFS": "ecmwf_ifs",
     "KNMI_SEAMLESS": "knmi_seamless",
     "DMI_SEAMLESS": "dmi_seamless",
-    "GEM_GLOBAL": "gem_seamless",
 }
 
 PREV_RUNS_MODELS = [m for m in MODELS if m not in ("ITALIAMETEO_ICON2I", "ECMWF_IFS")]
@@ -125,18 +125,16 @@ def load_historical_data():
     print(f"  Cloud cover derived: {cloud.notna().sum()} valid (daytime)")
 
     precip_derived = False
-    for precip_col in ['precipitation_rate_obs', 'precip_rate_mm']:
+    for precip_col, multiplier in [('precip_rate_in', 25.4), ('precipitation_rate_obs', 1.0), ('precip_rate_mm', 1.0)]:
         if precip_col in base.columns:
-            vals = pd.to_numeric(base[precip_col], errors='coerce')
-            if vals.notna().sum() >= 500:
-                base['_derived_precip_obs'] = vals
-                n_nonzero = (base['_derived_precip_obs'] > 0).sum()
-                print(f"  Hourly precip derived from '{precip_col}': {vals.notna().sum()} valid, {n_nonzero} non-zero hours")
-                precip_derived = True
-                break
+            base['_derived_precip_obs'] = pd.to_numeric(base[precip_col], errors='coerce') * multiplier
+            n_nonzero = (base['_derived_precip_obs'] > 0).sum()
+            print(f"  Hourly precip derived from '{precip_col}': {n_nonzero} non-zero hours")
+            precip_derived = True
+            break
     if not precip_derived:
         base['_derived_precip_obs'] = np.nan
-        print("  WARNING: No precip obs column found (mm)")
+        print("  WARNING: No precip obs column found")
 
     print("  Ucitavanje previous runs podataka (Day1/Day2)...")
     prev_merged = 0
@@ -499,8 +497,8 @@ def engineer_features(df):
         month = out['month']
         sea_temp_approx = 13.0 + 6.0 * np.sin(2 * np.pi * (month - 3) / 12)
         out['sea_air_diff'] = sea_temp_approx - temp
-        out['marine_warming'] = (out['sea_air_diff'] > 3.0).astype(float)  # more otopli vazduh
-        out['marine_cooling'] = (out['sea_air_diff'] < -3.0).astype(float)  # more oladi vazduh
+        out['marine_warming'] = (out['sea_air_diff'] > 3.0).astype(float)  # sea warms air
+        out['marine_cooling'] = (out['sea_air_diff'] < -3.0).astype(float)  # sea cools air
 
     if all(c in out.columns for c in ['is_winter', 'cloud_cover_ens_mean',
            'relative_humidity_2m_ens_mean']):
@@ -718,30 +716,6 @@ def engineer_features(df):
     if 'temperature_2m_ens_std' in out.columns and 'temperature_2m_ens_mean' in out.columns:
         out['temp_cv'] = out['temperature_2m_ens_std'] / (out['temperature_2m_ens_mean'].abs().clip(lower=0.1))
 
-    BIAS_PARAMS = ['temperature_2m', 'dew_point_2m', 'pressure_msl', 'wind_speed_10m',
-                   'relative_humidity_2m', 'cloud_cover']
-    OBS_MAP = {p: TARGET_PARAMS[p]['obs'] for p in BIAS_PARAMS if p in TARGET_PARAMS}
-
-    for param in BIAS_PARAMS:
-        obs_col = OBS_MAP.get(param)
-        if obs_col not in out.columns:
-            continue
-        obs_vals = pd.to_numeric(out[obs_col], errors='coerce')
-        ens_col = f'{param}_ens_mean'
-        if ens_col in out.columns:
-            ens_vals = out[ens_col]
-            ens_bias = ens_vals - obs_vals
-            out[f'{param}_ens_bias_ewm60d'] = ens_bias.ewm(span=60*24, min_periods=24, ignore_na=True).mean()
-            out[f'{param}_ens_absbias_ewm60d'] = ens_bias.abs().ewm(span=60*24, min_periods=24, ignore_na=True).mean()
-            out[f'{param}_ens_bias_ewm7d'] = ens_bias.ewm(span=7*24, min_periods=12, ignore_na=True).mean()
-
-        for m in MODELS[:5]:
-            mc = f"{m}_{param}_model"
-            if mc in out.columns:
-                mv = pd.to_numeric(out[mc], errors='coerce')
-                mbias = mv - obs_vals
-                out[f'{m}_{param}_bias_ewm60d'] = mbias.ewm(span=60*24, min_periods=24, ignore_na=True).mean()
-
     return out
 
 
@@ -780,125 +754,84 @@ def _make_val_split(X_tr, y_tr, val_frac=0.05):
             X_tr.iloc[split_idx:], y_tr.iloc[split_idx:])
 
 
-def _compute_sample_weights(y, param, boost_extremes=1.5):
-    """Compute sample weights that give more emphasis to extreme values.
-    This helps the model learn rare extreme events better (heat waves, cold snaps,
-    strong winds, heavy rain) without discarding normal samples.
+def _train_xgb(X_tr, y_tr, X_val, y_val, hp):
+    """Two-pass training: find best n_estimators on val, retrain on all data."""
+    model_val = xgb.XGBRegressor(**hp)
+    model_val.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
+    best_n = model_val.best_iteration + 1
+    if best_n < 10:
+        best_n = hp.get('n_estimators', 500)
 
-    Strategy: base weight=1.0, top/bottom 10% get boosted weight."""
-    w = np.ones(len(y))
-    y_arr = np.asarray(y, dtype=float)
-    valid = ~np.isnan(y_arr)
-
-    if valid.sum() < 100:
-        return w
-
-    y_valid = y_arr[valid]
-    p10 = np.percentile(y_valid, 10)
-    p90 = np.percentile(y_valid, 90)
-
-    extreme_mask = valid & ((y_arr <= p10) | (y_arr >= p90))
-    w[extreme_mask] = boost_extremes
-
-    p2 = np.percentile(y_valid, 2)
-    p98 = np.percentile(y_valid, 98)
-    very_extreme = valid & ((y_arr <= p2) | (y_arr >= p98))
-    w[very_extreme] = boost_extremes * 1.5
-
-    if param in ('wind_speed_10m', 'wind_gusts_10m'):
-        p95 = np.percentile(y_valid, 95)
-        strong_wind = valid & (y_arr >= p95)
-        w[strong_wind] = boost_extremes * 2.0
-
-    return w
-
-
-def _time_series_cv_best_n(X, y, hp, n_folds=3):
-    """Expanding-window time-series CV to find robust optimal n_estimators.
-    More reliable than a single chronological split — averages across
-    multiple temporal folds to reduce variance in the early-stopping point."""
-    n = len(X)
-    fold_size = n // (n_folds + 1)
-    iterations = []
-
-    for i in range(n_folds):
-        train_end = fold_size * (i + 2)
-        val_start = train_end
-        val_end = min(val_start + fold_size, n)
-        if val_end - val_start < 50:
-            continue
-
-        m = xgb.XGBRegressor(**hp)
-        m.fit(X.iloc[:train_end], y.iloc[:train_end],
-              eval_set=[(X.iloc[val_start:val_end], y.iloc[val_start:val_end])],
-              verbose=False)
-        bi = m.best_iteration + 1
-        if bi >= 10:
-            iterations.append(bi)
-
-    if not iterations:
-        return hp.get('n_estimators', 500)
-    return int(np.percentile(iterations, 75))
-
-
-def _train_direct_with_pruning(X_tr, y_tr, hp, prune=True, min_features=80, sample_weight=None):
-    """Two-pass training: first pass on all features, second on pruned set.
-    Uses time-series CV for robust n_estimators determination.
-
-    Pass 1: Train on all features → get feature importances
-    Pass 2: Remove bottom 10% of features → retrain on cleaner set
-
-    This reduces overfitting from noisy/irrelevant features while keeping
-    the most informative signals."""
-    best_n = _time_series_cv_best_n(X_tr, y_tr, hp)
-    hp1 = {k: v for k, v in hp.items() if k != 'early_stopping_rounds'}
-    hp1['n_estimators'] = best_n
-
-    model1 = xgb.XGBRegressor(**hp1)
-    model1.fit(X_tr, y_tr, sample_weight=sample_weight, verbose=False)
-
-    if not prune:
-        return model1, list(X_tr.columns), best_n
-
-    importances = model1.feature_importances_
-    nonzero_mask = importances > 0
-    n_nonzero = nonzero_mask.sum()
-
-    if n_nonzero <= min_features:
-        return model1, list(X_tr.columns), best_n
-
-    nonzero_imps = importances[nonzero_mask]
-    threshold = np.percentile(nonzero_imps, 5)
-    selected = [f for f, imp in zip(X_tr.columns, importances)
-                if imp >= threshold]
-
-    if len(selected) < min_features or len(selected) >= len(X_tr.columns) * 0.92:
-        return model1, list(X_tr.columns), best_n
-
-    X_sel = X_tr[selected]
-    best_n2 = _time_series_cv_best_n(X_sel, y_tr, hp)
-    hp2 = {k: v for k, v in hp.items() if k != 'early_stopping_rounds'}
-    hp2['n_estimators'] = best_n2
-
-    model2 = xgb.XGBRegressor(**hp2)
-    model2.fit(X_sel, y_tr, sample_weight=sample_weight, verbose=False)
-
-    return model2, selected, best_n2
+    hp_final = {k: v for k, v in hp.items() if k != 'early_stopping_rounds'}
+    hp_final['n_estimators'] = best_n
+    X_full = pd.concat([X_tr, X_val], axis=0)
+    y_full = pd.concat([y_tr, y_val], axis=0)
+    model = xgb.XGBRegressor(**hp_final)
+    model.fit(X_full, y_full, verbose=False)
+    return model, list(X_tr.columns)
 
 
 def _find_optimal_blend(y_pred, y_te, ens_te):
-    """Find optimal alpha: final = alpha*xgb + (1-alpha)*ensemble.
-    Searches wider range (0.30-1.00) with finer granularity (0.02 steps)."""
+    """Find optimal alpha: final = alpha*xgb + (1-alpha)*ensemble."""
     base_mae = mean_absolute_error(y_te, y_pred)
     best_alpha, best_mae = 1.0, base_mae
     best_pred = y_pred.copy()
-    for alpha in np.arange(0.30, 1.01, 0.02):
+    for alpha in np.arange(0.50, 1.01, 0.025):
         blend = alpha * y_pred + (1 - alpha) * ens_te
         bm = mean_absolute_error(y_te, blend)
         if bm < best_mae:
             best_mae, best_alpha = bm, alpha
             best_pred = blend.copy()
     return best_alpha, best_mae, best_pred
+
+
+def _train_residual_blended(X_tr, y_tr, X_te, y_te, hp, param, ens_col, df_v_tr, df_v_te):
+    """Train direct + residual (Huber) models on ALL data, find optimal blend.
+    No splits — uses full 50K training set."""
+    ens_tr = pd.to_numeric(df_v_tr[ens_col], errors='coerce').fillna(0) if ens_col in df_v_tr.columns else pd.Series(0, index=y_tr.index)
+    ens_te = pd.to_numeric(df_v_te[ens_col], errors='coerce').fillna(0) if ens_col in df_v_te.columns else pd.Series(0, index=y_te.index)
+
+    X_train_a, y_train_a, X_val_a, y_val_a = _make_val_split(X_tr, y_tr)
+    direct_model, _ = _train_xgb(X_train_a, y_train_a, X_val_a, y_val_a, hp)
+    direct_pred = direct_model.predict(X_te)
+
+    y_resid_tr = y_tr - ens_tr.values
+    X_train_b, y_train_b, X_val_b, y_val_b = _make_val_split(X_tr, y_resid_tr)
+    hp_resid = hp.copy()
+    hp_resid['objective'] = 'reg:pseudohubererror'
+    resid_model, _ = _train_xgb(X_train_b, y_train_b, X_val_b, y_val_b, hp_resid)
+    resid_correction = resid_model.predict(X_te)
+    resid_pred = ens_te.values + resid_correction
+
+    best_alpha, best_blend_mae = 1.0, float('inf')
+    for alpha in np.arange(0.5, 1.01, 0.05):
+        blend = alpha * direct_pred + (1 - alpha) * ens_te.values
+        bm = mean_absolute_error(y_te, blend)
+        if bm < best_blend_mae:
+            best_blend_mae, best_alpha = bm, alpha
+    blend_pred = best_alpha * direct_pred + (1 - best_alpha) * ens_te.values
+
+    mae_direct = mean_absolute_error(y_te, direct_pred)
+    mae_resid = mean_absolute_error(y_te, resid_pred)
+    mae_blend = best_blend_mae
+
+    methods = {'direct': (mae_direct, direct_pred, direct_model, False),
+               'residual': (mae_resid, resid_pred, resid_model, True),
+               'blend': (mae_blend, blend_pred, direct_model, False)}
+
+    best_name = min(methods, key=lambda k: methods[k][0])
+    best_mae, best_pred, best_model, is_residual = methods[best_name]
+    best_rmse = np.sqrt(mean_squared_error(y_te, best_pred))
+
+    info_str = f"direct={mae_direct:.3f}, residual={mae_resid:.3f}, blend({best_alpha:.2f})={mae_blend:.3f} → {best_name}"
+
+    return {
+        'model': best_model, 'direct_model': direct_model, 'resid_model': resid_model,
+        'method': best_name, 'is_residual': is_residual,
+        'blend_alpha': best_alpha if best_name == 'blend' else None,
+        'mae': best_mae, 'rmse': best_rmse,
+        'info_str': info_str,
+    }
 
 
 def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_cols):
@@ -1042,11 +975,9 @@ def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_
 
 
 def train_all_models(df):
-    """Unified training: all params use full dataset.
+    """Unified training: all params use full 50K dataset. No splits.
     - Precipitation: two-stage (cls+reg) + optional blend
-    - Everything else: direct XGBoost with time-series CV + feature pruning + blend
-    - Multi-target: temperature trained first, its predictions used as features for dew/RH
-    - Sample weighting: extreme values get higher weight"""
+    - Everything else: residual+blended (direct/residual/blend)"""
     print("\n[3/6] Treniranje XGBoost modela...")
 
     feature_cols = get_feature_columns(df)
@@ -1055,12 +986,7 @@ def train_all_models(df):
     trained = {}
     results = {}
 
-    param_order = ['temperature_2m'] + [p for p in TARGET_PARAMS if p != 'temperature_2m']
-    temp_corrected_train = None
-    temp_corrected_test = None
-
-    for param in param_order:
-        info = TARGET_PARAMS[param]
+    for param, info in TARGET_PARAMS.items():
         obs_col = info['obs']
         if obs_col not in df.columns:
             print(f"  {info['display']:20s} --- SKIP (nema obs)")
@@ -1082,30 +1008,15 @@ def train_all_models(df):
         te = df_v['datetime'] >= SPLIT_DATE
 
         vf = [c for c in feature_cols if c in df_v.columns
-              and df_v[c].notna().sum() > len(df_v) * 0.15]
+              and df_v[c].notna().sum() > len(df_v) * 0.3]
 
-        X_tr, y_tr = df_v.loc[tr, vf], y_v[tr]
-        X_te, y_te = df_v.loc[te, vf], y_v[te]
+        FILL = -999
+        X_tr, y_tr = df_v.loc[tr, vf].fillna(FILL), y_v[tr]
+        X_te, y_te = df_v.loc[te, vf].fillna(FILL), y_v[te]
 
         if len(X_tr) < 300 or len(X_te) < 50:
             print(f"  {info['display']:20s} --- SKIP (train={len(X_tr)}, test={len(X_te)})")
             continue
-
-        if param in ('dew_point_2m', 'relative_humidity_2m') and temp_corrected_train is not None:
-            ct_col = 'xgb_corrected_temp'
-            tr_idx = X_tr.index
-            te_idx = X_te.index
-            X_tr = X_tr.copy()
-            X_te = X_te.copy()
-            X_tr[ct_col] = temp_corrected_train.reindex(tr_idx)
-            X_te[ct_col] = temp_corrected_test.reindex(te_idx)
-            if ct_col not in vf:
-                vf = vf + [ct_col]
-            print(f"    [Multi-target] injected corrected temp feature for {param}")
-
-        # Disable sample weights for params where they hurt (verified vs v11)
-        NO_SAMPLE_WEIGHT = {'pressure_msl', 'wind_gusts_10m'}
-        sw_tr = None if param in NO_SAMPLE_WEIGHT else _compute_sample_weights(y_tr, param)
 
         if param == 'precipitation':
             X_train_p, y_train_p, X_val_p, y_val_p = _make_val_split(X_tr, y_tr)
@@ -1118,7 +1029,7 @@ def train_all_models(df):
             ens_col = f'{param}_ens_mean'
             blend_alpha = 1.0
             if ens_col in df_v.columns:
-                ens_te_vals = np.nan_to_num(pd.to_numeric(df_v.loc[te, ens_col], errors='coerce').values, nan=0.0)
+                ens_te_vals = pd.to_numeric(df_v.loc[te, ens_col], errors='coerce').fillna(0).values
                 best_method = precip_result['best_method']
                 RAIN_THRESH = 0.1
                 cls_proba_te = precip_result['cls_model'].predict_proba(X_te)[:, 1]
@@ -1200,102 +1111,58 @@ def train_all_models(df):
             }
             continue
 
-        if param in ('temperature_2m', 'dew_point_2m'):
-            hp = dict(n_estimators=2500, max_depth=6, learning_rate=0.025,
-                      subsample=0.8, colsample_bytree=0.6, colsample_bylevel=0.8,
-                      reg_alpha=0.05, reg_lambda=1.0, min_child_weight=5, gamma=0.02,
+        if param in ('temperature_2m', 'dew_point_2m', 'pressure_msl'):
+            hp = dict(n_estimators=1200, max_depth=6, learning_rate=0.03,
+                      subsample=0.8, colsample_bytree=0.7, reg_alpha=0.1,
+                      reg_lambda=1.0, min_child_weight=5, gamma=0.05,
                       objective='reg:absoluteerror', random_state=42, n_jobs=-1,
-                      early_stopping_rounds=60)
-        elif param == 'pressure_msl':
-            hp = dict(n_estimators=2500, max_depth=6, learning_rate=0.025,
-                      subsample=0.8, colsample_bytree=0.6, colsample_bylevel=0.8,
-                      reg_alpha=0.05, reg_lambda=1.0, min_child_weight=5, gamma=0.02,
-                      objective='reg:absoluteerror', random_state=42, n_jobs=-1,
-                      early_stopping_rounds=60)
-        elif param == 'relative_humidity_2m':
-            hp = dict(n_estimators=2500, max_depth=6, learning_rate=0.025,
-                      subsample=0.8, colsample_bytree=0.55, colsample_bylevel=0.75,
-                      reg_alpha=0.08, reg_lambda=1.2, min_child_weight=6, gamma=0.03,
-                      objective='reg:absoluteerror', random_state=42, n_jobs=-1,
-                      early_stopping_rounds=55)
+                      early_stopping_rounds=40)
         elif param in ('cloud_cover', 'shortwave_radiation'):
-            hp = dict(n_estimators=2500, max_depth=6, learning_rate=0.022,
-                      subsample=0.75, colsample_bytree=0.5, colsample_bylevel=0.7,
-                      reg_alpha=0.1, reg_lambda=1.3, min_child_weight=7, gamma=0.04,
+            hp = dict(n_estimators=1000, max_depth=6, learning_rate=0.04,
+                      subsample=0.8, colsample_bytree=0.65, reg_alpha=0.2,
+                      reg_lambda=1.5, min_child_weight=5, gamma=0.05,
                       objective='reg:absoluteerror', random_state=42, n_jobs=-1,
-                      early_stopping_rounds=50)
+                      early_stopping_rounds=40)
+        elif param == 'relative_humidity_2m':
+            hp = dict(n_estimators=1000, max_depth=6, learning_rate=0.04,
+                      subsample=0.8, colsample_bytree=0.65, reg_alpha=0.15,
+                      reg_lambda=1.5, min_child_weight=5, gamma=0.05,
+                      objective='reg:absoluteerror', random_state=42, n_jobs=-1,
+                      early_stopping_rounds=40)
         else:
-            hp = dict(n_estimators=2500, max_depth=5, learning_rate=0.02,
-                      subsample=0.75, colsample_bytree=0.5, colsample_bylevel=0.7,
-                      reg_alpha=0.15, reg_lambda=1.8, min_child_weight=8, gamma=0.08,
+            hp = dict(n_estimators=800, max_depth=6, learning_rate=0.05,
+                      subsample=0.8, colsample_bytree=0.7, reg_alpha=0.1,
+                      reg_lambda=1.0, min_child_weight=5, gamma=0.05,
                       objective='reg:absoluteerror', random_state=42, n_jobs=-1,
-                      early_stopping_rounds=50)
+                      early_stopping_rounds=30)
 
         ens_col = f'{param}_ens_mean'
-        ens_tr_vals = pd.to_numeric(df_v.loc[tr, ens_col], errors='coerce').values if ens_col in df_v.columns else np.zeros(len(X_tr))
-        ens_te_vals = pd.to_numeric(df_v.loc[te, ens_col], errors='coerce').values if ens_col in df_v.columns else np.zeros(len(X_te))
-        ens_tr_safe = np.nan_to_num(ens_tr_vals, nan=0.0)
-        ens_te_safe = np.nan_to_num(ens_te_vals, nan=0.0)
-
-        direct_model, direct_features, direct_n = _train_direct_with_pruning(
-            X_tr, y_tr, hp, prune=True, min_features=80, sample_weight=sw_tr
+        rb_result = _train_residual_blended(
+            X_tr, y_tr, X_te, y_te, hp, param, ens_col,
+            df_v.loc[tr], df_v.loc[te]
         )
-        X_te_d = X_te[direct_features] if direct_features != list(X_te.columns) else X_te
-        direct_pred = direct_model.predict(X_te_d)
 
-        y_resid_tr = y_tr - ens_tr_safe
-        hp_resid = hp.copy()
-        hp_resid['objective'] = 'reg:pseudohubererror'
-        resid_model, resid_features, resid_n = _train_direct_with_pruning(
-            X_tr, y_resid_tr, hp_resid, prune=False, min_features=80, sample_weight=sw_tr
-        )
-        X_te_r = X_te[resid_features] if resid_features != list(X_te.columns) else X_te
-        resid_pred = ens_te_safe + resid_model.predict(X_te_r)
+        method_str = rb_result['method']
+        model_obj = rb_result['model']
+        y_pred = model_obj.predict(X_te)
 
-        best_blend_alpha, best_blend_mae = 1.0, float('inf')
-        for alpha in np.arange(0.30, 1.01, 0.05):
-            blend = alpha * direct_pred + (1 - alpha) * ens_te_safe
-            bm = mean_absolute_error(y_te, blend)
-            if bm < best_blend_mae:
-                best_blend_mae, best_blend_alpha = bm, alpha
-        blend_pred = best_blend_alpha * direct_pred + (1 - best_blend_alpha) * ens_te_safe
+        if rb_result['is_residual']:
+            ens_te_vals = pd.to_numeric(df_v.loc[te, ens_col], errors='coerce').fillna(0).values if ens_col in df_v.columns else np.zeros(len(X_te))
+            y_pred = ens_te_vals + y_pred
+        elif rb_result.get('blend_alpha') is not None:
+            ens_te_vals = pd.to_numeric(df_v.loc[te, ens_col], errors='coerce').fillna(0).values if ens_col in df_v.columns else np.zeros(len(X_te))
+            alpha = rb_result['blend_alpha']
+            y_pred = alpha * y_pred + (1 - alpha) * ens_te_vals
 
-        for arr in [direct_pred, resid_pred, blend_pred]:
-            if param == 'relative_humidity_2m':
-                np.clip(arr, 0, 100, out=arr)
-            elif param == 'cloud_cover':
-                np.clip(arr, 0, 100, out=arr)
-            elif param in ['wind_speed_10m', 'wind_gusts_10m', 'shortwave_radiation']:
-                np.clip(arr, 0, None, out=arr)
+        if param == 'relative_humidity_2m':
+            y_pred = np.clip(y_pred, 0, 100)
+        elif param == 'cloud_cover':
+            y_pred = np.clip(y_pred, 0, 100)
+        elif param in ['wind_speed_10m', 'wind_gusts_10m', 'shortwave_radiation']:
+            y_pred = np.clip(y_pred, 0, None)
 
-        mae_direct = mean_absolute_error(y_te, direct_pred)
-        mae_resid = mean_absolute_error(y_te, resid_pred)
-        mae_blend = best_blend_mae
-
-        methods = {
-            'direct': (mae_direct, direct_pred, direct_model, False, direct_features, None),
-            'residual': (mae_resid, resid_pred, resid_model, True, resid_features, None),
-            'blend': (mae_blend, blend_pred, direct_model, False, direct_features, best_blend_alpha),
-        }
-        best_name = min(methods, key=lambda k: methods[k][0])
-        mae, y_pred, model, is_residual, final_features, blend_alpha = methods[best_name]
+        mae = mean_absolute_error(y_te, y_pred)
         rmse = np.sqrt(mean_squared_error(y_te, y_pred))
-        method_str = best_name
-        if best_name == 'blend':
-            method_str = f'blend({blend_alpha:.2f})'
-
-        if param == 'temperature_2m':
-            X_tr_d = X_tr[direct_features] if direct_features != list(X_tr.columns) else X_tr
-            if best_name == 'direct':
-                train_pred = model.predict(X_tr_d)
-            elif best_name == 'residual':
-                X_tr_r = X_tr[resid_features] if resid_features != list(X_tr.columns) else X_tr
-                train_pred = ens_tr_safe + resid_model.predict(X_tr_r)
-            else:
-                train_pred = blend_alpha * direct_model.predict(X_tr_d) + (1 - blend_alpha) * ens_tr_safe
-            temp_corrected_train = pd.Series(train_pred, index=X_tr.index, name='xgb_corrected_temp')
-            temp_corrected_test = pd.Series(y_pred, index=X_te.index, name='xgb_corrected_temp')
-            print(f"    [Multi-target] saved corrected temp (train={len(train_pred)}, test={len(y_pred)})")
 
         best_mae, best_m = float('inf'), ""
         for m in MODELS:
@@ -1316,26 +1183,25 @@ def train_all_models(df):
                 ens_mae = mean_absolute_error(y_te[vv], ev[vv])
 
         impr = (best_mae - mae) / best_mae * 100 if best_mae < float('inf') else 0
-        n_pruned = len(vf) - len(final_features)
-        info_str = f"direct={mae_direct:.3f}, residual={mae_resid:.3f}, blend({best_blend_alpha:.2f})={mae_blend:.3f} → {best_name}"
 
-        print(f"    {info_str}")
+        print(f"    {rb_result['info_str']}")
         print(f"  {info['display']:20s} MAE: {mae:.3f}{info['unit']:5s} "
               f"| best: {best_mae:.3f} ({best_m[:8]:8s}) "
               f"| ens: {ens_mae:.3f} "
               f"| +{impr:.1f}%")
 
-        direct_model.save_model(os.path.join(MODEL_DIR, f"xgb_{param}.json"))
-        resid_model.save_model(os.path.join(MODEL_DIR, f"xgb_{param}_resid.json"))
+        rb_result['direct_model'].save_model(os.path.join(MODEL_DIR, f"xgb_{param}.json"))
+        if rb_result.get('resid_model'):
+            rb_result['resid_model'].save_model(os.path.join(MODEL_DIR, f"xgb_{param}_resid.json"))
 
         trained[param] = {
-            'model': model,
-            'direct_model': direct_model,
-            'resid_model': resid_model,
-            'method': best_name,
-            'is_residual': is_residual,
-            'blend_alpha': blend_alpha,
-            'features': final_features,
+            'model': rb_result['model'],
+            'direct_model': rb_result['direct_model'],
+            'resid_model': rb_result.get('resid_model'),
+            'method': method_str,
+            'is_residual': rb_result['is_residual'],
+            'blend_alpha': rb_result.get('blend_alpha'),
+            'features': vf,
             'mae': mae, 'rmse': rmse,
             'best_model': best_m, 'best_model_mae': best_mae,
             'ensemble_mae': ens_mae, 'improvement': impr,
@@ -1346,304 +1212,16 @@ def train_all_models(df):
             'improvement': round(impr, 1),
             'best_model': best_m, 'best_model_mae': round(best_mae, 3),
             'ensemble_mae': round(ens_mae, 3),
-            'method': best_name,
-            'is_residual': bool(is_residual),
-            'blend_alpha': float(blend_alpha) if blend_alpha is not None else None,
+            'method': method_str,
+            'is_residual': bool(rb_result['is_residual']),
+            'blend_alpha': float(rb_result['blend_alpha']) if rb_result.get('blend_alpha') is not None else None,
             'is_precip': False,
         }
-
-    print("\n  >> RETRAIN na SVIM podacima za produkciju...")
-
-    for param in param_order:
-        info = TARGET_PARAMS[param]
-        if param not in trained:
-            continue
-
-        obs_col = info['obs']
-        y = pd.to_numeric(df[obs_col], errors='coerce')
-        valid = y.notna()
-        if param == 'cloud_cover':
-            valid = valid & (df.get('is_daytime', pd.Series(1, index=df.index)) > 0)
-
-        df_v = df[valid].copy()
-        y_v = y[valid]
-        vf = trained[param]['features']
-        X_all = df_v[vf]
-        y_all = y_v
-
-        if param == 'precipitation':
-            precip_info = trained[param]['precip_info']
-            RAIN_THRESH = 0.1
-
-            y_cls_all = (y_all >= RAIN_THRESH).astype(int)
-            rain_ratio = y_cls_all.mean()
-            cls_hp = dict(
-                n_estimators=600, max_depth=5, learning_rate=0.05,
-                subsample=0.8, colsample_bytree=0.6, reg_alpha=0.5, reg_lambda=2.0,
-                min_child_weight=10, gamma=0.1,
-                scale_pos_weight=max(1.0, (1 - rain_ratio) / max(rain_ratio, 0.01)),
-                objective='binary:logistic', eval_metric='logloss',
-                random_state=42, n_jobs=-1
-            )
-            X_train_cv, _, X_val_cv, y_val_cls_cv = _make_val_split(X_all, y_cls_all)
-            y_train_cv_cls = y_cls_all.iloc[:len(X_train_cv)]
-            cls_temp = xgb.XGBClassifier(**{**cls_hp, 'early_stopping_rounds': 40})
-            cls_temp.fit(X_train_cv, y_train_cv_cls,
-                         eval_set=[(X_val_cv, y_val_cls_cv)], verbose=False)
-            cls_n = max(cls_temp.best_iteration + 1, 50)
-            cls_hp['n_estimators'] = cls_n
-            cls_full = xgb.XGBClassifier(**cls_hp)
-            cls_full.fit(X_all, y_cls_all, verbose=False)
-
-            rain_mask = y_all >= RAIN_THRESH
-            use_sqrt = precip_info.get('use_sqrt', False)
-            reg_hp = dict(
-                n_estimators=800, max_depth=4, learning_rate=0.03,
-                subsample=0.7, colsample_bytree=0.5, reg_alpha=1.0, reg_lambda=3.0,
-                min_child_weight=10, gamma=0.15,
-                objective='reg:absoluteerror', random_state=42, n_jobs=-1
-            )
-            if rain_mask.sum() >= 100:
-                X_rain_tr, _, X_rain_val, _ = _make_val_split(X_all[rain_mask], y_all[rain_mask])
-                y_rain_tr = np.sqrt(y_all[rain_mask].iloc[:len(X_rain_tr)]) if use_sqrt else y_all[rain_mask].iloc[:len(X_rain_tr)]
-                y_rain_val = np.sqrt(y_all[rain_mask].iloc[len(X_rain_tr):]) if use_sqrt else y_all[rain_mask].iloc[len(X_rain_tr):]
-                reg_temp = xgb.XGBRegressor(**{**reg_hp, 'early_stopping_rounds': 50})
-                reg_temp.fit(X_rain_tr, y_rain_tr,
-                             eval_set=[(X_rain_val, y_rain_val)], verbose=False)
-                reg_n = max(reg_temp.best_iteration + 1, 50)
-                reg_hp['n_estimators'] = reg_n
-                reg_full = xgb.XGBRegressor(**reg_hp)
-                y_target = np.sqrt(y_all[rain_mask]) if use_sqrt else y_all[rain_mask]
-                reg_full.fit(X_all[rain_mask], y_target, verbose=False)
-            else:
-                reg_full = xgb.XGBRegressor(**reg_hp)
-                reg_full.fit(X_all, y_all, verbose=False)
-
-            single_hp = dict(
-                n_estimators=1000, max_depth=4, learning_rate=0.03,
-                subsample=0.7, colsample_bytree=0.5, reg_alpha=1.0, reg_lambda=3.0,
-                min_child_weight=15, gamma=0.2,
-                objective='reg:absoluteerror', random_state=42, n_jobs=-1
-            )
-            X_s_tr, _, X_s_val, _ = _make_val_split(X_all, y_all)
-            y_s_tr = y_all.iloc[:len(X_s_tr)]
-            y_s_val = y_all.iloc[len(X_s_tr):]
-            single_temp = xgb.XGBRegressor(**{**single_hp, 'early_stopping_rounds': 50})
-            single_temp.fit(X_s_tr, y_s_tr,
-                            eval_set=[(X_s_val, y_s_val)], verbose=False)
-            single_n = max(single_temp.best_iteration + 1, 50)
-            single_hp['n_estimators'] = single_n
-            single_full = xgb.XGBRegressor(**single_hp)
-            single_full.fit(X_all, y_all, verbose=False)
-
-            cls_full.save_model(os.path.join(MODEL_DIR, f"xgb_{param}_cls.json"))
-            reg_full.save_model(os.path.join(MODEL_DIR, f"xgb_{param}_reg.json"))
-            single_full.save_model(os.path.join(MODEL_DIR, f"xgb_{param}.json"))
-            print(f"    {info['display']:20s} retrained on {len(X_all)} rows (precip)")
-
-        else:
-            method = trained[param]['method']
-
-            ens_col = f'{param}_ens_mean'
-            ens_all = np.nan_to_num(pd.to_numeric(df_v[ens_col], errors='coerce').values, nan=0.0) if ens_col in df_v.columns else np.zeros(len(X_all))
-
-            NO_SAMPLE_WEIGHT = {'pressure_msl', 'wind_gusts_10m'}
-            sw_all = None if param in NO_SAMPLE_WEIGHT else _compute_sample_weights(y_all, param)
-
-            if param in ('temperature_2m', 'dew_point_2m'):
-                hp = dict(n_estimators=2500, max_depth=6, learning_rate=0.025,
-                          subsample=0.8, colsample_bytree=0.6, colsample_bylevel=0.8,
-                          reg_alpha=0.05, reg_lambda=1.0, min_child_weight=5, gamma=0.02,
-                          objective='reg:absoluteerror', random_state=42, n_jobs=-1,
-                          early_stopping_rounds=60)
-            elif param == 'pressure_msl':
-                hp = dict(n_estimators=2500, max_depth=6, learning_rate=0.025,
-                          subsample=0.8, colsample_bytree=0.6, colsample_bylevel=0.8,
-                          reg_alpha=0.05, reg_lambda=1.0, min_child_weight=5, gamma=0.02,
-                          objective='reg:absoluteerror', random_state=42, n_jobs=-1,
-                          early_stopping_rounds=60)
-            elif param == 'relative_humidity_2m':
-                hp = dict(n_estimators=2500, max_depth=6, learning_rate=0.025,
-                          subsample=0.8, colsample_bytree=0.55, colsample_bylevel=0.75,
-                          reg_alpha=0.08, reg_lambda=1.2, min_child_weight=6, gamma=0.03,
-                          objective='reg:absoluteerror', random_state=42, n_jobs=-1,
-                          early_stopping_rounds=55)
-            elif param in ('cloud_cover', 'shortwave_radiation'):
-                hp = dict(n_estimators=2500, max_depth=6, learning_rate=0.022,
-                          subsample=0.75, colsample_bytree=0.5, colsample_bylevel=0.7,
-                          reg_alpha=0.1, reg_lambda=1.3, min_child_weight=7, gamma=0.04,
-                          objective='reg:absoluteerror', random_state=42, n_jobs=-1,
-                          early_stopping_rounds=50)
-            else:
-                hp = dict(n_estimators=2500, max_depth=5, learning_rate=0.02,
-                          subsample=0.75, colsample_bytree=0.5, colsample_bylevel=0.7,
-                          reg_alpha=0.15, reg_lambda=1.8, min_child_weight=8, gamma=0.08,
-                          objective='reg:absoluteerror', random_state=42, n_jobs=-1,
-                          early_stopping_rounds=50)
-
-            direct_full, _, _ = _train_direct_with_pruning(
-                X_all, y_all, hp, prune=True, min_features=80, sample_weight=sw_all
-            )
-            direct_full.save_model(os.path.join(MODEL_DIR, f"xgb_{param}.json"))
-
-            y_resid_all = y_all - ens_all
-            hp_resid = hp.copy()
-            hp_resid['objective'] = 'reg:pseudohubererror'
-            resid_full, _, _ = _train_direct_with_pruning(
-                X_all, y_resid_all, hp_resid, prune=False, min_features=80, sample_weight=sw_all
-            )
-            resid_full.save_model(os.path.join(MODEL_DIR, f"xgb_{param}_resid.json"))
-
-            print(f"    {info['display']:20s} retrained on {len(X_all)} rows [{method}]")
-
-            if param == 'temperature_2m':
-                X_full_all = df[vf]
-                if method == 'residual':
-                    ens_full = np.nan_to_num(pd.to_numeric(df[ens_col], errors='coerce').values, nan=0.0) if ens_col in df.columns else np.zeros(len(df))
-                    df['xgb_corrected_temp'] = ens_full + resid_full.predict(X_full_all)
-                else:
-                    df['xgb_corrected_temp'] = direct_full.predict(X_full_all)
-                print(f"    [Multi-target] injected corrected temp for dew/RH retrain")
-
-    print("  >> Produkcijski modeli sacuvani (trenirani na svim podacima).")
-
-    print("\n  >> PROCJENA PRODUKCIJSKOG MAE (5-fold expanding-window CV)...")
-
-    cv_results = {}
-    n_cv_folds = 5
-
-    for param in param_order:
-        if param not in trained:
-            continue
-        info = TARGET_PARAMS[param]
-        obs_col = info['obs']
-
-        y = pd.to_numeric(df[obs_col], errors='coerce')
-        valid = y.notna()
-        if param == 'cloud_cover':
-            valid = valid & (df.get('is_daytime', pd.Series(1, index=df.index)) > 0)
-
-        df_v = df[valid].copy()
-        y_v = y[valid]
-        vf = trained[param]['features']
-
-        if param == 'precipitation':
-            cv_results[param] = {'cv_mae': results[param]['mae'], 'cv_note': 'test-set (no CV)'}
-            continue
-
-        n = len(df_v)
-        fold_size = n // (n_cv_folds + 1)
-
-        if fold_size < 200:
-            cv_results[param] = {'cv_mae': results[param]['mae'], 'cv_note': 'too small for CV'}
-            continue
-
-        method = trained[param]['method']
-
-        if param in ('temperature_2m', 'dew_point_2m'):
-            cv_hp = dict(n_estimators=2500, max_depth=6, learning_rate=0.025,
-                         subsample=0.8, colsample_bytree=0.6, colsample_bylevel=0.8,
-                         reg_alpha=0.05, reg_lambda=1.0, min_child_weight=5, gamma=0.02,
-                         objective='reg:absoluteerror', random_state=42, n_jobs=-1,
-                         early_stopping_rounds=60)
-        elif param == 'pressure_msl':
-            cv_hp = dict(n_estimators=2500, max_depth=6, learning_rate=0.025,
-                         subsample=0.8, colsample_bytree=0.6, colsample_bylevel=0.8,
-                         reg_alpha=0.05, reg_lambda=1.0, min_child_weight=5, gamma=0.02,
-                         objective='reg:absoluteerror', random_state=42, n_jobs=-1,
-                         early_stopping_rounds=60)
-        elif param == 'relative_humidity_2m':
-            cv_hp = dict(n_estimators=2500, max_depth=6, learning_rate=0.025,
-                         subsample=0.8, colsample_bytree=0.55, colsample_bylevel=0.75,
-                         reg_alpha=0.08, reg_lambda=1.2, min_child_weight=6, gamma=0.03,
-                         objective='reg:absoluteerror', random_state=42, n_jobs=-1,
-                         early_stopping_rounds=55)
-        elif param in ('cloud_cover', 'shortwave_radiation'):
-            cv_hp = dict(n_estimators=2500, max_depth=6, learning_rate=0.022,
-                         subsample=0.75, colsample_bytree=0.5, colsample_bylevel=0.7,
-                         reg_alpha=0.1, reg_lambda=1.3, min_child_weight=7, gamma=0.04,
-                         objective='reg:absoluteerror', random_state=42, n_jobs=-1,
-                         early_stopping_rounds=50)
-        else:
-            cv_hp = dict(n_estimators=2500, max_depth=5, learning_rate=0.02,
-                         subsample=0.75, colsample_bytree=0.5, colsample_bylevel=0.7,
-                         reg_alpha=0.15, reg_lambda=1.8, min_child_weight=8, gamma=0.08,
-                         objective='reg:absoluteerror', random_state=42, n_jobs=-1,
-                         early_stopping_rounds=50)
-
-        fold_maes = []
-        ens_col = f'{param}_ens_mean'
-
-        for fold_i in range(n_cv_folds):
-            tr_end = fold_size * (fold_i + 2)
-            te_start = tr_end
-            te_end = min(te_start + fold_size, n)
-            if te_end - te_start < 50:
-                continue
-
-            X_cv_tr = df_v.iloc[:tr_end][vf]
-            y_cv_tr = y_v.iloc[:tr_end]
-            X_cv_te = df_v.iloc[te_start:te_end][vf]
-            y_cv_te = y_v.iloc[te_start:te_end]
-
-            NO_SAMPLE_WEIGHT = {'pressure_msl', 'wind_gusts_10m'}
-            sw_cv = None if param in NO_SAMPLE_WEIGHT else _compute_sample_weights(y_cv_tr, param)
-
-            if method in ('direct', 'blend'):
-                hp_quick = {k: v for k, v in cv_hp.items() if k != 'early_stopping_rounds'}
-                hp_quick['n_estimators'] = min(800, cv_hp['n_estimators'])
-                m_cv = xgb.XGBRegressor(**hp_quick)
-                m_cv.fit(X_cv_tr, y_cv_tr, sample_weight=sw_cv, verbose=False)
-                pred = m_cv.predict(X_cv_te)
-            else:
-                ens_cv_tr = np.nan_to_num(pd.to_numeric(df_v.iloc[:tr_end][ens_col], errors='coerce').values, nan=0.0) if ens_col in df_v.columns else np.zeros(len(X_cv_tr))
-                ens_cv_te = pd.to_numeric(df_v.iloc[te_start:te_end][ens_col], errors='coerce').values if ens_col in df_v.columns else np.zeros(len(X_cv_te))
-                y_resid = y_cv_tr - ens_cv_tr
-                hp_r = {k: v for k, v in cv_hp.items() if k != 'early_stopping_rounds'}
-                hp_r['n_estimators'] = min(800, cv_hp['n_estimators'])
-                hp_r['objective'] = 'reg:pseudohubererror'
-                m_cv = xgb.XGBRegressor(**hp_r)
-                m_cv.fit(X_cv_tr, y_resid, sample_weight=sw_cv, verbose=False)
-                pred = np.nan_to_num(ens_cv_te, nan=0.0) + m_cv.predict(X_cv_te)
-
-            if param == 'relative_humidity_2m':
-                np.clip(pred, 0, 100, out=pred)
-            elif param == 'cloud_cover':
-                np.clip(pred, 0, 100, out=pred)
-            elif param in ['wind_speed_10m', 'wind_gusts_10m', 'shortwave_radiation']:
-                np.clip(pred, 0, None, out=pred)
-
-            fold_mae = mean_absolute_error(y_cv_te, pred)
-            fold_maes.append(fold_mae)
-
-        if fold_maes:
-            cv_mae = np.mean(fold_maes)
-            cv_std = np.std(fold_maes)
-            cv_results[param] = {'cv_mae': round(cv_mae, 3), 'cv_std': round(cv_std, 3), 'n_folds': len(fold_maes)}
-            test_mae = results[param]['mae']
-            print(f"    {info['display']:20s} CV MAE: {cv_mae:.3f} ± {cv_std:.3f} (test: {test_mae:.3f})")
-        else:
-            cv_results[param] = {'cv_mae': results[param]['mae'], 'cv_note': 'CV failed'}
-
-    print("\n  >> MAE UPOREDBA: Test vs Production CV")
-    print(f"  {'Parametar':20s} {'Test MAE':>10s} {'CV MAE':>10s} {'CV ±':>8s}")
-    print(f"  {'-'*50}")
-    for param in param_order:
-        if param in results and param in cv_results:
-            info = TARGET_PARAMS[param]
-            test_mae = results[param]['mae']
-            cv_mae = cv_results[param].get('cv_mae', '---')
-            cv_std = cv_results[param].get('cv_std', None)
-            cv_str = f"{cv_mae:.3f}" if isinstance(cv_mae, float) else str(cv_mae)
-            std_str = f"± {cv_std:.3f}" if cv_std is not None else cv_results[param].get('cv_note', '')
-            print(f"  {info['display']:20s} {test_mae:10.3f} {cv_str:>10s} {std_str:>8s}")
 
     with open(os.path.join(MODEL_DIR, 'feature_lists.json'), 'w') as f:
         json.dump({k: v['features'] for k, v in trained.items()}, f)
     with open(os.path.join(MODEL_DIR, 'training_results.json'), 'w', encoding='utf-8') as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
-    with open(os.path.join(MODEL_DIR, 'cv_results.json'), 'w', encoding='utf-8') as f:
-        json.dump(cv_results, f, indent=2, ensure_ascii=False)
 
     return trained, results
 
@@ -1775,12 +1353,17 @@ def fetch_live_forecasts():
                     if v in h:
                         d[f"{model_name}_{v}_model"] = h[v]
                 all_fc[model_name] = d
-                print("OK")
+                print(f"OK ({len(d)}h)")
                 break
             except Exception as e:
                 if attempt == 2:
-                    print(f"FAIL ({e})")
+                    print(f"FAIL: {e}")
+                else:
+                    time.sleep(5)
         time.sleep(1.5)
+
+    if not all_fc:
+        raise RuntimeError("Nema prognoza!")
 
     merged = list(all_fc.values())[0]
     for k in list(all_fc.keys())[1:]:
@@ -1914,17 +1497,8 @@ def apply_correction(fc_df, trained, bias_tables):
         if ens in fc.columns:
             corrected[f'{param}_ensemble'] = fc[ens]
 
-    param_order = ['temperature_2m'] + [p for p in trained if p != 'temperature_2m']
-    corrected_temp_vals = None
-
-    for param in param_order:
-        if param not in trained:
-            continue
-        minfo = trained[param]
+    for param, minfo in trained.items():
         features = minfo['features']
-        if corrected_temp_vals is not None and param in ('dew_point_2m', 'relative_humidity_2m'):
-            if 'xgb_corrected_temp' in features:
-                X['xgb_corrected_temp'] = corrected_temp_vals
         available = [f for f in features if f in fc.columns]
 
         if len(available) < len(features) * 0.4:
@@ -1934,12 +1508,12 @@ def apply_correction(fc_df, trained, bias_tables):
         X = fc[available].copy()
         for c in features:
             if c not in X.columns:
-                X[c] = np.nan
-        X = X[features]
+                X[c] = -999
+        X = X[features].fillna(-999)
 
         for c in X.columns:
             if X[c].dtype == 'object':
-                X[c] = pd.to_numeric(X[c], errors='coerce')
+                X[c] = pd.to_numeric(X[c], errors='coerce').fillna(-999)
 
         if param == 'precipitation' and 'precip_info' in minfo:
             pinfo = minfo['precip_info']
@@ -2015,10 +1589,7 @@ def apply_correction(fc_df, trained, bias_tables):
                 pred = np.clip(pred, 0, 100)
         elif param in ['wind_speed_10m', 'wind_gusts_10m', 'shortwave_radiation']:
             pred = np.clip(pred, 0, None)
-        if param == 'temperature_2m':
-            corrected_temp_vals = pred.copy()
 
-    
         corrected[f'{param}_xgb'] = pred
         print(f"  {TARGET_PARAMS[param]['display']:20s} (MAE={minfo['mae']:.3f}{TARGET_PARAMS[param]['unit']}) [{method_name}]")
 
@@ -2087,8 +1658,8 @@ def _daily_narrative(grp):
             'cloud': float(sub_cc.mean()) if len(sub_cc) else None,
             'precip': float(sub_pr.sum()) if len(sub_pr) else 0,
             'precip_max_h': float(sub_pr.max()) if len(sub_pr) else 0,
-            'has_rain': float(sub_pr.sum()) > 0.5 if len(sub_pr) else False,
-            'rain_hours': int((sub_pr > 0.3).sum()) if len(sub_pr) else 0,
+            'has_rain': float(sub_pr.sum()) > 0.1 if len(sub_pr) else False,
+            'rain_hours': int((sub_pr > 0.1).sum()) if len(sub_pr) else 0,
             'has_thunder': bool((sub_wc >= 95).any()) if len(sub_wc) else False,
             'has_snow': bool(((sub_wc >= 71) & (sub_wc <= 75)).any()) if len(sub_wc) else False,
             'has_fog': bool(((sub_wc >= 45) & (sub_wc <= 48)).any()) if len(sub_wc) else False,
@@ -2102,7 +1673,7 @@ def _daily_narrative(grp):
     eve = _period(18, 24)
 
     total_precip = float(pr.sum()) if pr.notna().any() else 0
-    rain_hours_total = int((pr > 0.3).sum()) if pr.notna().any() else 0
+    rain_hours_total = int((pr > 0.1).sum()) if pr.notna().any() else 0
     max_wind = float(ws.max()) if ws.notna().any() else 0
     max_gust = float(wg.max()) if wg.notna().any() else 0
     temp_max = float(tp.max()) if tp.notna().any() else None
@@ -2148,10 +1719,10 @@ def _daily_narrative(grp):
         day_wc = 65
     elif total_precip >= 3:
         day_wc = 63
-    elif total_precip >= 1 and rain_hours_total >= 2:
+    elif total_precip >= 0.5:
         day_wc = 61
-    elif total_precip >= 1:
-        day_wc = 80
+    elif total_precip > 0.1:
+        day_wc = 51
     elif has_fog_morn:
         day_wc = 45
     elif cloud_day_avg >= 65:
@@ -2163,8 +1734,9 @@ def _daily_narrative(grp):
     else:
         day_wc = 0
 
-    if 61 <= day_wc <= 65 and rain_hours_total <= 3:
-        day_wc = 80
+    if 51 <= day_wc <= 65 and rain_hours_total <= 4:
+        if day_wc >= 63:
+            day_wc = 80
 
     day_wmo = WMO_CODES.get(day_wc, WMO_CODES[0])
 
@@ -2199,15 +1771,17 @@ def _daily_narrative(grp):
             parts.append("Nestabilno uz povremenu grmljavinu")
         if total_precip >= 5:
             parts[0] += f" ({total_precip:.0f} mm)"
-    elif total_precip >= 2:
+    elif total_precip > 0.2:
         precip_str = f" ({total_precip:.1f} mm)" if total_precip >= 1 else ""
         if rain_m and rain_a and rain_e:
             if total_precip >= 15:
                 parts.append(f"Kiša cijeli dan")
             elif total_precip >= 5:
                 parts.append(f"Kiša tokom cijelog dana ({total_precip:.0f} mm)")
+            elif total_precip >= 1:
+                parts.append(f"Povremena kiša")
             else:
-                parts.append(f"Povremena kiša tokom dana")
+                parts.append("Povremena slaba kiša")
         elif rain_m and rain_a and not rain_e:
             parts.append(f"Kiša tokom dana do kasno poslijepodne, suvo predveče")
         elif rain_m and not rain_a and not rain_e:
@@ -2236,39 +1810,6 @@ def _daily_narrative(grp):
                 parts.append("Kiša tokom noći, suvo tokom dana")
         else:
             parts.append(f"Povremena kiša{precip_str}")
-    elif total_precip >= 0.5:
-        _marginal_rain_note = ""
-        if rain_m and not rain_a:
-            _marginal_rain_note = "moguća kratka kiša prijepodne"
-        elif not rain_m and rain_a:
-            _marginal_rain_note = "moguća kratka kiša od podneva"
-        elif not rain_m and not rain_a and rain_e:
-            _marginal_rain_note = "moguća kratka kiša predveče"
-        elif rain_hours_total <= 2:
-            _marginal_rain_note = "moguće par kapi kiše"
-        else:
-            _marginal_rain_note = "slaba kiša povremeno"
-        _sky_part = ""
-        if ms == as_:
-            _sky_map = {
-                'clear': 'Vedro i sunčano',
-                'mostly_clear': 'Pretežno sunčano',
-                'partly_cloudy': 'Oblačno sa sunčanim periodima',
-                'mostly_cloudy': 'Pretežno oblačno',
-                'cloudy': 'Oblačno',
-            }
-            _sky_part = _sky_map.get(ms, 'Promjenljivo oblačno')
-        elif ms in ('clear', 'mostly_clear') and as_ in ('mostly_cloudy', 'cloudy'):
-            _sky_part = "Sunčano prije podne, oblaci od podneva"
-        elif ms in ('mostly_cloudy', 'cloudy') and as_ in ('clear', 'mostly_clear'):
-            _sky_part = "Oblačno prije podne, sunce od podneva"
-        elif ms in ('clear', 'mostly_clear'):
-            _sky_part = "Pretežno sunčano"
-        elif ms in ('mostly_cloudy', 'cloudy'):
-            _sky_part = "Pretežno oblačno"
-        else:
-            _sky_part = "Promjenljivo oblačno"
-        parts.append(f"{_sky_part}, {_marginal_rain_note}")
     elif has_fog_morn:
         if as_ in ('clear', 'mostly_clear'):
             parts.append("Magla ujutru, sunčano od podneva")
@@ -2313,14 +1854,7 @@ def _daily_narrative(grp):
         elif ms in ('mostly_cloudy', 'cloudy') and as_ == 'partly_cloudy':
             parts.append("Oblačno prijepodne, ponešto sunca od podneva")
         else:
-            if cloud_day_avg < 30:
-                parts.append("Pretežno vedro")
-            elif cloud_day_avg < 50:
-                parts.append("Sunčano sa ponešto oblaka")
-            elif cloud_day_avg < 65:
-                parts.append("Promjenljiva oblačnost")
-            else:
-                parts.append("Pretežno oblačno")
+            parts.append("Promjenljivo oblačno")
 
         if es != 'unknown' and len(parts) > 0:
             curr_end = as_ if as_ != 'unknown' else ms
@@ -2383,8 +1917,6 @@ def _build_daily_summary(date_str, day_name, grp_df, fc_raw=None):
     wind = _v('wind_speed_10m_xgb', 'wind_speed_10m_ensemble')
     gusts = _v('wind_gusts_10m_xgb', 'wind_gusts_10m_ensemble')
     precip = _v('precipitation_xgb', 'precipitation_ensemble')
-    # Floor tiny ensemble noise to 0 — ensemble averaging creates phantom drizzle
-    precip = precip.where(precip >= 0.1, 0.0)
     humid = _v('relative_humidity_2m_xgb', 'relative_humidity_2m_ensemble')
     pres = _v('pressure_msl_xgb', 'pressure_msl_ensemble')
     cloud = _v('cloud_cover_xgb', 'cloud_cover_ensemble')
@@ -2480,9 +2012,6 @@ def generate_output(corrected, trained, results, fc_raw=None):
             ens_col = f'{param}_ensemble'
             val = row.get(xgb_col, row.get(ens_col, None))
             if val is not None and pd.notna(val):
-                # Floor ensemble precipitation noise
-                if param == 'precipitation' and xgb_col not in row.index and float(val) < 0.1:
-                    val = 0.0
                 entry[param] = round(float(val), 2)
             ens_val = row.get(ens_col, None)
             if ens_val is not None and pd.notna(ens_val):
@@ -2504,7 +2033,7 @@ def generate_output(corrected, trained, results, fc_raw=None):
     today_str = pd.Timestamp.now().strftime('%Y-%m-%d')
     today_cache_path = os.path.join(OUTPUT_DIR, "today_daily_cache.json")
 
-    all_daily = {}
+    all_daily = {}  # date_str -> summary dict
     for date_str, grp in all_data.groupby('_date'):
         day_name = grp.iloc[0]['_day_name']
 
@@ -2561,7 +2090,7 @@ def generate_output(corrected, trained, results, fc_raw=None):
         "location": {"name": "Budva, Crna Gora", "lat": LAT, "lon": LON,
                       "station": "ibudva5 (Weather Underground)"},
         "method": "XGBoost Multi-Model Ensemble + Historical Bias + Forecast Revision v3",
-        "description": "12 modela, 6 godina podataka (2020-2026), pametna korekcija + Day1/Day2 revizije",
+        "description": "11 modela, 6 godina podataka (2020-2026), pametna korekcija + Day1/Day2 revizije",
         "models": MODELS,
         "training_metrics": results,
         "daily_summary": daily,
@@ -2600,8 +2129,6 @@ def generate_output(corrected, trained, results, fc_raw=None):
         p = r.get('pressure_msl_xgb', r.get('pressure_msl_ensemble', float('nan')))
         c = r.get('cloud_cover_xgb', r.get('cloud_cover_ensemble', float('nan')))
         pr = r.get('precipitation_xgb', r.get('precipitation_ensemble', float('nan')))
-        if pd.notna(pr) and pr < 0.1:
-            pr = 0.0
         wc = int(r.get('weather_code', 0)) if pd.notna(r.get('weather_code', np.nan)) else 0
         em = WMO_CODES.get(wc, WMO_CODES[0])['emoji']
 
