@@ -1008,43 +1008,6 @@ function getWeatherIcon(code, hour) {
     return map[code] || (isNight ? 'clear_night' : 'clear_day');
 }
 
-// ---- Rain-onset timing block (discrete-time hazard model output) ----
-// Reads data.rain_onset (may be absent on older JSON). Pure display addition.
-function renderRainOnset(onset) {
-    if (!onset) return '';
-    const fmtT = iso => {
-        if (!iso) return '';
-        const d = new Date(iso);
-        if (isNaN(d.getTime())) return '';
-        const days = ['ned','pon','uto','sri','čet','pet','sub'];
-        return days[d.getDay()] + ' ' + String(d.getHours()).padStart(2,'0') + ':00';
-    };
-    const box = (border, bg, inner) =>
-        `<div class="rain-onset" style="margin:14px 0;padding:12px 14px;border-left:3px solid ${border};` +
-        `background:${bg};border-radius:6px;font-size:14px;color:#333">${inner}</div>`;
-
-    if (onset.already_raining) {
-        return box('#bf360c', '#fff3e0',
-            `🌧️ <b>Kiša je već u toku.</b> <span style="color:#666">SKALA hazard model.</span>`);
-    }
-    if (!onset.declared) {
-        const mp = onset.max_prob != null ? Math.round(onset.max_prob * 100) : 0;
-        return box('#2e7d32', '#f1f8f3',
-            `☀️ <b>Bez najave kiše</b> u narednih 48h ` +
-            `<span style="color:#666">(maks. vjerovatnoća početka ${mp}%, SKALA hazard model).</span>`);
-    }
-    const likely = fmtT(onset.likely_datetime);
-    const early = fmtT(onset.earliest_datetime);
-    const late = fmtT(onset.latest_datetime);
-    let span = '';
-    if (early && late) span = ` <span style="color:#666">(najranije ${early}, najkasnije ${late})</span>`;
-    const mp = onset.max_prob != null ? Math.round(onset.max_prob * 100) : null;
-    const conf = mp != null ? ` · ukupna vjerovatnoća ${mp}%` : '';
-    return box('#1565c0', '#e8f1fb',
-        `🌧️ <b>Kiša počinje ~${likely}</b>${span}` +
-        `<div style="margin-top:4px;font-size:12px;color:#777">SKALA hazard model — procjena početka padavina${conf}.</div>`);
-}
-
 // ---- SKALA radar gating of near-term rain icons ----
 // radarState is populated by refreshRadar(); null/stale = no gating (trust model).
 let radarState = null;
@@ -2438,7 +2401,6 @@ function render(data) {
         html += `
         <p>
             Kišu predviđamo u dva koraka: XGBoost model na osnovu svih ulaznih modela procjenjuje da li je kiša moguća (oznaka „Moguće"). Da li zaista pada potvrđuje SKALA sistem interpretacije. Zato ikonica za tekući i naredni sat prati radar: ako radar ne vidi kišu, prikazujemo stvarno stanje neba, a ne model. Kad kiša stvarno krene, ikonica se mijenja u odgovarajuću kišnu.
-            <b>POZOR: SKALA sistem je trenutno nedostupan. Povratak servisa planiran je za nedjelju, 31. maj 2026. godine.</b>
         </p>
         <div class="${cwClass}">
             <div class="cw-icon" id="cwIconBox" data-code="${currentData.weather_code}" data-cloud="${currentData.cloud_cover != null ? currentData.cloud_cover : ''}" data-hour="${currentData.hour}">${weatherIcon(cwIcon, 96)}</div>
@@ -2464,9 +2426,6 @@ function render(data) {
             </div>
         </div>`;
     }
-
-    // --- Rain-onset timing (SKALA hazard model) — addition, ne dira ostalo ---
-    html += renderRainOnset(data.rain_onset);
 
     html += '<div class="hourly-strip"><h3>Prognoza po satima</h3><div class="hourly-row">';
     data.hourly_forecast.forEach((h, i) => {
