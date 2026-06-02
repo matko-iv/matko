@@ -2069,14 +2069,24 @@ function computeWarnings(hourly, currentHour, currentDate) {
         return runs;
     }
 
+    // Local YYYY-MM-DD. NEVER use toISOString() here: it converts to UTC, and
+    // for a positive-offset TZ (Budva is UTC+1/+2) local midnight falls on the
+    // PREVIOUS UTC day, which shifted every day label back by one (tomorrow's
+    // warning was labelled "preksjutra").
+    function ymdLocal(d) {
+        return d.getFullYear() + '-' +
+               String(d.getMonth() + 1).padStart(2, '0') + '-' +
+               String(d.getDate()).padStart(2, '0');
+    }
+
     function dayPrefix(dateStr) {
         if (!dateStr || dateStr === currentDate) return '';
         const base = new Date(currentDate + 'T00:00');
         base.setDate(base.getDate() + 1);
-        const tom = base.toISOString().slice(0, 10);
+        const tom = ymdLocal(base);
         if (dateStr === tom) return 'sjutra ';
         base.setDate(base.getDate() + 1);
-        const dayAfter = base.toISOString().slice(0, 10);
+        const dayAfter = ymdLocal(base);
         if (dateStr === dayAfter) return 'preksjutra ';
         return new Date(dateStr + 'T00:00').toLocaleDateString('sr-Latn', { weekday: 'short' }) + ' ';
     }
@@ -2092,7 +2102,7 @@ function computeWarnings(hourly, currentHour, currentDate) {
         if (e.hour === 23 && eHourEnd === 0 && eDate) {
             const d = new Date(eDate + 'T00:00');
             d.setDate(d.getDate() + 1);
-            eDate = d.toISOString().slice(0, 10);
+            eDate = ymdLocal(d);
         }
         const sTag = dayPrefix(sDate);
         const eTag = dayPrefix(eDate);

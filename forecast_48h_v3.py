@@ -76,6 +76,115 @@ def meteorological_metrics(y_true, y_pred_binary, p_proba=None):
     return out
 
 
+def crps_ensemble(y_true, members):
+    """CRPS (continuous ranked probability score) from an ensemble/sample.
+
+    Report A3 / Gneiting & Raftery 2007: CRPS is the strictly-proper
+    generalisation of MAE to predictive distributions. Energy-form estimator:
+        CRPS = (1/m) Σ|x_i - y| - (1/(2 m^2)) ΣΣ|x_i - x_j|
+    with the sorted-sample identity ΣΣ|x_i-x_j| = 2 Σ_i (2i - m - 1) x_(i).
+    NaN members are dropped per row. Returns a per-sample array (mean it yourself).
+    """
+    y = np.asarray(y_true, dtype=float)
+    M = np.asarray(members, dtype=float)
+    if M.ndim == 1:
+        M = M[:, None]
+    n = len(y)
+    out = np.full(n, np.nan)
+    for k in range(n):
+        row = M[k][np.isfinite(M[k])]
+        if row.size == 0 or not np.isfinite(y[k]):
+            continue
+        m = row.size
+        t1 = np.abs(row - y[k]).mean()
+        rs = np.sort(row)
+        idx = np.arange(1, m + 1)
+        t2 = (1.0 / (m * m)) * np.sum((2 * idx - m - 1) * rs)
+        out[k] = t1 - t2
+    return out
+
+
+def crps_score(y_true, members):
+    """Mean CRPS over all valid samples (lower is better)."""
+    vals = crps_ensemble(y_true, members)
+    return float(np.nanmean(vals)) if np.isfinite(vals).any() else float('nan')
+
+
+def pit_values(y_true, members):
+    """Probability Integral Transform values (report A3): the continuous analog
+    of the rank histogram. PIT = fraction of ensemble members <= obs, in (0,1).
+    Flat histogram = calibrated; U-shaped = under-dispersed (overconfident);
+    dome = over-dispersed. NaN members dropped per row."""
+    y = np.asarray(y_true, dtype=float)
+    M = np.asarray(members, dtype=float)
+    if M.ndim == 1:
+        M = M[:, None]
+    n = len(y)
+    out = np.full(n, np.nan)
+    for k in range(n):
+        row = M[k][np.isfinite(M[k])]
+        if row.size == 0 or not np.isfinite(y[k]):
+            continue
+        out[k] = np.sum(row <= y[k]) / (row.size + 1.0)
+    return out
+
+
+def pit_histogram(pit, bins=10):
+    """Return (counts, flatness_rmse). flatness_rmse=0 => perfectly calibrated."""
+    p = np.asarray(pit, dtype=float)
+    p = p[np.isfinite(p)]
+    if p.size == 0:
+        return [], float('nan')
+    counts, _ = np.histogram(p, bins=bins, range=(0.0, 1.0))
+    freq = counts / counts.sum()
+    uniform = 1.0 / bins
+    flatness = float(np.sqrt(np.mean((freq - uniform) ** 2)))
+    return counts.tolist(), flatness
+
+
+def onset_timing_metrics(pred_hours, obs_hours, tolerances=(1, 2, 3)):
+    """Event-based onset-timing verification (report B4). Avoids the hourly
+    POD/FAR double-penalty. pred_hours / obs_hours are per-case onset LEAD hours
+    (np.nan if no onset in the window).
+      mae_hours / median_hours : |pred - obs| over cases where BOTH have onset
+      hit_within_Nh            : fraction of those within +/-N hours
+      onset_pod / onset_far    : event detection (did we call onset at all)
+    """
+    pred = np.asarray(pred_hours, dtype=float)
+    obs = np.asarray(obs_hours, dtype=float)
+    has_p, has_o = np.isfinite(pred), np.isfinite(obs)
+    both = has_p & has_o
+    err = np.abs(pred[both] - obs[both])
+    res = {
+        'n_cases': int(len(pred)),
+        'n_both': int(both.sum()),
+        'mae_hours': float(err.mean()) if err.size else float('nan'),
+        'median_hours': float(np.median(err)) if err.size else float('nan'),
+    }
+    for nN in tolerances:
+        res[f'hit_within_{nN}h'] = float((err <= nN).mean()) if err.size else float('nan')
+    res['onset_pod'] = float(both.sum() / max(int(has_o.sum()), 1))
+    res['onset_far'] = float((has_p & ~has_o).sum() / max(int(has_p.sum()), 1))
+    return res
+
+
+def temporal_fss(pred_wet, obs_wet, window=3):
+    """Temporal Fractions Skill Score (report B4; Roberts & Lean 2008 in the
+    time dimension). pred_wet/obs_wet: binary wet-hour sequences. Compares
+    fractional wet coverage in +/-window neighbourhoods. FSS>0.5 ~ 'useful'."""
+    p = np.asarray(pred_wet, dtype=float)
+    o = np.asarray(obs_wet, dtype=float)
+    if len(p) == 0 or len(p) != len(o):
+        return float('nan')
+    kernel = np.ones(2 * window + 1)
+    norm = (2 * window + 1)
+    pf = np.convolve(p, kernel, mode='same') / norm
+    of = np.convolve(o, kernel, mode='same') / norm
+    num = np.mean((pf - of) ** 2)
+    den = np.mean(pf ** 2) + np.mean(of ** 2)
+    return float(1.0 - num / den) if den > 0 else float('nan')
+
+
 def threshold_for_precision_at_recall(y_true, p_proba, min_recall=0.5,
                                        fallback_thresh=0.5):
     """PDF §1.3: precision-first threshold tuning.
@@ -209,8 +318,8 @@ TRUSTED_MODELS = ["ITALIAMETEO_ICON2I"]
 # engineered features). Set to None to disable filtering for that target.
 # To revert to full features for wind: set FEATURE_MODEL_SUBSET = {} (empty dict).
 FEATURE_MODEL_SUBSET = {
-    #"wind_speed_10m":  ["ITALIAMETEO_ICON2I", "KNMI_SEAMLESS", "DMI_SEAMLESS"],
-    #"wind_gusts_10m":  ["ITALIAMETEO_ICON2I", "KNMI_SEAMLESS", "DMI_SEAMLESS"],
+    "wind_speed_10m":  ["GFS_SEAMLESS", "KNMI_SEAMLESS", "DMI_SEAMLESS", "ICON_SEAMLESS", "ECMWF_IFS025"],
+    "wind_gusts_10m":  ["GFS_SEAMLESS", "KNMI_SEAMLESS", "DMI_SEAMLESS", "ICON_SEAMLESS", "ECMWF_IFS025"],
 }
 TRUSTED_RAIN_MODEL = "ITALIAMETEO_ICON2I"
 CORRECTED_RAIN_THRESHOLD_MM = 0.2
@@ -280,7 +389,11 @@ MARINE_WIND_LOCATIONS = [
         "desc": "Iza Svetog Nikole, otvoreno more",
     },
 ]
-MARINE_MODELS = ["ewam", "meteofrance_wave"]
+# Wave models. ewam (DWD EWAM) is high-res but only ~4 days; meteofrance_wave
+# (MFWAM) and gwam (DWD GWAM) are global ~7+ days. TWO globals on purpose:
+# day-5+ coverage survives if one global fails/short-fetches on a given run
+# (the daily summary uses a NaN-skipping mean across whatever succeeded).
+MARINE_MODELS = ["ewam", "meteofrance_wave", "gwam"]
 MARINE_VARS = [
     "wave_height", "wave_period", "wave_direction",
     "wind_wave_height", "wind_wave_period",
@@ -288,10 +401,13 @@ MARINE_VARS = [
     "sea_surface_temperature",
 ]
 MARINE_WIND_MODELS = [
-    "italia_meteo_arpae_icon_2i",   
-    "icon_eu",                       
-    "arpege_europe",                 
-    "ecmwf_ifs025",                  
+    "italia_meteo_arpae_icon_2i",
+    "icon_eu",
+    "arpege_europe",
+    "ecmwf_ifs025",                  # global ~7d (day-5+ backbone)
+    "gfs_seamless",                  # 2nd global ~7d — day-5+ redundancy
+    "knmi_harmonie_arome_europe",
+    "dmi_harmonie_arome_europe",
 ]
 
 # Fallback TTL when upstream meta is unavailable (some "seamless" wrappers
@@ -311,6 +427,7 @@ MODEL_UPDATE_HOURS = {
     'dmi_seamless': 3,
     'ewam': 12,
     'meteofrance_wave': 12,
+    'gwam': 12,
     'meteofrance_arpege_europe': 1,
     'knmi_harmonie_arome_europe': 1,
     'dmi_harmonie_arome_europe': 3,
@@ -823,6 +940,12 @@ def engineer_features(df):
     out['month_cos'] = np.cos(2 * np.pi * out['month'] / 12)
     out['doy_sin'] = np.sin(2 * np.pi * out['day_of_year'] / 365.25)
     out['doy_cos'] = np.cos(2 * np.pi * out['day_of_year'] / 365.25)
+    # 2nd harmonics (report A1): capture semidiurnal + semiannual structure
+    # (land/sea-breeze, twice-yearly transition) more efficiently than dummies.
+    out['hour_sin2'] = np.sin(4 * np.pi * out['hour'] / 24)
+    out['hour_cos2'] = np.cos(4 * np.pi * out['hour'] / 24)
+    out['doy_sin2'] = np.sin(4 * np.pi * out['day_of_year'] / 365.25)
+    out['doy_cos2'] = np.cos(4 * np.pi * out['day_of_year'] / 365.25)
     season_map = {12: 0, 1: 0, 2: 0, 3: 1, 4: 1, 5: 1,
                   6: 2, 7: 2, 8: 2, 9: 3, 10: 3, 11: 3}
     out['season'] = out['month'].map(season_map)
@@ -943,6 +1066,21 @@ def engineer_features(df):
         # Max model precipitation — captures extreme predictions the mean smooths out
         out['precip_ens_max_single'] = rain_vals.max(axis=1)
 
+        # --- LAM-pair agreement (report A1/B3) ---
+        # High-res LAMs (ICON-2I 2.2km, KNMI/DMI HARMONIE-AROME) are the best
+        # timing signal at this scale; their mutual agreement is a strong,
+        # sharper-than-global rain predictor/anchor.
+        LAM_MODELS = ["ITALIAMETEO_ICON2I", "KNMI_SEAMLESS", "DMI_SEAMLESS"]
+        lam_cols = [f"{m}_precipitation_model" for m in LAM_MODELS
+                    if f"{m}_precipitation_model" in out.columns]
+        if len(lam_cols) >= 2:
+            lam_vals = out[lam_cols].apply(pd.to_numeric, errors='coerce')
+            lam_wet = lam_vals >= 0.1
+            out['lam_frac_wet'] = lam_wet.mean(axis=1)
+            out['lam_all_wet'] = (lam_wet.sum(axis=1) == len(lam_cols)).astype(float)
+            out['lam_precip_median'] = lam_vals.median(axis=1)
+            out['lam_precip_spread'] = lam_vals.std(axis=1)
+
     wc_feat_cols = [f"{m}_weather_code_model" for m in MODELS if f"{m}_weather_code_model" in out.columns]
     if wc_feat_cols:
         wc_vals = out[wc_feat_cols].apply(pd.to_numeric, errors='coerce')
@@ -979,6 +1117,34 @@ def engineer_features(df):
     bura_cols = [f'{m}_bura' for m in MODELS if f'{m}_bura' in out.columns]
     if bura_cols:
         out['bura_agreement'] = out[bura_cols].sum(axis=1)
+
+    # --- Wind u/v components (report A1) ---
+    # Raw direction in degrees wraps at 0/360, which trees split badly and which
+    # makes naive averaging wrong. Decompose to u/v (meteorological convention:
+    # direction is where the wind comes FROM) and build a circular-correct
+    # ensemble mean + a directional-consistency ratio (vector speed / scalar
+    # speed: 1 = all models agree on direction, <1 = directional disagreement).
+    u_cols, v_cols = [], []
+    for m in MODELS:
+        wd = f"{m}_wind_direction_10m_model"
+        ws = f"{m}_wind_speed_10m_model"
+        if wd in out.columns and ws in out.columns:
+            d = np.radians(pd.to_numeric(out[wd], errors='coerce'))
+            s = pd.to_numeric(out[ws], errors='coerce')
+            out[f'{m}_wind_u'] = -s * np.sin(d)
+            out[f'{m}_wind_v'] = -s * np.cos(d)
+            u_cols.append(f'{m}_wind_u')
+            v_cols.append(f'{m}_wind_v')
+    if u_cols:
+        out['wind_u_ens_mean'] = out[u_cols].mean(axis=1)
+        out['wind_v_ens_mean'] = out[v_cols].mean(axis=1)
+        out['wind_speed_vec_ens'] = np.sqrt(out['wind_u_ens_mean'] ** 2 + out['wind_v_ens_mean'] ** 2)
+        out['wind_dir_vec_ens'] = (np.degrees(np.arctan2(-out['wind_u_ens_mean'],
+                                                          -out['wind_v_ens_mean'])) % 360)
+        if 'wind_speed_10m_ens_mean' in out.columns:
+            out['wind_dir_consistency'] = (
+                out['wind_speed_vec_ens'] / out['wind_speed_10m_ens_mean'].clip(lower=0.1)
+            ).clip(0, 1)
 
     if rain_mcols:
         rain_vals = out[rain_mcols].apply(pd.to_numeric, errors='coerce').fillna(0)
@@ -1632,6 +1798,9 @@ def get_feature_columns(df):
         'cloudy', 'extreme_cold', 'extreme_hot',
         '_derived_cloud_obs', '_derived_precip_obs',
         'date_str', 'time_str', '_h',
+        # Derived display direction in degrees — has the 0/360 wrap; the model
+        # should use the wind_u/wind_v components instead (report A1).
+        'wind_dir_vec_ens',
     ])
     obs_suffix = '_obs'
     # Exclude features that require station observations — these are unavailable at
@@ -2511,6 +2680,319 @@ def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_
     }
 
 
+# ===========================================================================
+# RAIN-ONSET TIMING — discrete-time conditional-hazard model (report Part B)
+# ===========================================================================
+# Our historical data is a continuous valid-time series (no archived per-run
+# lead tables), so we adapt the discrete-time hazard to "dry spells":
+#   onset = first hour with obs precip >= ONSET_THRESHOLD_MM after >=
+#           ONSET_DRY_GAP_HOURS dry hours. We model h(t) = P(onset this hour |
+#           dry through t-1) as a function of atmospheric state + dry_age (t).
+# At inference we walk the live 48h forecast hour-by-hour, accumulate
+#   S(t)=Π(1-h), F(t)=1-S(t), and extract earliest/likely/latest onset.
+ONSET_THRESHOLD_MM = 0.2
+ONSET_DRY_GAP_HOURS = 3
+ONSET_MAX_DRY_AGE = 48          # cap the elapsed-dry feature
+ONSET_P_LIKELY = 0.50           # F(t) crossing (kept for context/CDF reporting)
+ONSET_P_EARLY = 0.25
+ONSET_P_LATE = 0.75
+# Precision-first declaration uses the INSTANTANEOUS per-hour hazard, not the
+# accumulated CDF: over a long dry spell F(t) creeps to 0.5 from base rate alone
+# (~1.8%/h) and would declare rain almost every day. We declare only when a
+# specific hour's hazard is genuinely elevated. Gate-tune this on held-out
+# ±Nh hit-rate vs false-early-alarm rate (report B5).
+ONSET_HAZARD_DECLARE = 0.10     # per-hour hazard for a confident onset hour
+ONSET_HAZARD_BAND = 0.05        # lower hazard bounding the earliest/latest window
+
+
+def build_onset_person_period(df, feature_cols):
+    """Build the dry-spell person-period table (report B1).
+    Returns (X with dry_age column, y onset 0/1, datetimes) over period rows
+    (every dry hour = target 0; the hour a >=3h-dry spell ends in rain = 1).
+    Wet-but-continuation hours are excluded (we're inside an event, not a spell).
+    """
+    obs = pd.to_numeric(df.get('_derived_precip_obs', pd.Series(np.nan, index=df.index)),
+                        errors='coerce').values
+    n = len(df)
+    valid = np.isfinite(obs)
+    wet = valid & (obs >= ONSET_THRESHOLD_MM)
+    dry_age = np.zeros(n)
+    onset = np.zeros(n, dtype=bool)
+    period = np.zeros(n, dtype=bool)
+    prev_dry = 0
+    for i in range(n):
+        if not valid[i]:
+            prev_dry = 0          # unknown obs breaks the streak; no period row
+            continue
+        if wet[i]:
+            if prev_dry >= ONSET_DRY_GAP_HOURS:
+                onset[i] = True
+                dry_age[i] = min(prev_dry, ONSET_MAX_DRY_AGE)
+                period[i] = True   # onset row (target 1)
+            prev_dry = 0           # short-gap/continuation wet: not a period row
+        else:
+            prev_dry += 1
+            dry_age[i] = min(prev_dry, ONSET_MAX_DRY_AGE)
+            period[i] = True       # dry hazard row (target 0)
+    pos = np.where(period)[0]
+    feats = [c for c in feature_cols if c in df.columns and c != 'dry_age']
+    X = df.iloc[pos][feats].copy()
+    X['dry_age'] = dry_age[pos]
+    y = pd.Series(onset[pos].astype(int), index=X.index)
+    dt = df.iloc[pos]['datetime'].reset_index(drop=True)
+    X = X.reset_index(drop=True)
+    y = y.reset_index(drop=True)
+    return X, y, dt
+
+
+def _onset_cdf_from_hazard(hazard, dry_age):
+    """Given per-row hazard within a chronological dry-spell sequence, reset the
+    survival product whenever a new spell starts (dry_age drops) and return the
+    onset CDF F(t)=1-S(t) per row."""
+    h = np.clip(np.asarray(hazard, dtype=float), 0.0, 0.999)
+    da = np.asarray(dry_age, dtype=float)
+    F = np.zeros(len(h))
+    S = 1.0
+    prev_da = 0
+    for i in range(len(h)):
+        if da[i] <= prev_da:      # new spell started -> reset survival
+            S = 1.0
+        S *= (1.0 - h[i])
+        F[i] = 1.0 - S
+        prev_da = da[i]
+    return F
+
+
+def train_onset_model(df):
+    """Train the discrete-time onset hazard (XGBoost) on the dry-spell table.
+    Trains on < SPLIT_DATE, isotonic-calibrates on a tail val slice, verifies on
+    >= SPLIT_DATE with hazard Brier/reliability + event-based onset metrics
+    (report B4) against the first-wet-hour baseline. Saves model+calibrator."""
+    print("\n  [Onset] Treniranje discrete-time hazard modela...")
+    feature_cols = get_feature_columns(df)
+    try:
+        X, y, dt = build_onset_person_period(df, feature_cols)
+    except Exception as e:
+        print(f"  [Onset] build person-period failed ({e}); preskačem onset model.")
+        return None
+    if len(X) < 1000 or int(y.sum()) < 30:
+        print(f"  [Onset] nedovoljno: rows={len(X)}, onsets={int(y.sum())}; preskačem.")
+        return None
+
+    tr = (dt < SPLIT_DATE).values
+    te = (dt >= SPLIT_DATE).values
+    if tr.sum() < 500 or int(y[tr].sum()) < 20 or te.sum() < 100:
+        print(f"  [Onset] split premali (train onsets={int(y[tr].sum())}); preskačem.")
+        return None
+
+    feats = list(X.columns)
+    # Monotone constraints where physics dictates (report A2/B): onset hazard
+    # increases with model agreement-wet and humidity.
+    mono_up = {'lam_frac_wet', 'rain_agreement', 'frac_high_res_wet',
+               'relative_humidity_2m_ens_mean', 'humidity_above_90',
+               'precip_ens_mean_rainy', 'lam_all_wet'}
+    constraints = tuple(1 if f in mono_up else 0 for f in feats)
+
+    X_tr, y_tr = X[tr], y[tr]
+    X_te, y_te = X[te], y[te]
+    dt_te = dt[te].reset_index(drop=True)
+    X_te = X_te.reset_index(drop=True)
+    y_te = y_te.reset_index(drop=True)
+
+    # tail val slice of train for calibration + early stopping
+    vcut = int(len(X_tr) * 0.9)
+    X_fit, y_fit = X_tr.iloc[:vcut], y_tr.iloc[:vcut]
+    X_val, y_val = X_tr.iloc[vcut:], y_tr.iloc[vcut:]
+
+    if 'month' in X_fit.columns:
+        sw_fit = seasonal_sample_weights(X_fit['month'].values, y_fit.values)
+    else:
+        sw_fit = np.ones(len(y_fit))
+
+    hp = dict(n_estimators=800, max_depth=5, learning_rate=0.03,
+              subsample=0.8, colsample_bytree=0.6, reg_alpha=0.2, reg_lambda=2.0,
+              min_child_weight=20, gamma=0.1, objective='binary:logistic',
+              eval_metric='logloss', tree_method='hist', max_bin=512,
+              monotone_constraints=constraints, random_state=42, n_jobs=-1,
+              early_stopping_rounds=40)
+    clf = xgb.XGBClassifier(**hp)
+    clf.fit(X_fit, y_fit, sample_weight=sw_fit, eval_set=[(X_val, y_val)], verbose=False)
+    best_n = max(int(getattr(clf, 'best_iteration', 0)) + 1, 100)
+
+    # isotonic calibration of the hazard on val
+    proba_val = clf.predict_proba(X_val)[:, 1]
+    iso = None
+    if len(proba_val) >= 300 and y_val.sum() >= 5:
+        iso = IsotonicRegression(out_of_bounds='clip')
+        iso.fit(proba_val, y_val.astype(float))
+
+    # Verify on the test period
+    proba_te = clf.predict_proba(X_te)[:, 1]
+    if iso is not None:
+        proba_te = iso.transform(proba_te)
+    brier = float(np.mean((proba_te - y_te.values) ** 2))
+
+    # Event-based onset metrics: reconstruct per-spell predicted vs observed
+    # onset. Predicted onset = first hour the INSTANTANEOUS hazard is elevated
+    # (>= ONSET_HAZARD_DECLARE), mirroring the precision-first inference rule.
+    da = X_te['dry_age'].values
+    pred_onset, obs_onset = [], []
+    spell_pred = None
+    prev_da = 0
+    for i in range(len(proba_te)):
+        if da[i] <= prev_da:           # new spell
+            if spell_pred is not None:
+                pred_onset.append(spell_pred['pred'])
+                obs_onset.append(spell_pred['obs'])
+            spell_pred = {'pred': np.nan, 'obs': np.nan, 'start_da': da[i]}
+        if spell_pred is not None:
+            if np.isnan(spell_pred['pred']) and proba_te[i] >= ONSET_HAZARD_DECLARE:
+                spell_pred['pred'] = da[i]      # likely onset elapsed-hour
+            if y_te.values[i] == 1:
+                spell_pred['obs'] = da[i]
+        prev_da = da[i]
+    if spell_pred is not None:
+        pred_onset.append(spell_pred['pred']); obs_onset.append(spell_pred['obs'])
+    ometrics = onset_timing_metrics(pred_onset, obs_onset)
+
+    # Baseline: fraction-of-models-wet crossing 0.5 as the onset anchor
+    print(f"  [Onset] test Brier={brier:.4f} | onsets(test)={int(y_te.sum())} | "
+          f"MAE={ometrics['mae_hours']:.2f}h | hit±1h={ometrics['hit_within_1h']:.2f} "
+          f"hit±2h={ometrics['hit_within_2h']:.2f} hit±3h={ometrics['hit_within_3h']:.2f} | "
+          f"onset POD={ometrics['onset_pod']:.2f} FAR={ometrics['onset_far']:.2f}")
+
+    # Production retrain on ALL period rows
+    if 'month' in X.columns:
+        sw_all = seasonal_sample_weights(X['month'].values, y.values)
+    else:
+        sw_all = np.ones(len(y))
+    hp_prod = {k: v for k, v in hp.items() if k != 'early_stopping_rounds'}
+    hp_prod['n_estimators'] = best_n
+    clf_prod = xgb.XGBClassifier(**hp_prod)
+    clf_prod.fit(X, y, sample_weight=sw_all, verbose=False)
+
+    clf_prod.save_model(os.path.join(MODEL_DIR, 'onset_hazard.json'))
+    with open(os.path.join(MODEL_DIR, 'onset_meta.json'), 'w', encoding='utf-8') as f:
+        json.dump({'features': feats, 'best_iteration': best_n,
+                   'threshold_mm': ONSET_THRESHOLD_MM, 'dry_gap': ONSET_DRY_GAP_HOURS,
+                   'metrics': ometrics, 'brier': brier}, f, ensure_ascii=False, indent=2)
+    if iso is not None:
+        import joblib
+        joblib.dump(iso, os.path.join(MODEL_DIR, 'onset_iso.joblib'))
+    print(f"  [Onset] sačuvan (features={len(feats)}, best_n={best_n}).")
+    return {'model': clf_prod, 'calibrator': iso, 'features': feats, 'metrics': ometrics}
+
+
+def load_onset_model():
+    """Reload the onset hazard bundle for --skip-training; None if absent."""
+    mpath = os.path.join(MODEL_DIR, 'onset_hazard.json')
+    metapath = os.path.join(MODEL_DIR, 'onset_meta.json')
+    if not (os.path.exists(mpath) and os.path.exists(metapath)):
+        return None
+    try:
+        clf = xgb.XGBClassifier()
+        clf.load_model(mpath)
+        with open(metapath, encoding='utf-8') as f:
+            meta = json.load(f)
+        iso = None
+        ipath = os.path.join(MODEL_DIR, 'onset_iso.joblib')
+        if os.path.exists(ipath):
+            import joblib
+            iso = joblib.load(ipath)
+        return {'model': clf, 'calibrator': iso, 'features': meta.get('features', []),
+                'metrics': meta.get('metrics', {})}
+    except Exception as e:
+        print(f"  [Onset] reload failed ({e}); bez onset bloka.")
+        return None
+
+
+def predict_onset_timing(fc, bundle):
+    """Walk the live forecast hour-by-hour, accumulate the onset CDF from now
+    forward, and return earliest/likely/latest onset (report B5). Returns None
+    if no bundle or no onset reaches the declaration probability within 48h.
+    Defensive: never raises into the main pipeline."""
+    if not bundle:
+        return None
+    try:
+        feats = bundle['features']
+        model = bundle['model']
+        iso = bundle.get('calibrator')
+
+        ens_precip = pd.to_numeric(fc.get('precipitation_ens_mean', pd.Series(0, index=fc.index)),
+                                   errors='coerce').fillna(0).values
+        n = len(fc)
+        dry_age = np.zeros(n)
+        prev = 0
+        for i in range(n):
+            if ens_precip[i] >= ONSET_THRESHOLD_MM:
+                prev = 0
+            else:
+                prev += 1
+            dry_age[i] = min(prev, ONSET_MAX_DRY_AGE)
+
+        X = pd.DataFrame(index=fc.index)
+        for c in feats:
+            if c == 'dry_age':
+                continue
+            X[c] = pd.to_numeric(fc[c], errors='coerce') if c in fc.columns else np.nan
+        X['dry_age'] = dry_age
+        X = X[feats]
+        hazard = model.predict_proba(X)[:, 1]
+        if iso is not None:
+            hazard = iso.transform(hazard)
+
+        now = local_now().floor('h')
+        dts = pd.to_datetime(fc['datetime'])
+        fut = (dts >= now).values
+        idx = np.where(fut)[0]
+        if len(idx) == 0:
+            return None
+        idx = idx[:48]  # 48h horizon
+
+        # Already raining at the first future hour?
+        if ens_precip[idx[0]] >= ONSET_THRESHOLD_MM:
+            return {'already_raining': True, 'declared': True,
+                    'likely_datetime': dts.iloc[idx[0]].isoformat()}
+
+        S = 1.0
+        prob_by_hour = []
+        hz = np.zeros(len(idx))
+        for j, i in enumerate(idx):
+            h = float(np.clip(hazard[i], 0, 0.999))
+            hz[j] = h
+            S *= (1.0 - h)
+            ts = dts.iloc[i]
+            prob_by_hour.append({'datetime': ts.isoformat(), 'hour': int(ts.hour),
+                                 'lead_h': j + 1, 'hazard': round(h, 3),
+                                 'p_by_then': round(float(1.0 - S), 3)})
+        max_prob = round(float(1.0 - S), 3)
+        peak = float(hz.max())
+
+        # Precision-first: declare only when a specific hour's hazard is elevated
+        # (avoids declaring from base-rate CDF accumulation over long dry spells).
+        if peak < ONSET_HAZARD_DECLARE:
+            return {'already_raining': False, 'declared': False,
+                    'max_prob': max_prob, 'peak_hazard': round(peak, 3),
+                    'prob_by_hour': prob_by_hour}
+        likely_j = int(np.argmax(hz >= ONSET_HAZARD_DECLARE))   # first elevated hour
+        band = np.where(hz >= ONSET_HAZARD_BAND)[0]
+        early_j = int(band.min()) if band.size else likely_j
+        late_j = int(band.max()) if band.size else likely_j
+        return {
+            'already_raining': False,
+            'declared': True,
+            'likely_datetime': dts.iloc[idx[likely_j]].isoformat(),
+            'earliest_datetime': dts.iloc[idx[early_j]].isoformat(),
+            'latest_datetime': dts.iloc[idx[late_j]].isoformat(),
+            'peak_hazard': round(peak, 3),
+            'max_prob': max_prob,
+            'prob_by_hour': prob_by_hour,
+        }
+    except Exception as e:
+        print(f"  [Onset] inference failed ({e}); bez onset bloka.")
+        return None
+
+
 def train_all_models(df):
     """Unified training: all params use full 50K dataset. No splits.
     - Precipitation: two-stage (cls+reg) + optional blend
@@ -2613,74 +3095,108 @@ def train_all_models(df):
             print(f"  {info['display']:20s} --- SKIP (train={len(X_tr)}, test={len(X_te)})")
             continue
 
+        # --- LEAKAGE FIX: the test set must not be used for BOTH choosing the
+        # configuration AND reporting accuracy. Split it chronologically:
+        #   SELECTION half -> picks method / blend alpha / stack weights
+        #   REPORT half     -> ONLY for the prijavljena MAE; never drives a choice
+        # Base learners still train solely on the train period (< SPLIT_DATE), so
+        # the selection half is genuinely out-of-sample. The production retrain
+        # below still uses the FULL test set (more data is better for shipping).
+        # Tiny test sets fall back to the old behaviour (no meaningful split).
+        _df_te = df_v.loc[te]
+        if len(X_te) >= 200:
+            _h = len(X_te) // 2
+            _sel_sl, _rep_sl = slice(0, _h), slice(_h, None)
+        else:
+            _sel_sl, _rep_sl = slice(None), slice(None)
+        X_te_sel, y_te_sel, df_te_sel = X_te.iloc[_sel_sl], y_te.iloc[_sel_sl], _df_te.iloc[_sel_sl]
+        X_te_rep, y_te_rep, df_te_rep = X_te.iloc[_rep_sl], y_te.iloc[_rep_sl], _df_te.iloc[_rep_sl]
+
         if param == 'precipitation':
             X_train_p, y_train_p, X_val_p, y_val_p = _make_val_split(X_tr, y_tr)
+            # Method selection inside the two-stage happens on the SELECTION half.
             precip_result = _train_precipitation_twostage(
-                X_train_p, y_train_p, X_te, y_te, X_val_p, y_val_p, vf
+                X_train_p, y_train_p, X_te_sel, y_te_sel, X_val_p, y_val_p, vf
             )
-            mae = precip_result['mae']
             rmse = precip_result['rmse']
 
             ens_col = f'{param}_ens_mean'
             blend_alpha = 1.0
-            if ens_col in df_v.columns:
-                ens_te_vals = pd.to_numeric(df_v.loc[te, ens_col], errors='coerce').fillna(0).values
-                best_method = precip_result['best_method']
-                RAIN_THRESH = 0.1
-                cls_proba_te_raw = precip_result['cls_model'].predict_proba(X_te)[:, 1]
-                _iso = precip_result.get('iso_calibrator')
-                cls_proba_te = _iso.transform(cls_proba_te_raw) if _iso is not None else cls_proba_te_raw
-                thresh = precip_result['threshold']
+            RAIN_THRESH = 0.1
+            best_method = precip_result['best_method']
+            _iso = precip_result.get('iso_calibrator')
+            thresh = precip_result['threshold']
+
+            # Reproduce the production precip prediction for an arbitrary X
+            # (mirrors apply_correction's method dispatch + clamping). Used to
+            # evaluate the chosen config on both the selection and report halves.
+            def _precip_xgb_pred(X_sub):
+                cls_raw = precip_result['cls_model'].predict_proba(X_sub)[:, 1]
+                cls_p = _iso.transform(cls_raw) if _iso is not None else cls_raw
                 if precip_result.get('use_sqrt', False):
-                    reg_pred_te = np.square(np.clip(precip_result['reg_model'].predict(X_te), 0, None))
+                    reg_p = np.square(np.clip(precip_result['reg_model'].predict(X_sub), 0, None))
                 else:
-                    reg_pred_te = np.clip(precip_result['reg_model'].predict(X_te), 0, None)
-                single_pred_te = np.clip(precip_result['single_model'].predict(X_te), 0, None)
-                single_pred_te[single_pred_te < RAIN_THRESH] = 0.0
-
+                    reg_p = np.clip(precip_result['reg_model'].predict(X_sub), 0, None)
+                single_p = np.clip(precip_result['single_model'].predict(X_sub), 0, None)
+                single_p[single_p < RAIN_THRESH] = 0.0
                 if best_method == 'hard':
-                    xgb_pred = np.where(cls_proba_te >= thresh, reg_pred_te, 0.0)
+                    xp = np.where(cls_p >= thresh, reg_p, 0.0)
                 elif best_method == 'soft':
-                    xgb_pred = cls_proba_te * reg_pred_te
+                    xp = cls_p * reg_p
                 elif best_method == 'sharp':
-                    xgb_pred = np.where(cls_proba_te >= thresh, 0.7 * reg_pred_te + 0.3 * single_pred_te, single_pred_te * cls_proba_te)
+                    xp = np.where(cls_p >= thresh, 0.7 * reg_p + 0.3 * single_p, single_p * cls_p)
                 elif best_method == 'adaptive':
-                    confidence = np.abs(cls_proba_te - 0.5) * 2
-                    xgb_pred = np.where(cls_proba_te >= thresh, confidence * reg_pred_te + (1 - confidence) * single_pred_te, (1 - confidence) * single_pred_te * 0.5)
+                    conf = np.abs(cls_p - 0.5) * 2
+                    xp = np.where(cls_p >= thresh, conf * reg_p + (1 - conf) * single_p, (1 - conf) * single_p * 0.5)
+                elif best_method == 'tweedie' and precip_result.get('tweedie_model') is not None:
+                    xp = np.clip(precip_result['tweedie_model'].predict(X_sub), 0, None)
                 else:
-                    xgb_pred = single_pred_te
-                xgb_pred = np.clip(xgb_pred, 0, None)
+                    xp = single_p
+                xp = np.clip(xp, 0, None)
+                xp[xp < RAIN_THRESH] = 0.0
+                if 'ens_all_dry' in X_sub.columns:
+                    xp[X_sub['ens_all_dry'].values > 0.5] = 0.0
+                return xp
 
-                # Apply same clamping as production (suppress noise + ensemble dry consensus)
-                xgb_pred[xgb_pred < RAIN_THRESH] = 0.0
-                if 'ens_all_dry' in X_te.columns:
-                    dry_mask = X_te['ens_all_dry'].values > 0.5
-                    xgb_pred[dry_mask] = 0.0
-
-                b_alpha, b_mae, _ = _find_optimal_blend(xgb_pred, y_te.values, ens_te_vals)
-                if b_mae < mae:
-                    mae = b_mae
+            # Choose the blend alpha on the SELECTION half only.
+            if ens_col in df_v.columns:
+                ens_sel = pd.to_numeric(df_te_sel[ens_col], errors='coerce').fillna(0).values
+                xgb_sel = _precip_xgb_pred(X_te_sel)
+                base_mae_sel = mean_absolute_error(y_te_sel, xgb_sel)
+                b_alpha, b_mae_sel, _ = _find_optimal_blend(xgb_sel, y_te_sel.values, ens_sel)
+                if b_mae_sel < base_mae_sel:
                     blend_alpha = b_alpha
                     precip_result['blend_alpha'] = blend_alpha
-                    print(f"    Blend improved: alpha={b_alpha:.3f}, MAE={b_mae:.3f}")
+                    print(f"    Blend improved (selection half): alpha={b_alpha:.3f}, "
+                          f"MAE {base_mae_sel:.3f}->{b_mae_sel:.3f}")
+
+            # Report on the REPORT half with the chosen method + alpha (no further choice).
+            xgb_rep = _precip_xgb_pred(X_te_rep)
+            if blend_alpha < 1.0 and ens_col in df_v.columns:
+                ens_rep = pd.to_numeric(df_te_rep[ens_col], errors='coerce').fillna(0).values
+                final_rep = blend_alpha * xgb_rep + (1 - blend_alpha) * ens_rep
+            else:
+                final_rep = xgb_rep
+            mae = mean_absolute_error(y_te_rep, final_rep)
+            rmse = np.sqrt(mean_squared_error(y_te_rep, final_rep))
 
             best_mae, best_m = float('inf'), ""
             for m in MODELS:
                 mc = f"{m}_{param}_model"
                 if mc in df_v.columns:
-                    mv = pd.to_numeric(df_v.loc[te, mc], errors='coerce')
-                    vv = mv.notna() & y_te.notna()
+                    mv = pd.to_numeric(df_te_rep[mc], errors='coerce')
+                    vv = mv.notna() & y_te_rep.notna()
                     if vv.sum() > 50:
-                        mm = mean_absolute_error(y_te[vv], mv[vv])
+                        mm = mean_absolute_error(y_te_rep[vv], mv[vv])
                         if mm < best_mae:
                             best_mae, best_m = mm, m
 
             ens_mae = float('inf')
             if ens_col in df_v.columns:
-                ev = pd.to_numeric(df_v.loc[te, ens_col], errors='coerce')
-                vv = ev.notna() & y_te.notna()
+                ev = pd.to_numeric(df_te_rep[ens_col], errors='coerce')
+                vv = ev.notna() & y_te_rep.notna()
                 if vv.sum() > 50:
-                    ens_mae = mean_absolute_error(y_te[vv], ev[vv])
+                    ens_mae = mean_absolute_error(y_te_rep[vv], ev[vv])
 
             impr = (best_mae - mae) / best_mae * 100 if best_mae < float('inf') else 0
             print(f"  {info['display']:20s} MAE: {mae:.3f}{info['unit']:5s} "
@@ -2840,9 +3356,11 @@ def train_all_models(df):
         sample_weight = _compute_sample_weights(y_tr, train_datetimes, decay_half_life_days=365)
 
         ens_col = f'{param}_ens_mean'
+        # Method/blend/stack chosen on the SELECTION half (out-of-sample, not the
+        # reported set). Reporting below uses the untouched REPORT half.
         rb_result = _train_residual_blended(
-            X_tr, y_tr, X_te, y_te, hp, param, ens_col,
-            df_v.loc[tr], df_v.loc[te],
+            X_tr, y_tr, X_te_sel, y_te_sel, hp, param, ens_col,
+            df_v.loc[tr], df_te_sel,
             use_optuna=True, sample_weight=sample_weight,
             train_datetimes=train_datetimes
         )
@@ -2851,14 +3369,15 @@ def train_all_models(df):
         model_obj = rb_result['model']
         # Use selected features if feature selection was applied
         sel_feats = rb_result.get('selected_features')
-        X_te_eval = X_te[sel_feats] if sel_feats else X_te
+        # Report on the REPORT half (never used to choose the config above).
+        X_te_eval = X_te_rep[sel_feats] if sel_feats else X_te_rep
         y_pred = model_obj.predict(X_te_eval)
 
         if rb_result['is_residual']:
-            ens_te_vals = pd.to_numeric(df_v.loc[te, ens_col], errors='coerce').fillna(0).values if ens_col in df_v.columns else np.zeros(len(X_te))
+            ens_te_vals = pd.to_numeric(df_te_rep[ens_col], errors='coerce').fillna(0).values if ens_col in df_v.columns else np.zeros(len(X_te_rep))
             y_pred = ens_te_vals + y_pred
         elif rb_result.get('blend_alpha') is not None:
-            ens_te_vals = pd.to_numeric(df_v.loc[te, ens_col], errors='coerce').fillna(0).values if ens_col in df_v.columns else np.zeros(len(X_te))
+            ens_te_vals = pd.to_numeric(df_te_rep[ens_col], errors='coerce').fillna(0).values if ens_col in df_v.columns else np.zeros(len(X_te_rep))
             alpha = rb_result['blend_alpha']
             y_pred = alpha * y_pred + (1 - alpha) * ens_te_vals
 
@@ -2869,10 +3388,17 @@ def train_all_models(df):
         elif param in ['wind_speed_10m', 'wind_gusts_10m', 'shortwave_radiation']:
             y_pred = np.clip(y_pred, 0, None)
 
+        # Evaluation target for the report half. NOTE: we do NOT mutate y_te here
+        # (the old code did `y_te = y_te_orig`, which left y_tr in CSI/deficit
+        # space but y_te in original space → the production retrain below then
+        # trained on a MIXED target). Keep y_te in model space; evaluate against
+        # a separate y_eval in observation space.
+        y_eval = y_te_rep
+
         # --- CSI back-transform: convert CSI predictions back to W/m² for evaluation ---
         if csi_mode and param == 'shortwave_radiation':
-            y_pred = np.clip(y_pred * clear_sky_te, 0, None)
-            y_te = y_te_orig  # evaluate MAE against original W/m² observations
+            y_pred = np.clip(y_pred * clear_sky_te[_rep_sl], 0, None)
+            y_eval = y_te_orig.iloc[_rep_sl]
             print(f"    Solar CSI back-transform applied")
 
         # --- Dew deficit back-transform: convert deficit to dew point for evaluation ---
@@ -2881,33 +3407,33 @@ def train_all_models(df):
             # Need corrected temperature for back-transform; use ensemble mean as proxy during eval
             t_ens_col = 'temperature_2m_ens_mean'
             if t_ens_col in df_v.columns:
-                t_proxy = pd.to_numeric(df_v.loc[te, t_ens_col], errors='coerce').values
+                t_proxy = pd.to_numeric(df_te_rep[t_ens_col], errors='coerce').values
             else:
-                t_proxy = pd.to_numeric(df_v.loc[te, 'temperature_2m_obs'], errors='coerce').values
+                t_proxy = pd.to_numeric(df_te_rep['temperature_2m_obs'], errors='coerce').values
             y_pred = t_proxy - y_pred  # Td = T - deficit
-            y_te = y_te_orig_dew  # evaluate against original dew point observations
+            y_eval = y_te_orig_dew.iloc[_rep_sl]
             print(f"    Dew deficit back-transform applied")
 
-        mae = mean_absolute_error(y_te, y_pred)
-        rmse = np.sqrt(mean_squared_error(y_te, y_pred))
+        mae = mean_absolute_error(y_eval, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_eval, y_pred))
 
         best_mae, best_m = float('inf'), ""
         for m in MODELS:
             mc = f"{m}_{param}_model"
             if mc in df_v.columns:
-                mv = pd.to_numeric(df_v.loc[te, mc], errors='coerce')
-                vv = mv.notna() & y_te.notna()
+                mv = pd.to_numeric(df_te_rep[mc], errors='coerce')
+                vv = mv.notna() & y_eval.notna()
                 if vv.sum() > 50:
-                    mm = mean_absolute_error(y_te[vv], mv[vv])
+                    mm = mean_absolute_error(y_eval[vv], mv[vv])
                     if mm < best_mae:
                         best_mae, best_m = mm, m
 
         ens_mae = float('inf')
         if ens_col in df_v.columns:
-            ev = pd.to_numeric(df_v.loc[te, ens_col], errors='coerce')
-            vv = ev.notna() & y_te.notna()
+            ev = pd.to_numeric(df_te_rep[ens_col], errors='coerce')
+            vv = ev.notna() & y_eval.notna()
             if vv.sum() > 50:
-                ens_mae = mean_absolute_error(y_te[vv], ev[vv])
+                ens_mae = mean_absolute_error(y_eval[vv], ev[vv])
 
         impr = (best_mae - mae) / best_mae * 100 if best_mae < float('inf') else 0
 
@@ -2982,6 +3508,18 @@ def train_all_models(df):
         direct_prod.save_model(os.path.join(MODEL_DIR, f"xgb_{param}.json"))
         resid_prod.save_model(os.path.join(MODEL_DIR, f"xgb_{param}_resid.json"))
         mse_prod.save_model(os.path.join(MODEL_DIR, f"xgb_{param}_mse.json"))
+        # Persist the non-XGB base learners + meta-learner so --skip-training
+        # reload reproduces the SAME prediction path (stacked needs resid_model;
+        # ridge_meta needs cb/lgb/ridge). Without this, reload silently degrades
+        # to direct-only / stacked-without-residual. joblib matches the
+        # iso_calibrator persistence pattern below.
+        import joblib
+        if cb_prod is not None:
+            joblib.dump(cb_prod, os.path.join(MODEL_DIR, f"xgb_{param}_catboost.joblib"))
+        if lgb_prod is not None:
+            joblib.dump(lgb_prod, os.path.join(MODEL_DIR, f"xgb_{param}_lightgbm.joblib"))
+        if rb_result.get('ridge_meta') is not None:
+            joblib.dump(rb_result['ridge_meta'], os.path.join(MODEL_DIR, f"xgb_{param}_ridge_meta.joblib"))
 
         # Update result with production models
         rb_result['direct_model'] = direct_prod
@@ -3028,6 +3566,12 @@ def train_all_models(df):
             'is_residual': bool(rb_result['is_residual']),
             'blend_alpha': float(rb_result['blend_alpha']) if rb_result.get('blend_alpha') is not None else None,
             'stack_weights': [float(w) for w in rb_result['stack_weights']] if rb_result.get('stack_weights') else None,
+            # Persist back-transform flags + base-learner availability so
+            # --skip-training reload reproduces the exact training-time path.
+            'csi_mode': bool(csi_mode),
+            'dew_deficit_mode': bool(dew_deficit_mode),
+            'has_catboost': bool(rb_result.get('has_catboost', False)),
+            'has_lightgbm': bool(rb_result.get('has_lightgbm', False)),
             'is_precip': False,
         }
 
@@ -3159,8 +3703,12 @@ def load_trained_models():
             direct_model.load_model(direct_path)
 
             is_residual = rinfo.get('is_residual', False)
+            # Load resid_model whenever it exists — NOT only when is_residual.
+            # The 'stacked' and 'ridge_meta' methods have is_residual=False yet
+            # still consume resid_model; gating the load on is_residual silently
+            # collapsed their residual term to direct in --skip-training mode.
             resid_model = None
-            if is_residual and os.path.exists(resid_path):
+            if os.path.exists(resid_path):
                 resid_model = xgb.XGBRegressor()
                 resid_model.load_model(resid_path)
 
@@ -3168,6 +3716,30 @@ def load_trained_models():
             if os.path.exists(mse_path):
                 mse_model = xgb.XGBRegressor()
                 mse_model.load_model(mse_path)
+
+            # CatBoost / LightGBM base learners + RidgeCV meta-learner (joblib).
+            # Needed so method=='ridge_meta' reproduces the trained prediction
+            # instead of falling back to direct-only.
+            import joblib
+            cb_model = lgb_model = ridge_meta = None
+            cb_jl = os.path.join(MODEL_DIR, f"xgb_{param}_catboost.joblib")
+            lgb_jl = os.path.join(MODEL_DIR, f"xgb_{param}_lightgbm.joblib")
+            ridge_jl = os.path.join(MODEL_DIR, f"xgb_{param}_ridge_meta.joblib")
+            if os.path.exists(cb_jl):
+                try: cb_model = joblib.load(cb_jl)
+                except Exception as _e: print(f"    WARN: cb reload failed ({_e})")
+            if os.path.exists(lgb_jl):
+                try: lgb_model = joblib.load(lgb_jl)
+                except Exception as _e: print(f"    WARN: lgb reload failed ({_e})")
+            if os.path.exists(ridge_jl):
+                try: ridge_meta = joblib.load(ridge_jl)
+                except Exception as _e: print(f"    WARN: ridge_meta reload failed ({_e})")
+
+            # has_* must reflect what actually reloaded (a stored True is useless
+            # if the joblib is missing) — apply_correction guards on the model
+            # object, but keep the flag honest for downstream/debugging.
+            has_catboost = bool(rinfo.get('has_catboost', False)) and cb_model is not None
+            has_lightgbm = bool(rinfo.get('has_lightgbm', False)) and lgb_model is not None
 
             if is_residual and resid_model is not None:
                 active_model = resid_model
@@ -3179,10 +3751,17 @@ def load_trained_models():
                 'direct_model': direct_model,
                 'resid_model': resid_model,
                 'mse_model': mse_model,
+                'cb_model': cb_model,
+                'lgb_model': lgb_model,
+                'ridge_meta': ridge_meta,
+                'has_catboost': has_catboost,
+                'has_lightgbm': has_lightgbm,
                 'method': rinfo.get('method', 'direct'),
                 'is_residual': is_residual,
                 'blend_alpha': rinfo.get('blend_alpha'),
                 'stack_weights': rinfo.get('stack_weights'),
+                'csi_mode': bool(rinfo.get('csi_mode', False)),
+                'dew_deficit_mode': bool(rinfo.get('dew_deficit_mode', False)),
                 'features': features,
                 'mae': rinfo['mae'], 'rmse': rinfo['rmse'],
                 'best_model': rinfo.get('best_model', ''),
@@ -3454,11 +4033,17 @@ def beaufort_from_wind(ms):
 
 
 def douglas_sea_state(m):
+    # _DOUGLAS_THRESHOLDS are the UPPER bounds of states 1..8, so the first
+    # threshold the height is below puts it in state i+1 (e.g. 1.7 m < 2.5 ->
+    # state 4 "Moderate", 1.25-2.5 m). Returning i was off by one (1.7 m -> 3,
+    # which the UI table caps at 1.25 m).
     if m is None or pd.isna(m):
         return None
+    if m < 0.05:            # glassy calm
+        return 0
     for i, t in enumerate(_DOUGLAS_THRESHOLDS):
         if m < t:
-            return i
+            return i + 1
     return 9
 
 
@@ -4308,7 +4893,15 @@ def apply_correction(fc_df, trained, bias_tables, local_dry_nowcast=False):
             if minfo.get('has_lightgbm') and minfo.get('lgb_model') is not None:
                 base_preds.append(minfo['lgb_model'].predict(X))
             meta_X = np.column_stack(base_preds)
-            pred = minfo['ridge_meta'].predict(meta_X)
+            try:
+                pred = minfo['ridge_meta'].predict(meta_X)
+            except Exception as _e:
+                # Base-learner set didn't match what RidgeCV was fit on (e.g. a
+                # missing cb/lgb joblib after reload). Degrade to direct rather
+                # than crash the whole forecast.
+                print(f"  {TARGET_PARAMS[param]['display']}: ridge_meta predict failed "
+                      f"({_e}); fallback na direct model")
+                pred = minfo['direct_model'].predict(X)
         elif minfo.get('is_residual'):
             ens_col = f'{param}_ens_mean'
             ens_vals = pd.to_numeric(fc[ens_col], errors='coerce').fillna(0).values if ens_col in fc.columns else np.zeros(len(X))
@@ -4391,10 +4984,23 @@ def apply_correction(fc_df, trained, bias_tables, local_dry_nowcast=False):
 
     for extra in ['apparent_temperature', 'snowfall', 'rain',
                   'cloud_cover_low', 'cloud_cover_mid', 'cloud_cover_high',
-                  'wind_direction_10m', 'surface_pressure']:
+                  'surface_pressure']:
         ec = [f"{m}_{extra}_model" for m in MODELS if f"{m}_{extra}_model" in fc.columns]
         if ec:
             corrected[f'{extra}_ens'] = fc[ec].apply(pd.to_numeric, errors='coerce').mean(axis=1)
+
+    # Wind direction: arithmetic mean of degrees is WRONG across the 0/360 wrap
+    # (mean of 350° and 10° = 180°, due south, instead of 0°/north). Use the
+    # speed-weighted vector mean computed in engineer_features.
+    if 'wind_dir_vec_ens' in fc.columns:
+        corrected['wind_direction_10m_ens'] = fc['wind_dir_vec_ens'].values
+    else:
+        wd_ec = [f"{m}_wind_direction_10m_model" for m in MODELS if f"{m}_wind_direction_10m_model" in fc.columns]
+        if wd_ec:  # fallback: unit-vector circular mean
+            rad = np.radians(fc[wd_ec].apply(pd.to_numeric, errors='coerce'))
+            u = (-np.sin(rad)).mean(axis=1)
+            v = (-np.cos(rad)).mean(axis=1)
+            corrected['wind_direction_10m_ens'] = (np.degrees(np.arctan2(-u, -v)) % 360)
 
     # Microcellular-shower wind boost. Runs LAST so it can see the final
     # wind_speed_10m_xgb / wind_gusts_10m_xgb that the param loop produced.
@@ -4841,7 +5447,7 @@ def _gemini_narrative(date_str, hourly_rows):
     prompt = (
         f"Satni podaci za Budvu, {date_str} (sat  ikonica  temp  vlažnost  vjetar_m/s  pritisak_hPa  oblačnost  padavine_mm):\n"
         f"{hourly_text}\n\n"
-        "Na osnovu ovih satnih podataka za Budvu, napiši kratak izvještaj.\n\nPravila:\n1. Maksimalno 8 riječi.\n2. Fokusiraj se na glavnu promjenu vremena (npr. prelaz iz oblačnog u sunčano).\n3. Navedi doba dana kada se promjena dešava.\n4.Ako nema kiše ili vjetra, ne spominji ih."
+        "Na osnovu ovih satnih podataka za Budvu, napiši kratak izvještaj.\n\nPravila:\n1. Maksimalno 6-7 riječi.\n2. Fokusiraj se na glavnu promjenu vremena (npr. prelaz iz oblačnog u sunčano).\n3. Navedi doba dana kada se promjena dešava.\n4.Ako nema kiše ili vjetra, ne spominji ih."
     )
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key={GEMINI_API_KEY}"
@@ -4984,7 +5590,7 @@ def _enrich_narratives_with_ai(daily_list, hourly_data):
     print(f"  [Gemini] Generisano {count}/{len(daily_list)} AI opisa ({api_calls} API poziva, {count - api_calls} iz keša).")
 
 
-def generate_output(corrected, trained, results, fc_raw=None, marine=None):
+def generate_output(corrected, trained, results, fc_raw=None, marine=None, onset=None):
     print("\n[6/6] Generisanje izlaza...")
     now_str = local_now().isoformat()
     now_ts = local_now().floor('h')
@@ -5111,6 +5717,8 @@ def generate_output(corrected, trained, results, fc_raw=None, marine=None):
 
     if marine is not None:
         output["marine_forecast"] = marine
+    if onset is not None:
+        output["rain_onset"] = onset
 
     json_path = os.path.join(OUTPUT_DIR, "forecast_48h.json")
     with open(json_path, 'w', encoding='utf-8') as f:
@@ -5165,6 +5773,7 @@ if __name__ == "__main__":
     if skip_training:
         print("\n  MODE: --skip-training (ucitavam sacuvane modele)")
         trained, results, bias_tables = load_trained_models()
+        onset_bundle = load_onset_model()
     else:
         hist = load_historical_data()
 
@@ -5183,6 +5792,11 @@ if __name__ == "__main__":
         print(f"  Bias tabele: {bias_path}")
 
         trained, results = train_all_models(hist)
+        try:
+            onset_bundle = train_onset_model(hist)
+        except Exception as _e:
+            print(f"  [Onset] trening preskočen ({_e})")
+            onset_bundle = None
 
     try:
         fc_all = fetch_live_forecasts()
@@ -5203,6 +5817,23 @@ if __name__ == "__main__":
             print("\n  WU nowcast: WU_API_KEY nije postavljen, preskacem automatsku live-stanicu")
 
         corrected = apply_correction(fc_all, trained, bias_tables, local_dry_nowcast=dry_nowcast_active)
+
+        # Rain-onset timing (report Part B) — NEW output, doesn't touch the
+        # existing hourly/precip display. Best-effort: never breaks the forecast.
+        onset_info = None
+        try:
+            _fc_feat = engineer_features(apply_bias_features(fc_all.copy(), bias_tables))
+            onset_info = predict_onset_timing(_fc_feat, onset_bundle)
+            if onset_info and onset_info.get('declared'):
+                if onset_info.get('already_raining'):
+                    print("  [Onset] kiša već pada na početku horizonta.")
+                else:
+                    print(f"  [Onset] kiša počinje ~{onset_info.get('likely_datetime')} "
+                          f"(najranije {onset_info.get('earliest_datetime')}, "
+                          f"najkasnije {onset_info.get('latest_datetime')}).")
+        except Exception as _e:
+            print(f"  [Onset] preskočen ({_e})")
+            onset_info = None
     except TrustedRainGateError as e:
         print("\n" + "!" * 72)
         print(f"  TRUSTED RAIN GATE FAIL: {e}")
@@ -5231,7 +5862,8 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"  Marine: greska, preskacem ({e})")
 
-    json_path, csv_path = generate_output(corrected, trained, results, fc_raw=fc_all, marine=marine_block)
+    json_path, csv_path = generate_output(corrected, trained, results, fc_raw=fc_all,
+                                          marine=marine_block, onset=onset_info)
 
     print("\n" + "=" * 72)
     print("  GOTOVO! Fajlovi:", OUTPUT_DIR)
