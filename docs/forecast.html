@@ -2928,8 +2928,23 @@ async function fetchRadarData() {
 function parseRadarState(data) {
     const sum = (data && data.summary) || {};
     const sources = (data && data.sources) || {};
-    let bestRain = null;        // closest rain detection from any source
+    let bestRain = null;        // closest WET pixel (LOCAL intensity) across sources
+    let bestThreat = null;      // worst APPROACHING dominant cell (for SEVERE)
     let srcApproaching = false, srcEta = null, srcAtLoc = false, srcVicinity = false;
+
+    // Closest actual wet pixel of a source (rings) = the LOCAL intensity near
+    // Budva. Display this, NOT app.closest_rain_* — the pipeline sets that to the
+    // dominant cell's peak max_dbz (storm core, possibly far away), which reads
+    // far higher than the true local value. Mirrors SKALA (skala-sections.js).
+    const closestWetOf = (info) => {
+        let best = null;
+        for (const r of (info.rings || [])) {
+            if (r.closest_wet_km != null && (!best || r.closest_wet_km < best.km)) {
+                best = { km: r.closest_wet_km, cardinal: r.closest_wet_bearing_cardinal, dbz: r.closest_wet_dbz };
+            }
+        }
+        return best;
+    };
 
     for (const [srcId, info] of Object.entries(sources)) {
         if (!info || !info.ok) continue;
@@ -2937,22 +2952,27 @@ function parseRadarState(data) {
         if (!app) continue;
         if (app.rain_at_location) srcAtLoc = true;
         if (app.any_rain_within_radii) srcVicinity = true;
-        if (app.any_rain_within_radii && app.closest_rain_km != null) {
-            if (!bestRain || app.closest_rain_km < bestRain.km) {
-                bestRain = {
-                    src: srcId,
-                    km: app.closest_rain_km,
-                    cardinal: app.closest_rain_bearing_cardinal,
-                    label: app.closest_rain_intensity_label,
-                    dbz: app.closest_rain_intensity_dbz,
-                    motionCardinal: app.motion_direction_cardinal || (info.motion && info.motion.direction_cardinal),
-                    at_location: !!app.rain_at_location,
-                };
-            }
-            if (app.is_approaching) {
-                srcApproaching = true;
-                if (app.eta_minutes != null && (srcEta == null || app.eta_minutes < srcEta)) srcEta = app.eta_minutes;
-            }
+
+        const cw = closestWetOf(info);
+        if (cw && cw.km != null && (!bestRain || cw.km < bestRain.km)) {
+            bestRain = {
+                src: srcId, km: cw.km, cardinal: cw.cardinal, dbz: cw.dbz,
+                motionCardinal: app.motion_direction_cardinal || (info.motion && info.motion.direction_cardinal),
+            };
+        }
+
+        if (app.any_rain_within_radii && app.is_approaching) {
+            srcApproaching = true;
+            if (app.eta_minutes != null && (srcEta == null || app.eta_minutes < srcEta)) srcEta = app.eta_minutes;
+            // Worst approaching dominant cell drives SEVERE — its peak dBZ may be a
+            // big cell BEHIND a lighter closest one. Same as SKALA's threat.
+            const nd = app.nowcast_details && app.nowcast_details.dominant;
+            const cand = nd
+                ? { dbz: nd.max_dbz, km: nd.dist_km, cardinal: nd.bearing_cardinal, eta: nd.eta_minutes }
+                : (app.closest_rain_km != null
+                    ? { dbz: app.closest_rain_intensity_dbz, km: app.closest_rain_km, cardinal: app.closest_rain_bearing_cardinal, eta: app.eta_minutes }
+                    : null);
+            if (cand && (!bestThreat || (cand.dbz || 0) > (bestThreat.dbz || 0))) bestThreat = cand;
         }
     }
 
@@ -2966,7 +2986,7 @@ function parseRadarState(data) {
         approaching:    sum.rain_approaching != null ? !!sum.rain_approaching : srcApproaching,
         anyRainVicinity: sum.rain_in_vicinity != null ? !!sum.rain_in_vicinity : srcVicinity,
         etaMin:         sum.closest_eta_minutes != null ? sum.closest_eta_minutes : srcEta,
-        bestRain, ageMin,
+        bestRain, threat: bestThreat, ageMin,
     };
 }
 
@@ -3010,12 +3030,34 @@ function renderRadarStatusLine(state) {
     const CARD_SR = { N:'S', NE:'SI', E:'I', SE:'JI', S:'J', SW:'JZ', W:'Z', NW:'SZ' };
     function smjer(c) { return c ? (CARD_SR[c] || c) : ''; }
 
+    // SEVERE (≥50 dBZ) keyed off the nowcast's dominant approaching cell — mirrors
+    // SKALA (skala-text.js) so this line never says "umjerena kiša" while the radar
+    // page screams SEVERE. Priority matches SKALA: severe overhead, then ordinary
+    // rain already falling (RAINING beats an approaching cell that hasn't arrived),
+    // then a severe cell approaching, then ordinary approaching, blizu/zaobilazi…
+    const SEVERE_DBZ = 50;
+    const threat = state.threat;
+    const severeHere = !!(state.rainAtLocation && bestRain && bestRain.dbz != null && bestRain.dbz >= SEVERE_DBZ);
+    const severeApproaching = !!(state.approaching && threat && threat.dbz != null && threat.dbz >= SEVERE_DBZ);
+
     // Pixel-first model: kiša je "pada" SAMO ako je na tačnom pikselu Budve;
     // inače se ili približava (pašće) ili je blizu ali zaobilazi.
-    if (state.rainAtLocation && bestRain) {
+    if (severeHere) {
+        el.style.color = '#6a1b9a';
+        el.style.fontWeight = '700';
+        el.innerHTML = LINK + '<b>jako nevrijeme nad Budvom</b> — ' + intenzitet(bestRain.dbz) +
+                       ' (' + Math.round(bestRain.dbz) + ' dBZ)' + age;
+    } else if (state.rainAtLocation && bestRain) {
         el.style.color = '#bf360c';
         el.style.fontWeight = '700';
         el.innerHTML = LINK + '<b>pada kiša u Budvi</b> — ' + intenzitet(bestRain.dbz) + age;
+    } else if (severeApproaching) {
+        const tEta = threat.eta != null ? ', ETA ~' + Math.round(threat.eta) + ' min' : '';
+        const tDbz = threat.dbz != null ? ' (' + Math.round(threat.dbz) + ' dBZ)' : '';
+        el.style.color = '#6a1b9a';
+        el.style.fontWeight = '700';
+        el.innerHTML = LINK + '<b>jako nevrijeme se približava</b> — ' + intenzitet(threat.dbz) + tDbz +
+                       ', ~' + fmtKm(threat.km) + ' km ' + smjer(threat.cardinal) + tEta + age;
     } else if (state.approaching && bestRain) {
         const eta = state.etaMin != null ? ', ETA ~' + Math.round(state.etaMin) + ' min' : '';
         el.style.color = '#bf360c';
