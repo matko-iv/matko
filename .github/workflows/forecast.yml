@@ -22,6 +22,24 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Persist the Open-Meteo API response cache (trained_models_v2/api_cache)
+      # ACROSS runs WITHOUT committing it to git. Previously the cache was
+      # committed to the repo, and `git checkout` reset every file's mtime to
+      # the checkout time, so the TTL freshness check (which used mtime) always
+      # saw "0.0h" and NEVER refetched — the no-meta models (GFS/METEOFRANCE/
+      # UKMO/KNMI/DMI) were frozen on stale data (weird long-range temps).
+      # A unique key each run + a prefix restore-key gives a rolling "use the
+      # most recent snapshot" cache. The code now also stores the real fetch
+      # time in a `.fetched` sidecar, so age is correct even though cache
+      # restore (like checkout) resets mtime.
+      - name: Restore Open-Meteo API cache
+        uses: actions/cache@v4
+        with:
+          path: trained_models_v2/api_cache
+          key: om-api-cache-${{ github.run_id }}
+          restore-keys: |
+            om-api-cache-
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:

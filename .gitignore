@@ -3,6 +3,11 @@ __pycache__/
 *.pyc
 forecast_output/*
 !forecast_output/gemini_narrative_cache.json
+# Runtime API response cache — must NOT be committed. When committed, git
+# checkout reset file mtimes so the TTL freshness check never refetched
+# (frozen stale data -> weird long-range temps). Persisted across CI runs via
+# actions/cache instead (see .github/workflows/forecast.yml).
+trained_models_v2/api_cache/
 .idea/
 .vscode/
 *.egg-info/

@@ -499,12 +499,31 @@ def _cache_path(endpoint, model_id, lat, lon):
     return os.path.join(API_CACHE_DIR, f"{safe}__{model_id}__{lat}_{lon}.json")
 
 
+def _cache_age_hours(path):
+    """Cache age in hours from the stored fetch time (`.fetched` sidecar), NOT
+    file mtime. CRITICAL on GitHub Actions: `git checkout` rewrites every file's
+    mtime to the checkout time, so a committed cache always looked 0.0h fresh and
+    the TTL check NEVER refetched (frozen stale data — the long-range bug). The
+    sidecar stores the real fetch unix time inside the repo content, which git
+    preserves. If the sidecar is missing (old caches), return None so the cache
+    is treated as expired and refetched once (which then writes the sidecar)."""
+    meta = path + '.fetched'
+    if not os.path.exists(meta):
+        return None
+    try:
+        with open(meta) as f:
+            ts = float(f.read().strip())
+        return (time.time() - ts) / 3600.0
+    except Exception:
+        return None
+
+
 def _load_fresh_cache(path, max_age_hours):
     """Return parsed JSON if cache exists and is within max_age_hours, else None."""
     if not os.path.exists(path):
         return None
-    age_h = (time.time() - os.path.getmtime(path)) / 3600.0
-    if age_h > max_age_hours:
+    age_h = _cache_age_hours(path)
+    if age_h is None or age_h > max_age_hours:
         return None
     try:
         with open(path, 'r', encoding='utf-8') as f:
@@ -520,8 +539,7 @@ def _load_stale_cache(path):
     try:
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        age_h = (time.time() - os.path.getmtime(path)) / 3600.0
-        return data, age_h
+        return data, _cache_age_hours(path)
     except Exception:
         return None, None
 
@@ -530,6 +548,10 @@ def _save_cache(path, payload):
     try:
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(payload, f, ensure_ascii=False)
+        # Record the real fetch time so age survives git checkout (see
+        # _cache_age_hours). MUST be committed alongside the cache .json.
+        with open(path + '.fetched', 'w') as f:
+            f.write(str(int(time.time())))
     except Exception as e:
         print(f"  [cache] WARN save failed: {e}")
 
@@ -3821,8 +3843,8 @@ def fetch_live_forecasts():
                         if v in h:
                             d[f"{model_name}_{v}_model"] = h[v]
                     all_fc[model_name] = d
-                    age_h = (time.time() - os.path.getmtime(cache_path)) / 3600
-                    print(f"CACHE ({len(d)}h, {age_h:.1f}h, {cache_reason})")
+                    age_h = _cache_age_hours(cache_path)
+                    print(f"CACHE ({len(d)}h, {(age_h or 0):.1f}h, {cache_reason})")
                     continue
 
         params = {
@@ -3872,7 +3894,7 @@ def fetch_live_forecasts():
                             if v in h:
                                 d[f"{model_name}_{v}_model"] = h[v]
                         all_fc[model_name] = d
-                        print(f"FAIL ({e}); STALE CACHE used ({len(d)}h, {age_h:.1f}h staro)")
+                        print(f"FAIL ({e}); STALE CACHE used ({len(d)}h, {(age_h or 0):.1f}h staro)")
                     else:
                         print(f"FAIL: {e}")
                 else:
@@ -3956,8 +3978,8 @@ def fetch_live_forecasts():
                 d, added = _parse_prev(stale_data.get('hourly', {}), 'CACHE')
                 fc_all = fc_all.merge(d[['datetime'] + [c for c in d.columns if c != 'datetime']],
                                        on='datetime', how='left')
-                age_h = (time.time() - os.path.getmtime(pr_cache_path)) / 3600
-                print(f"    {model_name}: CACHE ({added} cols, {age_h:.1f}h, {cache_reason})")
+                age_h = _cache_age_hours(pr_cache_path)
+                print(f"    {model_name}: CACHE ({added} cols, {(age_h or 0):.1f}h, {cache_reason})")
                 time.sleep(0.3)
                 continue
 
@@ -3985,7 +4007,7 @@ def fetch_live_forecasts():
                 d, added = _parse_prev(stale.get('hourly', {}), 'STALE')
                 fc_all = fc_all.merge(d[['datetime'] + [c for c in d.columns if c != 'datetime']],
                                        on='datetime', how='left')
-                print(f"    {model_name}: FAIL ({e}); STALE CACHE used ({added} cols, {age_h:.1f}h staro)")
+                print(f"    {model_name}: FAIL ({e}); STALE CACHE used ({added} cols, {(age_h or 0):.1f}h staro)")
             else:
                 print(f"    {model_name}: FAIL ({e})")
         time.sleep(1.5)
@@ -4123,8 +4145,8 @@ def _fetch_marine_waves(lat, lon, label):
             if stale_data is not None:
                 d, added = _parse(stale_data.get('hourly', {}), model)
                 all_waves[model] = d
-                age_h = (time.time() - os.path.getmtime(cache_path)) / 3600
-                print(f"  [{label}] Wave {model}: CACHE ({len(d)}h, {age_h:.1f}h, {cache_reason})")
+                age_h = _cache_age_hours(cache_path)
+                print(f"  [{label}] Wave {model}: CACHE ({len(d)}h, {(age_h or 0):.1f}h, {cache_reason})")
                 continue
 
         params = {
@@ -4153,7 +4175,7 @@ def _fetch_marine_waves(lat, lon, label):
                     if stale is not None:
                         d, added = _parse(stale.get('hourly', {}), model)
                         all_waves[model] = d
-                        print(f"  [{label}] Wave {model}: FAIL ({e}); STALE ({age_h:.1f}h staro)")
+                        print(f"  [{label}] Wave {model}: FAIL ({e}); STALE ({(age_h or 0):.1f}h staro)")
                     else:
                         print(f"  [{label}] Wave {model}: FAIL ({e})")
                 else:
@@ -4213,8 +4235,8 @@ def _fetch_marine_wind(lat, lon, label):
             if stale_data is not None:
                 d = _parse(stale_data.get('hourly', {}), model_id)
                 all_winds[model_id] = d
-                age_h = (time.time() - os.path.getmtime(cache_path)) / 3600
-                print(f"  [{label}] Wind {model_id}: CACHE ({len(d)}h, {age_h:.1f}h, {cache_reason})")
+                age_h = _cache_age_hours(cache_path)
+                print(f"  [{label}] Wind {model_id}: CACHE ({len(d)}h, {(age_h or 0):.1f}h, {cache_reason})")
                 continue
 
         params = {
@@ -4238,7 +4260,7 @@ def _fetch_marine_wind(lat, lon, label):
             if stale is not None:
                 d = _parse(stale.get('hourly', {}), model_id)
                 all_winds[model_id] = d
-                print(f"  [{label}] Wind {model_id}: FAIL ({e}); STALE ({age_h:.1f}h staro)")
+                print(f"  [{label}] Wind {model_id}: FAIL ({e}); STALE ({(age_h or 0):.1f}h staro)")
             else:
                 print(f"  [{label}] Wind {model_id}: FAIL ({e})")
         time.sleep(1.0)
@@ -4971,6 +4993,23 @@ def apply_correction(fc_df, trained, bias_tables, local_dry_nowcast=False):
                 t_ens = f'temperature_2m_ens_mean'
                 t_vals = pd.to_numeric(fc[t_ens], errors='coerce').fillna(0).values if t_ens in fc.columns else np.zeros(len(pred))
             pred = t_vals - pred  # Td = T - deficit
+
+        # --- Missing-data guard: fixes the long-range "-1/1 °C" bug ---
+        # When NO model has data for an hour (far-out long-range hours, or a run
+        # where a model's cache delivered nothing for those dates), the ensemble
+        # mean is NaN. The residual/blend/stacked/ridge methods above used
+        # ensemble.fillna(0), so the correction collapsed to ~0 + residual =
+        # garbage (≈ -1/1 °C in summer). Mask those hours to NaN so the hourly
+        # JSON omits them and the daily summary's min/max skip them — i.e. show
+        # "no data" instead of fabricating a near-zero value.
+        ens_col_g = f'{param}_ens_mean'
+        if ens_col_g in fc.columns:
+            _ens_nan = pd.to_numeric(fc[ens_col_g], errors='coerce').isna().values
+            if _ens_nan.any():
+                pred = np.asarray(pred, dtype=float).copy()
+                pred[_ens_nan] = np.nan
+                print(f"    {TARGET_PARAMS[param]['display']}: {int(_ens_nan.sum())} sati bez "
+                      f"podataka modela -> NaN (umjesto 0-baziranog šuma)")
 
         corrected[f'{param}_xgb'] = pred
         print(f"  {TARGET_PARAMS[param]['display']:20s} (MAE={minfo['mae']:.3f}{TARGET_PARAMS[param]['unit']}) [{method_name}]")
