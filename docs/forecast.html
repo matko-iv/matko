@@ -908,8 +908,6 @@
     </div>
 
     <h1>Matkov model v3</h1>
-	
-	<p>Poštovani posjetioci, dana 25. maja 2026. godine treća verzija mog modela postala je operativna. Ova verzija donosi poboljšanja u preciznosti i pouzdanosti prognoza, zahvaljujući unaprijeđenim algoritmima i većem skupu podataka. Osim toga uveo sam i sistem radarske detekcije kiše, takozvani SKALA sistem, koji će u budućnosti dobijati nove modulske funkcionalnosti.</p>
 
     <p>
         Obavještenje za vremenske prilike za ljeto 2026: ovo ljeto će vjerovatno biti <b>drugo najtoplije ljeto</b> od kad se mjeri u Budvi. Dokument koji detaljnije objašnjava trend vremenskih prilika za ovogodišnju ljetnju turističku sezonu možete otvoriti klikom <a href="14_V_MMXXVI.pdf">ovđe</a>. <span style="font-size: 12px;font-style: italic;color:#6a737d; margin: 0 0 0;">Pošljednja izmjena: 15.5.2026.</span>
@@ -2965,11 +2963,14 @@ function parseRadarState(data) {
             srcApproaching = true;
             if (app.eta_minutes != null && (srcEta == null || app.eta_minutes < srcEta)) srcEta = app.eta_minutes;
             // Worst approaching dominant cell drives SEVERE — its peak dBZ may be a
-            // big cell BEHIND a lighter closest one. Same as SKALA's threat.
+            // big cell BEHIND a lighter closest one. Same as SKALA's threat. Bound
+            // to the monitored vicinity (150 km = outermost ring): a storm 200 km
+            // away is NOT a local severe event. The pipeline doesn't bound it.
+            const VICINITY_MAX_KM = 150;
             const nd = app.nowcast_details && app.nowcast_details.dominant;
-            const cand = nd
+            const cand = (nd && nd.dist_km != null && nd.dist_km <= VICINITY_MAX_KM)
                 ? { dbz: nd.max_dbz, km: nd.dist_km, cardinal: nd.bearing_cardinal, eta: nd.eta_minutes }
-                : (app.closest_rain_km != null
+                : (app.closest_rain_km != null && app.closest_rain_km <= VICINITY_MAX_KM
                     ? { dbz: app.closest_rain_intensity_dbz, km: app.closest_rain_km, cardinal: app.closest_rain_bearing_cardinal, eta: app.eta_minutes }
                     : null);
             if (cand && (!bestThreat || (cand.dbz || 0) > (bestThreat.dbz || 0))) bestThreat = cand;
