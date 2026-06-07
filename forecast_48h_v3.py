@@ -323,6 +323,10 @@ FEATURE_MODEL_SUBSET = {
 }
 TRUSTED_RAIN_MODEL = "ITALIAMETEO_ICON2I"
 CORRECTED_RAIN_THRESHOLD_MM = 0.2
+# Sustained wind (m/s) above which RAIN is shown as a gusty/stormy code instead
+# of "light/drizzle": in Budva a few mm with strong wind (or thunder) reads as a
+# storm, not "Slaba/Sitna kiša". See escalate_storm_code().
+STORM_WIND_MS = 5.0
 TRUSTED_RAIN_THRESHOLD = 0.1
 LOCAL_DRY_NOWCAST_HOURS = 4
 LOCAL_DRY_LIGHT_RAIN_MAX_MM = 0.7
@@ -4499,6 +4503,31 @@ def build_marine_output(marine_results):
     }
 
 
+def escalate_storm_code(code, wind_ms, thunder):
+    """Raise a rain code to a stormier one when wind/thunder make a light-rain
+    icon misleading: in Budva a few mm with strong wind or thunder reads as a
+    storm, not "Slaba/Sitna kiša". Only rain codes (51-82) escalate; clear /
+    cloud / fog / snow and existing thunder (>=95) pass through unchanged.
+
+        thunder present                  -> 95 Grmljavina
+        sustained wind > STORM_WIND_MS   -> 80 Pljuskovi (light 51/61)
+                                            82 Jaki pljuskovi (else)
+    """
+    try:
+        c = int(code)
+    except (TypeError, ValueError):
+        return code
+    # Only actual rain / drizzle / showers escalate — NOT snow (71-77) or
+    # freezing drizzle/rain (56, 57, 66, 67), which also live inside 51-82.
+    if c not in (51, 53, 55, 61, 63, 65, 80, 81, 82):
+        return code
+    if thunder:
+        return 95
+    if wind_ms is not None and not pd.isna(wind_ms) and float(wind_ms) > STORM_WIND_MS:
+        return 80 if c in (51, 61) else 82
+    return code
+
+
 def correct_weather_code_row(row, raw_row=None):
     """
     Models often report rain (WC >= 51) during winter overcast conditions
@@ -5073,9 +5102,17 @@ def apply_correction(fc_df, trained, bias_tables, local_dry_nowcast=False):
     # represents hour T+1's sky -- e.g., 67% cloud display + "Vedro" icon
     # because the next hour happens to clear.
     if 'weather_code_raw' in corrected.columns:
-        corrected['weather_code'] = corrected.apply(
-            lambda r: correct_weather_code_row(r, fc.loc[r.name] if r.name in fc.index else None), axis=1
-        )
+        def _final_weather_code(r):
+            raw_row = fc.loc[r.name] if r.name in fc.index else None
+            code = correct_weather_code_row(r, raw_row)
+            # Storm escalation: wind/thunder bump a rain code to pljuskovi/grmljavina.
+            storm_n = 0
+            if raw_row is not None:
+                storm_n = pd.to_numeric(raw_row.get('storm_wc_count', 0), errors='coerce')
+                if pd.isna(storm_n):
+                    storm_n = 0
+            return escalate_storm_code(code, r.get('wind_speed_10m_xgb'), storm_n >= 1)
+        corrected['weather_code'] = corrected.apply(_final_weather_code, axis=1)
 
     return corrected
 

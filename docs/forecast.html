@@ -1024,20 +1024,41 @@ function cloudToCode(cc) {
 }
 function radarFresh(rs) { return !!(rs && rs.ok && rs.ageMin != null && rs.ageMin <= 40); }
 
+// Storm severity rank of a WMO code (higher = worse) — lets the radar UPGRADE a
+// light model code without ever downgrading a heavier one.
+function wcSeverity(c) {
+    if (c == null || isNaN(c)) return 0;
+    if (c >= 95) return 5;                                  // grmljavina
+    const m = { 51:2, 61:2, 53:3, 63:3, 80:3, 81:3, 55:4, 65:4, 82:4 };
+    return m[c] || 0;                                       // non-rain -> 0
+}
+
+// Map the radar's measured intensity to a WMO code: SEVERE/hail -> thunderstorm,
+// otherwise the local closest-wet-pixel dBZ -> light/moderate/heavy rain.
+function radarIntensityCode(rs) {
+    if (rs.severe || (rs.threat && rs.threat.dbz != null && rs.threat.dbz >= 55)) return 95;
+    const dbz = (rs.bestRain && rs.bestRain.dbz != null) ? rs.bestRain.dbz : null;
+    if (dbz == null) return 61;       // confirmed rain, intensity unknown -> light
+    if (dbz >= 45) return 82;         // Jaki pljuskovi
+    if (dbz >= 35) return 63;         // Kiša
+    return 61;                        // Slaba kiša
+}
+
 // Reconcile a model weather code with the radar for hour offset 0 (current) or 1 (next).
 function gateWeatherCode(code, cloud, offset, rs) {
     if (!radarFresh(rs)) return code;                 // radar down/stale -> trust the model
-    if (offset === 0) {
-        if (rs.rainAtLocation) return isRainCode(code) ? code : 61;  // radar confirms rain -> ensure rain icon
-        return isRainCode(code) ? cloudToCode(cloud) : code;          // radar dry -> strip model rain
+    const confirms = (offset === 0) ? rs.rainAtLocation
+                   : (offset === 1) ? (rs.approaching || rs.rainAtLocation)
+                   : null;
+    if (confirms === null) return code;               // offsets other than 0/1 untouched
+    if (confirms) {
+        // Radar confirms rain (now) / incoming (next hour): show the WORSE of the
+        // model code vs the radar's intensity — so heavy rain on the radar upgrades
+        // a light model icon, but a heavier model code (e.g. thunder) is kept.
+        const rc = radarIntensityCode(rs);
+        return wcSeverity(code) >= wcSeverity(rc) ? code : rc;
     }
-    if (offset === 1) {
-        // Rain headed toward Budva (or already falling now) -> show rain next hour,
-        // even if the model was dry. Otherwise it will bypass us -> strip to cloud.
-        if (rs.approaching || rs.rainAtLocation) return isRainCode(code) ? code : 61;
-        return isRainCode(code) ? cloudToCode(cloud) : code;
-    }
-    return code;
+    return isRainCode(code) ? cloudToCode(cloud) : code;   // radar dry -> strip model rain
 }
 
 // Re-skin the current-weather icon + the current/next hourly cells after a radar refresh.
@@ -2992,6 +3013,7 @@ function parseRadarState(data) {
         anyRainVicinity: sum.rain_in_vicinity != null ? !!sum.rain_in_vicinity : srcVicinity,
         etaMin:         sum.closest_eta_minutes != null ? sum.closest_eta_minutes : srcEta,
         bestRain, threat: bestThreat, ageMin,
+        severe: !!sum.severe_present,
     };
 }
 
