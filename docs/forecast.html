@@ -3005,13 +3005,24 @@ function parseRadarState(data) {
     let ageMin = null;
     if (data && data.generated) ageMin = Math.round((Date.now() - new Date(data.generated).getTime()) / 60000);
     const ok = Object.values(sources).some(s => s && s.ok);
-    // Prefer the server-aggregated summary booleans; fall back to per-source.
+    // KANONSKI verdikt: precomputed once by the budva-radar pipeline
+    // (radar/verdict.py, DHMZ nowcast = single source of truth) and rendered
+    // verbatim on EVERY surface — this line, budva-radar index.html and
+    // radar-map.html — so the pages can never disagree. The aggregation above
+    // remains only as a fallback for radar_status.json from older pipelines.
+    const verdict = sum.budva_verdict || null;
+    const vf = (verdict && verdict.facts) || null;
     return {
         ok,
-        rainAtLocation: sum.rain_at_location != null ? !!sum.rain_at_location : srcAtLoc,
-        approaching:    sum.rain_approaching != null ? !!sum.rain_approaching : srcApproaching,
-        anyRainVicinity: sum.rain_in_vicinity != null ? !!sum.rain_in_vicinity : srcVicinity,
-        etaMin:         sum.closest_eta_minutes != null ? sum.closest_eta_minutes : srcEta,
+        verdict,
+        rainAtLocation: vf ? !!vf.rainAtLocation
+            : (sum.rain_at_location != null ? !!sum.rain_at_location : srcAtLoc),
+        approaching:    vf ? !!vf.approaching
+            : (sum.rain_approaching != null ? !!sum.rain_approaching : srcApproaching),
+        anyRainVicinity: vf ? !!vf.anyRain
+            : (sum.rain_in_vicinity != null ? !!sum.rain_in_vicinity : srcVicinity),
+        etaMin:         vf && vf.eta != null ? vf.eta
+            : (sum.closest_eta_minutes != null ? sum.closest_eta_minutes : srcEta),
         bestRain, threat: bestThreat, ageMin,
         severe: !!sum.severe_present,
     };
@@ -3037,6 +3048,21 @@ function renderRadarStatusLine(state) {
     const bestRain = state.bestRain;
     const age = state.ageMin != null ? ' · podatak star ' + state.ageMin + ' min' : '';
     const LINK = '<a href="https://matko-iv.github.io/budva-radar/">Radar</a>: ';
+
+    // KANONSKI verdikt iz pipeline-a (vidi parseRadarState) — ista rečenica
+    // kao zaključak na budva-radar stranicama, samo kraći format. Logika ispod
+    // ostaje SAMO kao fallback za stari radar_status.json.
+    const v = state.verdict;
+    if (v && v.line_sr) {
+        el.style.color = v.color_sr || '#777';
+        el.style.fontWeight = String(v.weight_sr || 400);
+        let line = v.line_sr;
+        if (v.line_sr_bold && line.indexOf(v.line_sr_bold) !== -1) {
+            line = line.replace(v.line_sr_bold, '<b>' + v.line_sr_bold + '</b>');
+        }
+        el.innerHTML = LINK + line + age;
+        return;
+    }
 
     // Format km with finer precision for sub-km echoes.
     function fmtKm(km) {
