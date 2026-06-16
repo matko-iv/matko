@@ -319,7 +319,7 @@
         </nav>
     </div>
 
-    <p class="date">Maj 2026, ažurirano kad je sistem prešao na multi-algoritmski stacking sa 10 modela</p>
+    <p class="date">Jun 2026, ažurirano nakon prelaska na probabilistički sistem (kvantili + konformna kalibracija), proširene podatke i radarski nowcast</p>
     <h1>Tačnije vremenske prognoze za Budvu</h1>
 
     <div class="note blue">
@@ -332,6 +332,8 @@
 
     <p>Sistem koristi 10 modela, mjerenja sa Weather Underground stanice IBUDVA5, šest godina istorijskih podataka (2020-2026), bias tabele, Day1/Day2 forecasts iz prethodnih runs, temperaturu mora i kombinaciju XGBoost + CatBoost + LightGBM korekcije. Rezultat se zapisuje u <code>forecast_48h.json</code>, a sajt ga prikazuje kao live prognozu.</p>
 
+    <p>Tokom 2026. sistem je dosta proširen po preporukama jedne naučne monografije o naknadnom procesiranju NWP prognoza. Najvažnije promjene: prešao je sa <strong>tačkastih</strong> na <strong>probabilističke</strong> prognoze (pune kvantilne trake p05–p95 sa konformnom kalibracijom umjesto samo jednog broja), dodao <strong>komšijske 5×5 padavinske mreže</strong> i <strong>prekodinaridski gradijent pritiska</strong> (za buru), uveo <strong>lead-time</strong> kao feature, i počeo da blenduje <strong>radarski nowcast</strong> sa NWP-om za prvih 6 sati. Sve mjereno rigoroznije — rolling-origin evaluacijom sa Diebold-Mariano testom umjesto jednog splita.</p>
+
     <h2>Šta se zapravo radi</h2>
 
     <p>Svaki run prolazi kroz isti tok: preuzimanje prognoza, spajanje modela, kreiranje feature-a, primjena korekcionih modela i izvoz rezultata za sajt. Sve se radi u lokalnom vremenu <code>Europe/Podgorica</code>. Bez toga se lako desi da gledaš 17:00 u UTC, a misliš da gledaš 17:00 u Budvi.</p>
@@ -339,12 +341,14 @@
     <ol>
         <li>Open-Meteo se poziva za 10 modela na koordinatama Budve: 42.2864, 18.84.</li>
         <li>Za 8 od njih se dohvataju i Previous Runs — Day1 i Day2 forecasts iz prethodnih ciklusa.</li>
-        <li>Svi satni podaci se poravnavaju u <code>Europe/Podgorica</code> vremenu.</li>
+        <li>Za 5 modela se dohvata i <strong>komšijska 5×5 mreža padavina</strong> (25 tačaka oko Budve, ~12 km razmak), plus pritisak iznad <strong>Podgorice</strong> (druga strana Lovćena) — za buru.</li>
+        <li>Svi satni podaci se poravnavaju u <code>Europe/Podgorica</code> vremenu (harmonike sat/dan se računaju u UTC-u da DST prelazi ne pomjere dnevnu fazu).</li>
         <li>Računaju se ansambl statistike: prosjek, p25, p75, raspon, standardna devijacija i agreement.</li>
         <li>Iz istorije se prave bias tabele po satu, mjesecu i sezoni za svaki model i parametar.</li>
-        <li>Dodaju se lokalni feature-i: mjesec, sat, sezona, SST, cross-parameter signali i tendency-ji.</li>
-        <li>Za svaki parametar se primjenjuje korekcioni model — najčešće stack više boostera.</li>
-        <li>Padavine prolaze kroz trusted rain gate; weather code se usklađuje sa korigovanom kišom i oblačnošću.</li>
+        <li>Dodaju se lokalni feature-i: mjesec, sat, sezona, SST, lead-time, prekodinaridski gradijent, gust faktor, komšijske padavinske statistike, cirkulacioni režimi (bura/maestral), cross-parameter signali i tendency-ji.</li>
+        <li>Za svaki parametar se primjenjuje korekcioni model — najčešće stack više boostera — i, pored tačke, pun skup kvantila (p05–p95) sa konformnom kalibracijom.</li>
+        <li>Padavine prolaze kroz trusted rain gate (ili kalibrisani PoP-blend gdje je dokazano bolji); radarski nowcast se blenduje za prvih 6 sati; weather code se usklađuje sa korigovanom kišom i oblačnošću.</li>
+        <li>Izvoze se rezultati: tačka + kvantilne trake + vjerovatnoće prelaska pragova (P(kiša&gt;1mm), P(udar&gt;17 m/s)) + ECC scenariji za vremensku koherentnost.</li>
     </ol>
 
     <h2>Problem</h2>
@@ -443,11 +447,20 @@
 
     <p>Za većinu parametara ansambl koristi sve modele. Za <strong>vjetar</strong> namjerno radim suprotno: trening koristi feature-e samo od tri high-res LAM-a — ItaliaMeteo ICON-2I (2 km), KNMI Seamless i DMI Seamless. Globalni modeli (GFS, ECMWF na 25 km) gladuju lokalne efekte kao što su bure niz Lovćen, pa ih za vjetar isključujem iz feature seta. Plus engineered features (sat, sezona, bias) ostaju.</p>
 
-    <p>Za <strong>padavine</strong> postoji jedan trusted signal: <span class="trusted">ItaliaMeteo ICON-2I</span>. Ako on ne vidi barem 0.10 mm, korekcioni model prikazuje suvo. KNMI i DMI ostaju u feature setu, ali ne mogu sami otvoriti rain gate.</p>
+    <p>Za <strong>padavine</strong> postoji jedan trusted signal: <span class="trusted">ItaliaMeteo ICON-2I</span>. Ako on ne vidi barem 0.10 mm, korekcioni model prikazuje suvo. KNMI i DMI ostaju u feature setu, ali ne mogu sami otvoriti rain gate. (Postoji i alternativa — kalibrisani PoP-blend svih modela — koja se aktivira samo za režime u kojima je dokazano bolja od veta; više dolje.)</p>
+
+    <h3>Prošireni podaci za 2026.</h3>
+
+    <p>Pored tačke Budve, sistem sada povlači dva dodatna prostorna izvora iz Open-Meteo arhive (historical-forecast API, ista distribucija kao live prognoze — bez domain shift-a koji bi unijela ERA5 reanaliza):</p>
+
+    <ul>
+        <li><strong>Komšijska 5×5 mreža padavina:</strong> 25 tačaka oko Budve (~12 km razmak) za 5 modela. Uzvodne (zapadne) ćelije hvataju kišu koja tek dolazi — klasičan displacement problem gdje tačkasta prognoza promaši jer je front malo zakasnio. Iz mreže se računaju: prosjek, maksimum, udio mokrih tačaka i poseban "upwind" prosjek.</li>
+        <li><strong>Pritisak iznad Podgorice</strong> (42.44, 19.26) za svaki model. Razlika Podgorica − Budva daje <strong>prekodinaridski gradijent pritiska</strong> — fizički pokretač bure koja se obrušava niz Lovćen na obalu.</li>
+    </ul>
 
     <h2>Kako se korekcija pravi</h2>
 
-    <p>Nije samo XGBoost. Za svaki parametar treniram tri bazna boostera — XGBoost, CatBoost i LightGBM — pa ih spajam ridge meta-learnerom. Tri algoritma "vide" podatke iz različitih uglova, pa zajedno često hvataju greške koje bi pojedinačni model propustio.</p>
+    <p>Nije samo XGBoost. Za svaki parametar treniram više baznih learnera — XGBoost (u tri varijante loss-a), CatBoost i LightGBM — pa ih spajam ridge meta-learnerom. Različiti algoritmi "vide" podatke iz različitih uglova, pa zajedno često hvataju greške koje bi pojedinačni model propustio. Meta-learner od nedavno dobija i <strong>interakcije režim × model</strong> (mixture-of-experts "za siromašne"): isti model dobija različitu težinu ljeti, u buri ili u kišnom režimu.</p>
 
     <p>XGBoost sam po sebi je ansambl stabala odlučivanja. Konačna predikcija je suma doprinosa mnogo malih stabala. Svako novo stablo pokušava da popravi greške prethodnih.</p>
 
@@ -485,7 +498,7 @@
 
     <h3>Optuna za hiperparametre</h3>
 
-    <p>Učenje stope, dubinu stabla, broj stabala i regularizacione koeficijente ne biram ručno. Za svaki parametar Optuna radi Bayesian search sa TPE samplerom kroz 10-15 trial-a i bira kombinaciju koja daje najmanji MAE na TimeSeriesSplit cross-validaciji. TimeSeriesSplit je bitan jer ne smijem da treniram na budućnosti — fold-ovi se uvijek slažu hronološki.</p>
+    <p>Učenje stope, dubinu stabla, broj stabala i regularizacione koeficijente ne biram ručno. Za svaki parametar Optuna radi Bayesian search sa TPE samplerom (do 50 trial-a, sa fokusom na learning_rate, broj stabala uz early stopping, i min_child_weight/max_depth) i bira kombinaciju koja daje najmanji MAE na TimeSeriesSplit cross-validaciji sa embargo razmakom od 72h. TimeSeriesSplit je bitan jer ne smijem da treniram na budućnosti — fold-ovi se uvijek slažu hronološki, a embargo spriječi da susjedni sati "procure" preko granice folda.</p>
 
     <h3>Pet metoda, bira se najmanja MAE</h3>
 
@@ -496,10 +509,14 @@
         <li><strong>Residual (Huber):</strong> XGBoost predviđa rezidual u odnosu na ensemble mean, sa Huber loss-om (otporniji na ekstremne greške).</li>
         <li><strong>Stacked:</strong> linearna kombinacija direct + residual + MSE-fit modela; težine se traže grid search-om.</li>
         <li><strong>Blend:</strong> stacked × α + sirovi ensemble × (1−α); α se bira da minimizuje MAE.</li>
-        <li><strong>Ridge meta:</strong> ridge regresor koji prima out-of-fold predikcije tri boostera (XGB, CatBoost, LightGBM) kao ulaze.</li>
+        <li><strong>Ridge meta:</strong> ridge regresor koji prima out-of-fold predikcije svih pet baznih learnera (direct/residual/MSE XGBoost + CatBoost + LightGBM), plus njihove interakcije sa cirkulacionim režimima, kao ulaze.</li>
     </ol>
 
-    <p>Pobjednička metoda se snima zajedno sa modelom; inferenca koristi tačno tu metodu i njene težine.</p>
+    <p>Pobjednička metoda se bira na <strong>odvojenoj selection polovini test-skupa</strong> (ne na onoj na kojoj se prijavljuje MAE — da mjerenje skill-a ne bude optimistički pristrasno), pa se snima zajedno sa modelom; inferenca koristi tačno tu metodu i njene težine. Različiti parametri obično završe sa različitom metodom.</p>
+
+    <h3>Lead-time: jedan model preko svih horizonata</h3>
+
+    <p>Umjesto odvojenih modela po danu prognoze (što bi prepolovilo uzorak), <code>lead_time</code> ulazi kao feature, sa interakcijama (lead × spread, lead × doba dana). Iz Previous Runs arhive se prave i sintetički redovi sa lead-om ~36h i ~60h (gdje feature nosi Day1/Day2 vrijednost za isti ciljni sat), pa model uči kako greška raste sa horizontom — a ne samo na kratkom roku. Literatura (Mlakar et al. 2024) pokazuje da ovakvo udruživanje preko lead-time-ova u malim podacima ne gubi, čak dobija na skill-u.</p>
 
     <h3>Residual vs direct</h3>
 
@@ -545,6 +562,40 @@
 
     <p>Solar je manje haotičan u CSI domenu nego u apsolutnoj W/m² skali, jer se uklanja jaka sezonska + dnevna komponenta.</p>
 
+    <h2>Probabilistički izlazi</h2>
+
+    <p>Najveća promjena 2026. je prelazak sa <strong>jednog broja</strong> na <strong>punu distribuciju</strong>. Tačka kaže "biće 24 °C"; distribucija kaže "najvjerovatnije 24 °C, ali sa 80% sigurnosti između 22 i 26 °C". Za planiranje (plovidba, događaji) ta nesigurnost je često važnija od same tačke.</p>
+
+    <h3>Kvantilni modeli</h3>
+
+    <p>Za temperaturu, vjetar, udare i padavine se uz tačku trenira skup LightGBM kvantilnih modela (p05, p10, p25, p50, p75, p90, p95) sa pinball loss-om. Pinball loss je asimetričan: za p90 model jače kažnjava potcjenjivanje nego precjenjivanje, pa nauči gornji rep. Eventualni "crossing" (da p90 ispadne ispod p50) se ispravlja sortiranjem po redu.</p>
+
+    <div class="math-block">
+        \[
+        L_\tau(y, q) = \max\big(\tau\,(y-q),\ (\tau-1)(y-q)\big)
+        \]
+    </div>
+
+    <h3>Konformna kalibracija (CQR)</h3>
+
+    <p>Sirovi kvantili često nisu dobro kalibrisani — 90% interval ne pokrije baš 90% slučajeva. Conformalized Quantile Regression (Romano et al. 2019) to popravlja: na odvojenom kalibracionom foldu se izmjeri koliko interval promašuje, pa se proširi/suzi za empirijski iznos. Rezultat ima <strong>garantovanu pokrivenost konačnog uzorka</strong>, bez pretpostavke o obliku distribucije. Skor funkcija mjeri koliko stvarna vrijednost ispada van intervala:</p>
+
+    <div class="math-block">
+        \[
+        s(x, y) = \max\big(\hat{Q}_{\alpha/2}(x) - y,\ y - \hat{Q}_{1-\alpha/2}(x)\big)
+        \]
+    </div>
+
+    <p>Na live prognozi izmjerena pokrivenost 80% i 50% intervala pada na ±3 procentna poena od nominalne — dakle intervali znače ono što tvrde.</p>
+
+    <h3>Vjerovatnoće prelaska pragova</h3>
+
+    <p>Iz kvantilne krive se izvode direktno korisne vjerovatnoće: P(kiša &gt; 1 mm), P(kiša &gt; 5 mm), P(udar &gt; 17 m/s). To je za odluke korisnije od gole vrijednosti — "30% šanse za udar preko 17 m/s" je jasnija poruka od "udar p90 = 16.4 m/s".</p>
+
+    <h3>ECC: vremenski koherentni scenariji</h3>
+
+    <p>Kvantili po satu nemaju sat-na-sat korelaciju — p90 u 14h i p90 u 15h nisu isti "scenario". Ensemble Copula Coupling (Schefzik et al. 2013) to vraća: uzorci iz kalibrisanih marginalnih distribucija se preurede prema rang-strukturi sirovog ansambla. Iz tih koherentnih scenarija se računaju stvarno korisne stvari: P(ima kiše u prozoru 0–12h / 12–24h / 24–48h), očekivani broj kišnih epizoda i njihovo prosječno trajanje.</p>
+
     <h2>Padavine su poseban slučaj</h2>
 
     <p>Kiša nije kao temperatura. Većina sati je potpuno suva, a kada padavine postoje, često su lokalne i kratke. Klasičan regresor bi mogao samo da uči da prognozira 0 i imao bi sjajne metrike, ali nikakvu vrijednost. Zato je pipeline za kišu drugačiji.</p>
@@ -569,7 +620,7 @@
 
     <h3>Threshold biranje: precision umjesto F1</h3>
 
-    <p>Klasifikator daje vjerovatnoće u [0,1]. Da li je 0.5 pravi prag? Skoro nikad. Tražim prag koji maksimizuje preciznost (koliko od najavljenih kiša je stvarno bilo kiša), pod uslovom da recall (koliko stvarnih kiša uhvatim) ostane iznad 0.5. Za sajt je lažni alarm puno gori od propuštene kiše — ljudi izgube povjerenje.</p>
+    <p>Klasifikator daje vjerovatnoće u [0,1]. Da li je 0.5 pravi prag? Skoro nikad. Tražim prag koji maksimizuje preciznost (koliko od najavljenih kiša je stvarno bilo kiša), pod uslovom da recall (koliko stvarnih kiša uhvatim) ostane iznad 0.5. Za sajt je lažni alarm puno gori od propuštene kiše — ljudi izgube povjerenje. Pored toga računam i prag koji maksimizuje <strong>SEDI</strong> (Symmetric Extremal Dependence Index) — metriku robusnu na to što je kiša rijetka — pa biram onaj koji daje bolju diskriminaciju bez skoka u lažnim alarmima. Kvalitet vjerovatnoća se provjerava CORP reliability dijagramom sa dekompozicijom na miskalibraciju / diskriminaciju / nesigurnost.</p>
 
     <h3>Trusted rain gate</h3>
 
@@ -593,9 +644,27 @@
         <li><strong>Display threshold:</strong> sve ispod 0.20 mm/h se prikazuje kao 0. Ovo eliminiše "ikona kiše zbog 0.10 mm" situacije.</li>
     </ul>
 
+    <h3>Alternativa vetu: kalibrisani PoP-blend</h3>
+
+    <p>Tvrdi veto preko jednog modela (ICON-2I) baca informaciju iz ostalih 9. Zato je dodata i alternativa: logistička regresija koja iz PoP signala svih modela (ko vidi ≥0.1 mm, koliko, koliko se slažu) daje jednu kalibrisanu vjerovatnoću kiše. Na svakom retreningu se <strong>režimski</strong> uporedi — ljeti, u buri, u frontalnim situacijama — da li PoP-blend pobjeđuje veto po SEDI/CSI bez porasta lažnih alarma. Ako da, koristi se; ako ne, ostaje veto. Trenutno (zadnji retrening) veto i dalje pobjeđuje globalno, pa je on aktivan — ali mehanizam je tu i mjeri se svaki put.</p>
+
+    <h3>Radarski nowcast za prvih 6 sati</h3>
+
+    <p>Za vrlo kratke rokove radar zna više od bilo kog NWP modela. Moj zasebni projekat <a href="https://matko-iv.github.io/budva-radar/" target="_blank" rel="noreferrer">SKALA</a> interpretira DHMZ/OPERA radar i objavljuje nowcast (vjerovatnoća kiše na 15/30/60/120 min). Prognoza ga čita i <strong>težinski blenduje</strong>: težina radara pada linearno sa 1 (sada) na 0 (+6h). Ako je radar svjež i kaže suvo, gasi slabu blisku kišu; ako vidi kišu koja stiže, podiže prvih par sati; ako je ćelija već prošla (udaljava se), ne dozvoljava da je 120-min signal drži mokrom. Ako radar nije svjež (stariji od 25 min) ili nedostupan, prognoza se gracilno vrati na staro ponašanje. Radarski log se i arhivira — kasnije će postati feature za model početka kiše.</p>
+
     <h3>Burst wind boost</h3>
 
     <p>Kratak wet run u ItaliaMeteo signalu (do 2 sata neprekidno, eventualno 3-4 ako je intenzitet jak) je tipičan otisak mikroćelijaske konvekcije — kratki ali žestoki pljusak sa udarima vjetra. Kad takav obrazac nađem u trusted modelu, dižem korigovanu brzinu vjetra i udare u istom satu. Dugi wet run-ovi nisu konvekcija nego stratiformna kiša i ne triguju boost.</p>
+
+    <h3>Bura: prekodinaridski gradijent i gust faktor</h3>
+
+    <p>Bura na južnom Jadranu je teža za prognozu nego na sjevernom — Dinaridi su viši i strmiji, a iza Budve je masiv Lovćena, idealan za katabatski (silazni) pad vazduha i naglo pojačanje udara. Pokretač je gradijent pritiska <em>preko</em> grebena. Zato model dobija:</p>
+
+    <ul>
+        <li><strong>Prekodinaridski gradijent</strong> — razlika pritiska Podgorica − Budva po modelu, plus ansambl prosjek i interakcija sa NE sektorom vjetra (bura duva sa sjeveroistoka).</li>
+        <li><strong>Gust faktor</strong> \(G = U_{\text{udar}}/U_{\text{srednji}}\) po modelu, i njegova interakcija sa CAPE-om (nestabilnost pojačava udare).</li>
+        <li><strong>Cirkulacioni režimi</strong> izvedeni iz NWP polja (udio modela sa vjetrom u NE sektoru, udio sa morskim/onshore smjerom) — koriste se i kao feature i za režimsko težinjenje meta-learnera.</li>
+    </ul>
 
     <h3>Weather code remapping</h3>
 
@@ -605,7 +674,7 @@
 
     <h3>Oblačnost i jutarnji prelaz</h3>
 
-    <p>Korigovana oblačnost se ne primjenjuje 24/7. XGBoost je naučen na satima sa pouzdanim solar-derivisanim opservacijama (uglavnom 9-15h zimi, 7-18h ljeti), pa van tog prozora model ekstrapolira. Plus, u jutarnjim satima 7-9 derivisana cloud opservacija (\(1 - SW_{\text{obs}}/SW_{\text{clear}}\)) je nestabilna zbog niskog ugla sunca i terenske sjenke Lovćena.</p>
+    <p>Korigovana oblačnost se ne primjenjuje 24/7. XGBoost je naučen na satima sa pouzdanim solar-derivisanim opservacijama (uglavnom 9-15h zimi, 7-18h ljeti), pa van tog prozora model ekstrapolira. Plus, u jutarnjim satima 7-9 derivisana cloud opservacija (\(1 - SW_{\text{obs}}/SW_{\text{clear}}\)) je nestabilna zbog niskog ugla sunca i nepouzdanih podataka sa stanice u tim satima.</p>
 
     <p>Zato u produkciji koristim sljedeće pravilo: <strong>za satove prije 10:00 lokalno koristim sirovi ensemble prosjek, a od 10:00 XGBoost</strong>, do sezonske gornje granice (15h zimi, 18h ljeti). Posle toga opet ensemble. Pravilo eliminiše vidljive skokove oblačnosti u jutarnjim satima.</p>
 
@@ -619,6 +688,8 @@
 
     <p>Na validacionom setu, korekcija najviše pomaže na parametrima koji imaju stabilan bias: temperatura, pritisak, vjetar, oblačnost i vlažnost. Padavine se čitaju opreznije, jer su često lokalne, nelinearne i vremenski pomjerene za sat-dva.</p>
 
+    <p>Skill se sada mjeri rigoroznije. Umjesto jednog hronološkog splita (koji bi test napravio uglavnom ljeto+jesen), koristim <strong>rolling-origin</strong> evaluaciju — više polazišta kroz godinu, svako testirano na narednih 6 mjeseci — i poredim sa hijerarhijom baseline-ova: sirovi najbolji model → ansambl prosjek → EMOS. Razlike se provjeravaju <strong>Diebold-Mariano testom</strong> sa block-bootstrap intervalima (blokovi hvataju autokorelaciju satne serije, inače bi intervali bili lažno uski). Na zadnjoj evaluaciji korekcija je statistički značajno (p&lt;0.01) bolja od ansambla i EMOS-a na svih 9 parametara. Iskreno: kod vjetra je dio tog "dobitka" zato što sirovi ansambl precjenjuje vjetar na zaklonjenoj stanici — pošten dobitak preko obične kalibracije (EMOS) je skromniji. Kod padavina je dobitak u <em>količini</em>, dok je pogađanje same <em>pojave</em> kiše blizu plafona (kao što i literatura kaže).</p>
+
     <div id="liveAccuracy">
         <p style="color:#586069;font-size:15px;">Učitavanje podataka o tačnosti...</p>
     </div>
@@ -629,6 +700,9 @@
 
     <ul>
         <li><strong>Satna prognoza:</strong> 48 sati temperature, vlage, vjetra, pritiska, oblačnosti i padavina.</li>
+        <li><strong>Kvantilne trake:</strong> graf temperature pokazuje raspon p05–p95 (fan chart), ne samo liniju — koliko je prognoza sigurna.</li>
+        <li><strong>Vjerovatnoće:</strong> šansa za kišu (PoP) po satu, P(kiša&gt;1 mm), i upozorenje kad je P(udar&gt;17 m/s) ≥ 30%.</li>
+        <li><strong>Scenariji kiše:</strong> P(ima kiše) u prozorima 0–12h / 12–24h / 24–48h iz koherentnih ECC scenarija.</li>
         <li><strong>Dnevni narativ:</strong> kratak opis dana, bez previše tehničkog jezika.</li>
         <li><strong>Raw vs corrected:</strong> grafovi pokazuju gdje je korekcija pomjerila ansambl.</li>
         <li><strong>Jasnije padavine:</strong> sitni šum ispod 0.20 mm se ne prikazuje kao kiša.</li>
@@ -643,6 +717,8 @@
     <p>Najveća poboljšanja su tamo gdje postoji stabilan, ponavljajući bias. Najveći rizik ostaje kod konvektivnih padavina, kratkih pljuskova i situacija kada je granica kiše baš preko Budve. Zato je za padavine važno čuvati trusted gate, summer abstention pravilo i WU nowcast kao zaštitne slojeve.</p>
 
     <p>Drugo realno ograničenje: stanica IBUDVA5 nije meteorološka referentna stanica, nego privatni WU instrument. Greške u njenim očitanjima ulaze direktno u bias tabele. Periodično je treba uporediti sa zvaničnim DHMZ/Tivat podacima.</p>
+
+    <p>Nekoliko svjesnih odluka i njihovih granica: proširenje podataka koristi Open-Meteo <em>historical-forecast</em> arhivu (arhiva stvarnih prošlih prognoza istih modela), namjerno NE ERA5 reanalizu — reanaliza ima drugačiju distribuciju od prognoza, pa bi unijela domain shift. Radarski nowcast pomaže samo prvih nekoliko sati i sam sebe gasi ako je slika starija od 25 min. Kvantilna pokrivenost je mjerena na kraćem lead-time-u, pa je za dalje horizonte vjerovatno blago optimistična. I dalje ne postoji ERA5/satelitski feature (po izboru) — oblačnost se i dalje izvodi iz solarnog signala stanice.</p>
 
     <details>
         <summary><strong>Još grafika iz stare analize</strong></summary>

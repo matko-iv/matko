@@ -907,7 +907,11 @@
         </nav>
     </div>
 
-    <h1>Matkov model v3</h1>
+    <h1>Matkov model v4</h1>
+	
+	<p>
+        Četvrta verzija modela objavljena je 16. juna 2026. godine. Mogućnosti ove verzije prevazilaze sve dosadašnje verzije Matkove prognoze za Budvu. Ona donosi prelazak sa tačkastih na pune probabilističke prognoze i statistički značajno nadmašuje i sirovi ansambl i EMOS, pa i starije verzije samog modela na svih devet parametara — prednost koja raste što je vremenska situacija lokalnija i složenija.
+    </p>
 
     <p>
         Obavještenje za vremenske prilike za ljeto 2026: ovo ljeto će vjerovatno biti <b>drugo najtoplije ljeto</b> od kad se mjeri u Budvi. Dokument koji detaljnije objašnjava trend vremenskih prilika za ovogodišnju ljetnju turističku sezonu možete otvoriti klikom <a href="14_V_MMXXVI.pdf">ovđe</a>. <span style="font-size: 12px;font-style: italic;color:#6a737d; margin: 0 0 0;">Pošljednja izmjena: 15.5.2026.</span>
@@ -2465,6 +2469,11 @@ function render(data) {
         const t = h.temperature_2m != null ? Math.round(h.temperature_2m) + '°' : '-';
         const rain = h.precipitation > 0.05 ? h.precipitation.toFixed(1) + 'mm' : '';
         const wind = h.wind_speed_10m != null ? h.wind_speed_10m.toFixed(1) : '';
+        // PDF2 §3.5: calibrated PoP + gust-exceedance badge (fields exist only
+        // after the quantile-upgrade retrain; render nothing on old JSONs)
+        const pop = (h.precipitation_pop != null && h.precipitation_pop >= 0.15)
+            ? Math.round(h.precipitation_pop * 100) + '%' : '';
+        const gustWarn = h.p_gust_gt17 != null && h.p_gust_gt17 >= 0.3;
         const gateOffset = (i === currentIdx) ? 0 : (i === currentIdx + 1 ? 1 : -1);
         const cellCode = gateOffset >= 0 ? gateWeatherCode(h.weather_code, h.cloud_cover, gateOffset, radarState) : h.weather_code;
         const iconKey = getWeatherIcon(cellCode, h.hour);
@@ -2476,10 +2485,23 @@ function render(data) {
             <span class="h-icon">${weatherIcon(iconKey, 48)}</span>
             <span class="h-temp">${t}</span>
             <span class="h-rain">${rain}</span>
-            <span class="h-wind">${wind ? windArrow(h.wind_direction_10m) + ' ' + wind + ' m/s' : ''}</span>
+            ${pop ? `<span class="h-pop" style="font-size:11px;color:#0366d6;font-weight:600">${pop}</span>` : ''}
+            <span class="h-wind"${gustWarn ? ` title="P(udar > 17 m/s) = ${Math.round(h.p_gust_gt17 * 100)}%"` : ''}>${wind ? windArrow(h.wind_direction_10m) + ' ' + wind + ' m/s' + (gustWarn ? ' ⚠' : '') : ''}</span>
         </div>`;
     });
     html += '</div></div>';
+
+    // PDF2 §5.2: ECC-scenario window probabilities (temporally coherent PoP)
+    if (data.precip_scenarios) {
+        const ps = data.precip_scenarios;
+        const pct = v => v != null ? Math.round(v * 100) + '%' : '–';
+        html += `<p style="font-size:13px;color:#586069;margin:6px 0 0 2px">` +
+            `Vjerovatnoća kiše (ECC scenariji): 0–12h <b>${pct(ps['p_rain_0_12h'])}</b>` +
+            ` · 12–24h <b>${pct(ps['p_rain_12_24h'])}</b>` +
+            ` · 24–48h <b>${pct(ps['p_rain_24_48h'])}</b>` +
+            (ps.expected_episodes != null ? ` · očekivano epizoda: <b>${ps.expected_episodes.toFixed(1)}</b>` : '') +
+            `</p>`;
+    }
 
     html += `
     <h2>Interaktivni grafovi</h2>
@@ -2855,11 +2877,37 @@ function drawChart(type) {
         }
     };
 
+    // --- PDF2 §3.5: distributional layers (only when the JSON has quantiles) ---
+    // Temp fan chart: q05-q95 (light) + q25-q75 (darker) bands around the line.
+    if (hours.some(h => h.temperature_2m_q05 != null)) {
+        const band = (key, color) => ({ label: '_' + key, data: hours.map(h => h[key]),
+            borderColor: 'transparent', backgroundColor: color,
+            pointRadius: 0, tension: 0.3, borderWidth: 0 });
+        const b95 = band('temperature_2m_q95', 'rgba(0,0,0,0)');
+        const b05 = band('temperature_2m_q05', 'rgba(215,58,73,0.10)'); b05.fill = '-1';
+        const b75 = band('temperature_2m_q75', 'rgba(0,0,0,0)');
+        const b25 = band('temperature_2m_q25', 'rgba(215,58,73,0.16)'); b25.fill = '-1';
+        configs.temp.datasets = [b95, b05, b75, b25, ...configs.temp.datasets];
+    }
+    if (hours.some(h => h.precipitation_pop != null)) {
+        configs.precip.datasets.push({ type: 'line', label: 'PoP (%)',
+            data: hours.map(h => h.precipitation_pop != null ? Math.round(h.precipitation_pop * 100) : null),
+            borderColor: '#28a745', backgroundColor: 'transparent', yAxisID: 'y1',
+            pointRadius: 0, borderWidth: 2, tension: 0.3 });
+        configs.precip.y1 = true;
+    }
+    if (hours.some(h => h.wind_gusts_10m_q90 != null)) {
+        configs.wind.datasets.push({ label: 'Udari p90 (m/s)',
+            data: hours.map(h => h.wind_gusts_10m_q90),
+            borderColor: 'rgba(215,58,73,0.4)', borderDash: [2,2],
+            pointRadius: 0, borderWidth: 1.5, tension: 0.3 });
+    }
+
     const cfg = configs[type];
     const chartType = cfg.type || 'line';
 
     cfg.datasets.forEach(ds => {
-        if (chartType === 'line' && !ds.pointRadius) {
+        if (chartType === 'line' && ds.pointRadius == null) {
             ds.pointRadius = 2;
             ds.pointHoverRadius = 5;
             ds.tension = 0.3;
@@ -2885,7 +2933,8 @@ function drawChart(type) {
             },
             plugins: {
                 legend: {
-                    labels: { color: '#586069', font: { size: 12 }, usePointStyle: true, pointStyle: 'line' }
+                    labels: { color: '#586069', font: { size: 12 }, usePointStyle: true, pointStyle: 'line',
+                              filter: (item) => !item.text.startsWith('_') }
                 },
                 tooltip: {
                     backgroundColor: '#24292e',
@@ -2893,6 +2942,7 @@ function drawChart(type) {
                     bodyColor: '#e1e4e8',
                     borderColor: '#444d56',
                     borderWidth: 1,
+                    filter: (item) => !(item.dataset.label || '').startsWith('_'),
                     callbacks: {
                         title: (items) => {
                             const d = new Date(items[0].label);
@@ -2920,7 +2970,13 @@ function drawChart(type) {
                     title: { display: true, text: cfg.yTitle, color: '#586069' },
                     grid: { color: 'rgba(0,0,0,0.06)' },
                     ticks: { color: '#586069' }
-                }
+                },
+                ...(cfg.y1 ? { y1: {
+                    position: 'right', min: 0, max: 100,
+                    grid: { drawOnChartArea: false },
+                    title: { display: true, text: 'PoP (%)', color: '#28a745' },
+                    ticks: { color: '#28a745' }
+                } } : {})
             }
         }
     });
