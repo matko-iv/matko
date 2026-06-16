@@ -12,7 +12,7 @@ permissions:
 jobs:
   forecast:
     runs-on: ubuntu-latest
-    timeout-minutes: 13
+    timeout-minutes: 20
     env:
       # Use Montenegro local time (CET in winter, CEST in summer) for all
       # timestamps — Python pd.Timestamp.now(), bash date, etc.
