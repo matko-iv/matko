@@ -5770,6 +5770,14 @@ def apply_correction(fc_df, trained, bias_tables, local_dry_nowcast=False):
                 )
                 pred[trusted_signal] = np.maximum(pred[trusted_signal], trusted_floor[trusted_signal])
 
+            # PDF2 §3.5: calibrated PoP (isotonic classifier proba), GATED by the
+            # trusted rain gate so the probabilistic view agrees with the
+            # deterministic one. Where the gate is closed (ICON-2I dry / summer
+            # abstention), the system asserts dry, so PoP -> 0. Set BEFORE the
+            # radar block so the radar nowcast can blend it.
+            corrected['precipitation_pop'] = np.clip(
+                np.where(no_signal, 0.0, cls_proba), 0.0, 1.0)
+
             # --- PDF2 §4.3: SKALA radar nowcast as a WEIGHTED 0-6h member ---
             # Replaces "hard override" thinking: weight w(lead) falls linearly
             # from 1 (now) to 0 (+6h); PoP is blended, amounts are only nudged
@@ -5830,10 +5838,7 @@ def apply_correction(fc_df, trained, bias_tables, local_dry_nowcast=False):
             pred[pred < CORRECTED_RAIN_THRESHOLD_MM] = 0.0
 
             corrected[f'{param}_xgb'] = pred
-            # PDF2 §3.5: calibrated PoP (isotonic-calibrated classifier proba).
-            # Deliberately NOT zeroed by the deterministic gates above — the
-            # probabilistic and deterministic views may legitimately disagree.
-            corrected['precipitation_pop'] = np.clip(cls_proba, 0.0, 1.0)
+            # (precipitation_pop set above, before the radar block, and gated)
             method_lbl = method + (f'+blend({p_blend_alpha:.2f})' if p_blend_alpha < 1.0 else '')
             _mae_s = (f"{minfo['mae']:.3f}{TARGET_PARAMS[param]['unit']}"
                       if minfo.get('mae') is not None else "n/a (resumed)")
@@ -5995,6 +6000,23 @@ def apply_correction(fc_df, trained, bias_tables, local_dry_nowcast=False):
         except Exception as _e:
             print(f"  Kvantili {param}: preskočeno ({_e})")
             continue
+
+        # --- PDF2 §3/§4.1: zero-inflate the PRECIP quantiles ---
+        # Precipitation is ~92% dry, but the bare quantile model (+ CQR widening)
+        # leaks rain mass into the upper tail even on dry hours, which made the
+        # exceedance probs and ECC scenarios contradict the (gated) dry point
+        # forecast. Fix: a quantile level alpha is DRY whenever alpha <= 1 - pw,
+        # where pw is the gated calibrated PoP. So a 1%-rain hour gets all
+        # quantiles = 0; a 40%-rain hour keeps only its top quantiles wet.
+        pw_precip = None
+        if param == 'precipitation' and 'precipitation_pop' in corrected.columns:
+            pw_precip = np.clip(corrected['precipitation_pop'].values.astype(float), 0.0, 1.0)
+            alphas_arr = np.array(sorted(pf.DEFAULT_ALPHAS))
+            qc_sorted = [f"q{int(round(a * 100)):02d}" for a in alphas_arr]
+            V = qdf[qc_sorted].values.astype(float)
+            V[alphas_arr[None, :] <= (1.0 - pw_precip)[:, None]] = 0.0
+            qdf = pd.DataFrame(np.sort(V, axis=1), columns=qc_sorted)
+
         # mask hours with no model data (same guard as the point forecast)
         ens_col_q = f'{param}_ens_mean'
         _nan_mask = (pd.to_numeric(fc[ens_col_q], errors='coerce').isna().values
@@ -6008,6 +6030,10 @@ def apply_correction(fc_df, trained, bias_tables, local_dry_nowcast=False):
             if param == 'precipitation':
                 for thr, name in ((1.0, 'p_precip_gt1'), (5.0, 'p_precip_gt5')):
                     ex = pf.exceedance_from_quantiles(qdf, pf.DEFAULT_ALPHAS, thr)
+                    # P(Y > thr>0) can never exceed the wet probability P(Y>0)=pw;
+                    # cap it so dry hours don't inherit a residual tail (0.05).
+                    if pw_precip is not None:
+                        ex = np.minimum(ex, pw_precip)
                     ex[_nan_mask] = np.nan
                     corrected[name] = ex
             elif param == 'wind_gusts_10m':
