@@ -2484,8 +2484,8 @@ function render(data) {
         <p>
             Kišu predviđamo u dva koraka: XGBoost model na osnovu svih ulaznih modela procjenjuje da li je kiša moguća (oznaka „Moguće"). Da li zaista pada potvrđuje SKALA sistem interpretacije. Zato ikonica za tekući i naredni sat prati radar: ako radar ne vidi kišu, prikazujemo stvarno stanje neba, a ne model. Kad kiša stvarno krene, ikonica se mijenja u odgovarajuću kišnu. Isto vrijedi i za nebo: SKALA sateliti (oblačnost/sunce) koriguju ikonicu tekućeg sata prema stvarno osmotrenom stanju.
         </p>
-        <p style="font-size:13px;color:#666;margin:6px 0 0;border-left:3px solid #ddd;padding-left:10px">
-            Napomena: SKALA (radar + sateliti) koriguje prikaz UŽIVO samo za tekući i naredni sat. Ta očitanja se ne arhiviraju u prognozu — kad sat prođe, za taj prošli sat se vraćamo na čisto rješenje NWP modela. Zato prošli sati pokazuju model, a ne ono što je SKALA pokazivala uživo, pa se mogu razlikovati od stvarnih dešavanja.
+        <p>
+            Napomena: SKALA koriguje prikaz UŽIVO samo za tekući i naredni sat. Ta očitanja se ne arhiviraju u prognozu. Kad sat prođe, za taj prošli sat se vraćamo na čisto rješenje NWP modela. Zato prošli sati pokazuju model, a ne ono što je SKALA pokazivala uživo, pa se mogu razlikovati od stvarnih dešavanja.
         </p>
         <div class="${cwClass}">
             <div class="cw-icon" id="cwIconBox" data-code="${currentData.weather_code}" data-cloud="${currentData.cloud_cover != null ? currentData.cloud_cover : ''}" data-hour="${currentData.hour}">${weatherIcon(cwIcon, 96)}</div>
