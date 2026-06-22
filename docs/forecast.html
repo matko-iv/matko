@@ -1065,14 +1065,56 @@ function gateWeatherCode(code, cloud, offset, rs) {
     return isRainCode(code) ? cloudToCode(cloud) : code;   // radar dry -> strip model rain
 }
 
-// Re-skin the current-weather icon + the current/next hourly cells after a radar refresh.
+// ---- SKALA satellite (cloud) gating of the near-term SKY icon ----
+// cloudState is populated by refreshCloud(); null/stale = no gating (trust model).
+let cloudState = null;
+function cloudFresh(cs) { return !!(cs && cs.ok && cs.ageMin != null && cs.ageMin <= 40); }
+
+// SKALA CLOUD verdict state -> WMO cloud code (0 vedro · 1 pretežno vedro ·
+// 2 djelimično oblačno · 3 oblačno). Thin cirrus that lets the sun through reads
+// as "pretežno vedro", not "oblačno" — the satellite module's whole point.
+function cloudStateToCode(cs) {
+    const thin = !!(cs && cs.facts && cs.facts.thinVeil);
+    switch (cs && cs.state) {
+        case 'OVERCAST': return 3;
+        case 'PARTLY':   return thin ? 1 : 2;
+        case 'CLEARING': return 2;
+        case 'CLOUDS_APPROACHING': return thin ? 1 : 0;    // clear NOW; clouds later
+        case 'CLEAR':    return thin ? 1 : 0;
+        default:         return null;
+    }
+}
+
+// Reconcile an (already radar-gated) code with the satellite sky. Rain/thunder
+// always win (the satellite can't see rain); only clear/cloud codes are touched.
+// Current hour (offset 0) = the OBSERVED sky; next hour gets only a gentle nudge.
+function gateCloudCode(code, offset, cs) {
+    if (!cloudFresh(cs)) return code;
+    if (isRainCode(code) || code >= 95) return code;
+    const observed = cloudStateToCode(cs);
+    if (observed == null) return code;
+    if (offset === 0) return observed;
+    if (offset === 1) {
+        if (cs.state === 'CLOUDS_APPROACHING') return Math.max(code, 2);
+        if (cs.state === 'CLEARING') return Math.min(code, 2);
+    }
+    return code;
+}
+
+// Combined near-term gate: radar first (rain), then satellite (sky). Reads the
+// module globals radarState + cloudState.
+function gatedCode(code, cloud, offset) {
+    return gateCloudCode(gateWeatherCode(code, cloud, offset, radarState), offset, cloudState);
+}
+
+// Re-skin the current-weather icon + the current/next hourly cells after a refresh.
 function applyRadarGating() {
     const box = document.getElementById('cwIconBox');
     if (box) {
         const code = +box.dataset.code;
         const cloud = box.dataset.cloud === '' ? null : +box.dataset.cloud;
         const hour = +box.dataset.hour;
-        box.innerHTML = weatherIcon(getWeatherIcon(gateWeatherCode(code, cloud, 0, radarState), hour), 96);
+        box.innerHTML = weatherIcon(getWeatherIcon(gatedCode(code, cloud, 0), hour), 96);
     }
     document.querySelectorAll('.hourly-cell[data-gate]').forEach(cell => {
         const offset = +cell.dataset.gate;
@@ -1080,7 +1122,7 @@ function applyRadarGating() {
         const code = +cell.dataset.code;
         const cloud = cell.dataset.cloud === '' ? null : +cell.dataset.cloud;
         const iconEl = cell.querySelector('.h-icon');
-        if (iconEl) iconEl.innerHTML = weatherIcon(getWeatherIcon(gateWeatherCode(code, cloud, offset, radarState), hour), 48);
+        if (iconEl) iconEl.innerHTML = weatherIcon(getWeatherIcon(gatedCode(code, cloud, offset), hour), 48);
     });
 }
 
@@ -2314,11 +2356,13 @@ async function loadForecast() {
         const resp = await fetch('forecast_data/forecast_48h.json?v=' + Date.now(), { cache: 'no-store' });
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
         forecastData = await resp.json();
-        // Populate radarState before first paint so near-term rain icons are
-        // gated immediately. Cap the wait so a slow radar never blocks render.
-        await Promise.race([refreshRadar(), new Promise(r => setTimeout(r, 2500))]);
+        // Populate radar + satellite state before first paint so near-term icons
+        // are gated immediately. Cap the wait so a slow source never blocks render.
+        await Promise.race([Promise.all([refreshRadar(), refreshCloud()]),
+                            new Promise(r => setTimeout(r, 2500))]);
         render(forecastData);
         renderRadarStatusLine(radarState);
+        renderCloudStatusLine(cloudState);
         applyRadarGating();
     } catch(e) {
         document.getElementById('app').innerHTML =
@@ -2404,8 +2448,9 @@ function render(data) {
     const currentIdx = data.hourly_forecast.indexOf(currentData);
     if (currentData) {
         const wmoDescs = {0:'Vedro',1:'Pretežno vedro',2:'Djelimično oblačno',3:'Oblačno',45:'Magla',48:'Magla',51:'Sitna kiša',53:'Sitna kiša, umjerena',55:'Sitna kiša, jaka',61:'Slaba kiša',63:'Kiša',65:'Jaka kiša',71:'Snijeg',73:'Snijeg',75:'Jak snijeg',80:'Pljuskovi',81:'Pljuskovi',82:'Jaki pljuskovi',95:'Grmljavina',96:'Grmljavina',99:'Grmljavina'};
-        // SKALA radar gate: the near-term rain icon must agree with the radar.
-        const cwCode = gateWeatherCode(currentData.weather_code, currentData.cloud_cover, 0, radarState);
+        // SKALA gate: the near-term icon must agree with the radar (rain) and the
+        // satellite (sky) — see gatedCode().
+        const cwCode = gatedCode(currentData.weather_code, currentData.cloud_cover, 0);
         const cwIcon = getWeatherIcon(cwCode, currentData.hour);
         const cwDesc = wmoDescs[cwCode] || 'Vedro';
         const gatedDryNow = isRainCode(currentData.weather_code) && !isRainCode(cwCode);
@@ -2437,7 +2482,10 @@ function render(data) {
 
         html += `
         <p>
-            Kišu predviđamo u dva koraka: XGBoost model na osnovu svih ulaznih modela procjenjuje da li je kiša moguća (oznaka „Moguće"). Da li zaista pada potvrđuje SKALA sistem interpretacije. Zato ikonica za tekući i naredni sat prati radar: ako radar ne vidi kišu, prikazujemo stvarno stanje neba, a ne model. Kad kiša stvarno krene, ikonica se mijenja u odgovarajuću kišnu.
+            Kišu predviđamo u dva koraka: XGBoost model na osnovu svih ulaznih modela procjenjuje da li je kiša moguća (oznaka „Moguće"). Da li zaista pada potvrđuje SKALA sistem interpretacije. Zato ikonica za tekući i naredni sat prati radar: ako radar ne vidi kišu, prikazujemo stvarno stanje neba, a ne model. Kad kiša stvarno krene, ikonica se mijenja u odgovarajuću kišnu. Isto vrijedi i za nebo: SKALA sateliti (oblačnost/sunce) koriguju ikonicu tekućeg sata prema stvarno osmotrenom stanju.
+        </p>
+        <p style="font-size:13px;color:#666;margin:6px 0 0;border-left:3px solid #ddd;padding-left:10px">
+            Napomena: SKALA (radar + sateliti) koriguje prikaz UŽIVO samo za tekući i naredni sat. Ta očitanja se ne arhiviraju u prognozu — kad sat prođe, za taj prošli sat se vraćamo na čisto rješenje NWP modela. Zato prošli sati pokazuju model, a ne ono što je SKALA pokazivala uživo, pa se mogu razlikovati od stvarnih dešavanja.
         </p>
         <div class="${cwClass}">
             <div class="cw-icon" id="cwIconBox" data-code="${currentData.weather_code}" data-cloud="${currentData.cloud_cover != null ? currentData.cloud_cover : ''}" data-hour="${currentData.hour}">${weatherIcon(cwIcon, 96)}</div>
@@ -2460,6 +2508,7 @@ function render(data) {
                     })()}
                 </div>
                 <div id="radarStatusLine" class="cw-radar-line" style="margin-top:10px;padding-top:10px;border-top:1px solid rgba(0,0,0,0.08);font-size:14px;color:#555">Radar: ucitavam...</div>
+                <div id="cloudStatusLine" class="cw-cloud-line" style="margin-top:6px;font-size:14px;color:#555">Sateliti: ucitavam...</div>
             </div>
         </div>`;
     }
@@ -2475,7 +2524,7 @@ function render(data) {
             ? Math.round(h.precipitation_pop * 100) + '%' : '';
         const gustWarn = h.p_gust_gt17 != null && h.p_gust_gt17 >= 0.3;
         const gateOffset = (i === currentIdx) ? 0 : (i === currentIdx + 1 ? 1 : -1);
-        const cellCode = gateOffset >= 0 ? gateWeatherCode(h.weather_code, h.cloud_cover, gateOffset, radarState) : h.weather_code;
+        const cellCode = gateOffset >= 0 ? gatedCode(h.weather_code, h.cloud_cover, gateOffset) : h.weather_code;
         const iconKey = getWeatherIcon(cellCode, h.hour);
         const isNow = h.hour === currentHour;
         const gateAttr = gateOffset >= 0 ? ` data-gate="${gateOffset}" data-hour="${h.hour}" data-code="${h.weather_code}" data-cloud="${h.cloud_cover != null ? h.cloud_cover : ''}"` : '';
@@ -3193,8 +3242,78 @@ function renderRadarStatusLine(state) {
     }
 }
 
-// Radar se osvježava svake 2 min; inicijalno gejtovanje ikonica radi loadForecast().
+// ============================================================================
+// SKALA CLOUD (satellite) status integration — mirrors the radar block above.
+// The same budva-radar repo publishes cloud_status.json; we render its canonical
+// verdict line (summary.cloud_verdict.line_sr) next to the radar line and gate
+// the near-term sky icon (gateCloudCode / gatedCode).
+// ============================================================================
+const CLOUD_STATUS_URLS = [
+    'cloud_status.json',
+    'https://matko-iv.github.io/budva-radar/cloud_status.json',
+];
+
+async function fetchCloudData() {
+    for (const url of CLOUD_STATUS_URLS) {
+        try {
+            const resp = await fetch(url + '?v=' + Date.now(), { cache: 'no-store' });
+            if (!resp.ok) throw new Error('HTTP ' + resp.status);
+            return await resp.json();
+        } catch (e) { /* try next url */ }
+    }
+    return null;
+}
+
+// Parse cloud JSON into the compact state used by the status line + icon gating.
+// Prefers the KANONSKI verdict precomputed by the budva-radar pipeline
+// (clouds/verdict.py), rendered verbatim on every surface so pages never disagree.
+function parseCloudState(data) {
+    const verdict = ((data && data.summary) || {}).cloud_verdict || null;
+    const facts = (verdict && verdict.facts) || (data && data.facts) || null;
+    let ageMin = null;
+    if (data && data.generated) ageMin = Math.round((Date.now() - new Date(data.generated).getTime()) / 60000);
+    return { ok: !!(verdict || facts), verdict, state: verdict ? verdict.state : null, facts, ageMin };
+}
+
+async function refreshCloud() {
+    const data = await fetchCloudData();
+    cloudState = data ? parseCloudState(data) : null;
+    renderCloudStatusLine(cloudState);
+    applyRadarGating();   // re-skin icons with the combined radar+satellite gate
+}
+
+function renderCloudStatusLine(state) {
+    const el = document.getElementById('cloudStatusLine');
+    if (!el) return;
+    const LINK = '<a href="https://matko-iv.github.io/budva-radar/cloud-map.html">Sateliti</a>: ';
+    if (!state || !state.ok) {
+        el.style.color = '#777';
+        el.style.fontWeight = '400';
+        el.innerHTML = LINK + 'nedostupno';
+        return;
+    }
+    const age = state.ageMin != null ? ' · podatak star ' + state.ageMin + ' min' : '';
+    // KANONSKI verdikt (line_sr/bold/color/weight) — ista rečenica kao na
+    // budva-radar cloud-map.html, samo kraći format.
+    const v = state.verdict;
+    if (v && v.line_sr) {
+        el.style.color = v.color_sr || '#777';
+        el.style.fontWeight = String(v.weight_sr || 400);
+        let line = v.line_sr;
+        if (v.line_sr_bold && line.indexOf(v.line_sr_bold) !== -1) {
+            line = line.replace(v.line_sr_bold, '<b>' + v.line_sr_bold + '</b>');
+        }
+        el.innerHTML = LINK + line + age;
+        return;
+    }
+    el.style.color = '#777';
+    el.style.fontWeight = '400';
+    el.innerHTML = LINK + 'nema podataka';
+}
+
+// Radar + sateliti se osvježavaju svake 2 min; inicijalno gejtovanje radi loadForecast().
 setInterval(refreshRadar, 120000);
+setInterval(refreshCloud, 120000);
 </script>
 
 </body>
