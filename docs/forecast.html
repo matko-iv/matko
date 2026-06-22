@@ -1068,7 +1068,10 @@ function gateWeatherCode(code, cloud, offset, rs) {
 // ---- SKALA satellite (cloud) gating of the near-term SKY icon ----
 // cloudState is populated by refreshCloud(); null/stale = no gating (trust model).
 let cloudState = null;
-function cloudFresh(cs) { return !!(cs && cs.ok && cs.ageMin != null && cs.ageMin <= 40); }
+// Satellite frames are inherently ~20-35 min old (dissemination latency), so the
+// freshness window is wider than the radar's — otherwise the icon gate would
+// flicker off every time latency nudged past 40 min.
+function cloudFresh(cs) { return !!(cs && cs.ok && cs.ageMin != null && cs.ageMin <= 60); }
 
 // SKALA CLOUD verdict state -> WMO cloud code (0 vedro · 1 pretežno vedro ·
 // 2 djelimično oblačno · 3 oblačno). Thin cirrus that lets the sun through reads
@@ -3270,8 +3273,13 @@ async function fetchCloudData() {
 function parseCloudState(data) {
     const verdict = ((data && data.summary) || {}).cloud_verdict || null;
     const facts = (verdict && verdict.facts) || (data && data.facts) || null;
+    // Age = age of the SATELLITE SNAPSHOT (sensing_time), not when the pipeline
+    // ran. The GeoColour/L2 frame is inherently ~20-35 min old (EUMETSAT
+    // dissemination latency), so that is the honest "podatak star N min".
+    const src = (data && data.source) || {};
+    const stamp = src.sensing_time || (data && data.generated);
     let ageMin = null;
-    if (data && data.generated) ageMin = Math.round((Date.now() - new Date(data.generated).getTime()) / 60000);
+    if (stamp) ageMin = Math.round((Date.now() - new Date(stamp).getTime()) / 60000);
     return { ok: !!(verdict || facts), verdict, state: verdict ? verdict.state : null, facts, ageMin };
 }
 
