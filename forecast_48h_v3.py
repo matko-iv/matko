@@ -6150,6 +6150,9 @@ WMO_CODES = {
 }
 
 
+import narrative_variants as nv
+
+
 def _daily_narrative(grp):
     def _col(name):
         return pd.to_numeric(grp.get(name, pd.Series(dtype=float)), errors='coerce')
@@ -6255,6 +6258,11 @@ def _daily_narrative(grp):
 
     day_wmo = WMO_CODES.get(day_wc, WMO_CODES[0])
 
+    # Per-day seed for deterministic phrasing variety: stable for a given day,
+    # varied across days (no forecast-JSON churn). See narrative_variants.py.
+    _seed = (f"{ms}{as_}{es}|{round(cloud_day_avg)}|{round(total_precip, 1)}"
+             f"|{round(max_wind)}|{round(temp_max) if temp_max is not None else 0}")
+
     parts = []
 
     if has_snow:
@@ -6355,28 +6363,31 @@ def _daily_narrative(grp):
                 'mostly_cloudy': 'Pretežno oblačno, malo sunca',
                 'cloudy': 'Oblačno tokom cijelog dana bez padavina',
             }
-            parts.append(sky_labels.get(ms, 'Promjenljivo'))
+            if ms == 'partly_cloudy':
+                parts.append(nv.variant("partly_steady", _seed))
+            else:
+                parts.append(sky_labels.get(ms, 'Promjenljivo'))
         elif ms in ('clear', 'mostly_clear') and as_ in ('mostly_cloudy', 'cloudy'):
-            parts.append("Sunčano prije podne, oblaci od podneva")
+            parts.append(nv.variant("sun_to_cloud", _seed))
         elif ms in ('mostly_cloudy', 'cloudy') and as_ in ('clear', 'mostly_clear'):
-            parts.append("Oblačno prije podne, sunce od podneva")
+            parts.append(nv.variant("cloud_to_sun", _seed))
         elif ms in ('clear', 'mostly_clear') and as_ == 'partly_cloudy':
-            parts.append("Sunčano sa ponešto oblaka od podneva")
+            parts.append(nv.variant("sun_to_partly", _seed))
         elif ms == 'partly_cloudy' and as_ in ('clear', 'mostly_clear'):
-            parts.append("Više oblaka prijepodna, sunčano od podneva")
+            parts.append(nv.variant("partly_to_sun", _seed))
         elif ms == 'partly_cloudy' and as_ in ('mostly_cloudy', 'cloudy'):
-            parts.append("Sve oblačnije kako dan odmiče")
+            parts.append(nv.variant("increasing_cloud", _seed))
         elif ms in ('mostly_cloudy', 'cloudy') and as_ == 'partly_cloudy':
-            parts.append("Oblačno prijepodne, ponešto sunca od podneva")
+            parts.append(nv.variant("cloud_to_partly", _seed))
         else:
-            parts.append("Promjenljivo oblačno")
+            parts.append(nv.variant("variable", _seed))
 
         if es != 'unknown' and len(parts) > 0:
             curr_end = as_ if as_ != 'unknown' else ms
             if curr_end in ('clear', 'mostly_clear') and es in ('mostly_cloudy', 'cloudy'):
-                parts[0] += ". Oblaci predveče"
+                parts[0] += nv.variant("eve_clouding", _seed)
             elif curr_end in ('mostly_cloudy', 'cloudy') and es in ('clear', 'mostly_clear'):
-                parts[0] += ". Vedrije predveče"
+                parts[0] += nv.variant("eve_clearing", _seed)
 
     wind_part = ""
     if max_wind >= 10:
@@ -6503,8 +6514,16 @@ def _build_daily_summary(date_str, day_name, grp_df, fc_raw=None):
 # ---------------------------------------------------------------------------
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
 
+# Factual-only narratives: Gemini REPHRASES the rule-based sentence (never
+# generates from the table) behind a deterministic guardrail + fallback. See
+# gemini_narrative.py.
+import gemini_narrative
+
 def _gemini_narrative(date_str, hourly_rows):
-    """Call Gemini to generate a short weather narrative from hourly data."""
+    """DEPRECATED (no longer called): generated the narrative FROM the hourly
+    table, which hallucinates phantom rain/wind/thunder. Replaced by
+    gemini_narrative.daily_narrative_ai(), which REPHRASES the rule-based
+    sentence behind a deterministic guardrail. Kept only for reference."""
     if not GEMINI_API_KEY or not hourly_rows:
         return None
     lines = []
@@ -6559,7 +6578,8 @@ def _gemini_narrative(date_str, hourly_rows):
 
 
 def _gemini_narrative_daily(date_str, ds):
-    """Call Gemini for long-range days that lack hourly data."""
+    """DEPRECATED (no longer called): see _gemini_narrative. Replaced by the
+    rephrase-and-validate path in gemini_narrative.daily_narrative_ai()."""
     if not GEMINI_API_KEY:
         return None
     tmin = ds.get('temp_min', '?')
@@ -6628,36 +6648,34 @@ def _enrich_narratives_with_ai(daily_list, hourly_data):
             hourly_by_date[d] = []
         hourly_by_date[d].append(h)
 
-    count = 0
+    cached = 0      # served from cache
+    applied = 0     # AI rephrase accepted by the guardrail
     api_calls = 0
     for ds in daily_list:
         date_str = ds.get('date', '')
+        base = ds.get('day_narrative')          # the rule-based correct sentence
+        if not base:
+            continue
         rows = hourly_by_date.get(date_str, [])
-        rows.sort(key=lambda r: r.get('hour', 0))
         has_hourly = len(rows) >= 8
 
-        # Cache strategy: only use cache for long-range days (no hourly available).
-        # Hourly-covered days are ALWAYS regenerated so the narrative reflects the
-        # latest forecast — and because earlier-cached entries may have been
-        # generated when this date was still long-range (Gemini hallucinates timing
-        # without hourly data). Cost: a few extra API calls per run, worth it.
+        # Cache strategy: only cache long-range days (no hourly). Hourly-covered
+        # days are ALWAYS re-rephrased so the wording tracks the latest forecast.
         if not has_hourly and date_str in cache:
             ds['day_narrative'] = cache[date_str]
-            count += 1
+            cached += 1
             continue
 
-        if has_hourly:
-            narrative = _gemini_narrative(date_str, rows)
-        else:
-            narrative = _gemini_narrative_daily(date_str, ds)
+        # REPHRASE the already-correct sentence (never generate from the table),
+        # validated by the deterministic guardrail; on any failure this returns
+        # `base` unchanged, so a phantom can never reach the output.
+        new = gemini_narrative.daily_narrative_ai(base, ds)
         api_calls += 1
-        if narrative:
-            ds['day_narrative'] = narrative
-            # Cache only daily-sourced narratives (long-range stable).
-            # Hourly-sourced ones change with each run so caching them is wasteful.
+        if new and new != base:
+            ds['day_narrative'] = new
+            applied += 1
             if not has_hourly:
-                cache[date_str] = narrative
-            count += 1
+                cache[date_str] = new
         if api_calls < len(daily_list):
             time.sleep(12)
 
@@ -6671,7 +6689,9 @@ def _enrich_narratives_with_ai(daily_list, hourly_data):
         except Exception:
             pass
 
-    print(f"  [Gemini] Generisano {count}/{len(daily_list)} AI opisa ({api_calls} API poziva, {count - api_calls} iz keša).")
+    print(f"  [Gemini] Preformulisano {applied}/{len(daily_list)} opisa "
+          f"({api_calls} API poziva, {cached} iz keša, "
+          f"{api_calls - applied} fallback na pravilo-bazirani opis).")
 
 
 def generate_output(corrected, trained, results, fc_raw=None, marine=None, onset=None):

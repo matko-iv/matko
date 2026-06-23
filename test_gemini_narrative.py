@@ -1,0 +1,146 @@
+"""Tests for gemini_narrative.py — the deterministic guardrail that keeps Gemini
+factual (PDF: rephrase-and-validate). The guardrail is the ACTUAL guarantee: it
+hard-gates the zero-tolerance phantoms (kiša/pljusak, grmljavina, snijeg, magla)
+against the structured daily summary `ds`, and any failure falls back to the
+rule-based sentence. Sky/wind descriptors are lenient so faithful rephrases like
+"Sunčano ujutru, kiša od podneva" are not false-rejected.
+
+Run from repo root:  python test_gemini_narrative.py   (exit 0 = pass)
+"""
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+
+import gemini_narrative as gn  # noqa: E402
+
+DRY = {"precip_total": 0.0, "weather_code": 1, "wind_max": 2.0,
+       "gust_max": 4.0, "cloud_cover_day": 30}
+RAINY = {"precip_total": 5.0, "weather_code": 63, "wind_max": 4.0,
+         "gust_max": 7.0, "cloud_cover_day": 80}
+
+
+def test_rejects_phantom_rain():
+    assert gn.validate("Kiša poslije podne", DRY) is False
+
+
+def test_accepts_supported_rain():
+    assert gn.validate("Povremena kiša tokom dana", RAINY) is True
+
+
+def test_rejects_phantom_thunder():
+    assert gn.validate("Grmljavina predveče", DRY) is False
+
+
+def test_accepts_supported_thunder():
+    assert gn.validate("Grmljavina od podneva", {"precip_total": 8.0,
+                       "weather_code": 95, "wind_max": 5, "gust_max": 9}) is True
+
+
+def test_rejects_phantom_snow():
+    assert gn.validate("Snijeg ujutru", DRY) is False
+
+
+def test_accepts_supported_snow():
+    assert gn.validate("Snijeg tokom dana", {"precip_total": 4.0,
+                       "weather_code": 73, "wind_max": 3, "gust_max": 6}) is True
+
+
+def test_rejects_phantom_fog():
+    assert gn.validate("Magla ujutru", DRY) is False
+
+
+def test_accepts_supported_fog():
+    assert gn.validate("Magla ujutru, sunčano od podneva",
+                       {"precip_total": 0.0, "weather_code": 45,
+                        "wind_max": 2, "gust_max": 3, "cloud_cover_day": 20}) is True
+
+
+def test_lenient_sun_plus_rain_not_false_rejected():
+    # The rule-based sentence legitimately combines sun + rain across periods;
+    # rain is supported by data, sun is a lenient descriptor -> must pass.
+    ds = {"precip_total": 3.0, "weather_code": 61, "wind_max": 4,
+          "gust_max": 7, "cloud_cover_day": 45}
+    assert gn.validate("Sunčano ujutru, kiša od podneva", ds) is True
+
+
+def test_rejects_phantom_strong_wind():
+    assert gn.validate("Jak vjetar tokom dana", DRY) is False
+
+
+def test_accepts_supported_strong_wind():
+    assert gn.validate("Jak vjetar tokom dana", {"precip_total": 0.0,
+                       "weather_code": 1, "wind_max": 12.0, "gust_max": 18.0,
+                       "cloud_cover_day": 30}) is True
+
+
+def test_bare_light_wind_is_lenient():
+    assert gn.validate("Pretežno vedro uz umjeren vjetar",
+                       {"precip_total": 0.0, "weather_code": 1, "wind_max": 6.0,
+                        "gust_max": 9.0, "cloud_cover_day": 40}) is True
+
+
+def test_long_faithful_rephrase_not_rejected_by_length():
+    # Complex days give long rule-based sentences; a faithful ~17-word rephrase
+    # (rain + strong NW wind + gusts, all supported) must NOT be length-rejected.
+    ds = {"precip_total": 3.5, "weather_code": 61, "wind_max": 11.0,
+          "gust_max": 18.0, "cloud_cover_day": 50}
+    text = ("Jača kiša prijepodne, suvo i vedrije od podneva, uz jak "
+            "sjeverozapadni vjetar i udare do osamnaest metara")
+    assert gn.validate(text, ds) is True
+
+
+def test_strong_wind_with_direction_infix_is_gated():
+    # "jak <smjer> vjetar" must still be treated as a strong-wind claim.
+    assert gn.validate("Jak sjeverozapadni vjetar tokom dana", DRY) is False
+
+
+def test_length_and_sanity():
+    assert gn.validate("a", DRY) is False                      # too short
+    assert gn.validate(" ".join(["riječ"] * 25), DRY) is False  # rambling (>22)
+
+
+def test_daily_narrative_ai_keeps_valid_rephrase(monkeypatch=None):
+    gn.rephrase = lambda s: "Tokom dana povremena kiša"          # valid paraphrase
+    out = gn.daily_narrative_ai("Povremena kiša", RAINY)
+    assert out == "Tokom dana povremena kiša", out
+
+
+def test_daily_narrative_ai_falls_back_on_phantom():
+    gn.rephrase = lambda s: "Sunčano, ali grmljavina uveče"      # phantom thunder
+    out = gn.daily_narrative_ai("Pretežno vedro", DRY)
+    assert out == "Pretežno vedro", out                         # fell back
+
+
+def test_daily_narrative_ai_falls_back_on_api_failure():
+    gn.rephrase = lambda s: None                                # API returned nothing
+    out = gn.daily_narrative_ai("Pretežno vedro", DRY)
+    assert out == "Pretežno vedro", out
+
+
+def main():
+    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+    fails = []
+    for fn in fns:
+        # restore the real rephrase between tests that monkeypatch it
+        import importlib
+        importlib.reload(gn)
+        try:
+            fn()
+            print(f"PASS  {fn.__name__}")
+        except AssertionError as e:
+            fails.append(f"{fn.__name__}: {e}")
+            print(f"FAIL  {fn.__name__}: {e}")
+        except Exception as e:
+            fails.append(f"{fn.__name__}: {type(e).__name__}: {e}")
+            print(f"ERROR {fn.__name__}: {type(e).__name__}: {e}")
+    if fails:
+        print(f"\n{len(fails)} failure(s).")
+        return 1
+    print("\nPASS — Gemini rephrase-and-validate guardrail OK.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
