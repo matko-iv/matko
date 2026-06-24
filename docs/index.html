@@ -25,9 +25,11 @@
             padding: 0;
             box-sizing: border-box;
         }
+		
+		@import url('https://fonts.cdnfonts.com/css/liberation-sans');
 
         body {
-            font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+            font-family: 'Liberation Sans';
             font-weight: 400;
             font-size: 18px;
             line-height: 1.6;
@@ -319,12 +321,39 @@
         </nav>
     </div>
 
-    <p class="date">Jun 2026, ažurirano nakon prelaska na probabilistički sistem (kvantili + konformna kalibracija), proširene podatke i radarski nowcast</p>
-    <h1>Tačnije vremenske prognoze za Budvu</h1>
+    <p class="date">24. Juna 2026.</h1>
 
     <div class="note blue">
         Korigovana prognoza za narednih 48 sati, satni detalji i grafovi su dostupni na <a href="forecast.html"><strong>stranici za live prognozu</strong></a>.
     </div>
+	
+	<h2>Poruka autora i šta treba imati na umu</h2>
+
+    <p>Iako je <a href="forecast.html">ovo</a> legitimno i provjereno najtačniji vremenski izvještaj za Budvu (a čiji je kod primjenjiv i na drugim lokacijama), postoje nedoumice o samom značenju ove rečenice. Treba imati na umu da postoje limitacije u ovom pristupu.<br><b>Naime, ovaj projekat NIJE zamjena za visoko-rezolucijski regionalni (ili pak državni) model. On je korekcija kontinuiranih grešaka koje regionalni i kontinentalni modeli prave za datu lokaciju. Ali postoje tri glavna problema:</b><br>
+	<h3>Problem iz programskog ugla</h3>
+	<p>Kada interfejsi mašinskog učenja, uprkos velikom setu podataka, NE MOGU uočiti grešku koju model napravi, prilikom uzorkovanja naspram <u>stvarnog</u>, osmotrenog mjerenja na stanici, onda ni korigovana prognoza kao rezultat ne može ispraviti tu grešku, koja se može ponoviti u budućnosti. Modeli mašinskog učenja ponekad propuštaju vremenske obrasce jer im prvenstveno nedostaje inherentno razumijevanje fizičkih atmosferskih zakona. Zbog toga izglađuju ili pogrešno izračunavaju neke događaje. Atmosfera je haotični medijum, što znači da brze promjene i neosmotreni parametri kontinuirano dovode do grešaka koje modeli bazirani na stablu odlučivanja ne mogu očekivati ili ispraviti.</p>
+	
+	
+	<h3>Problem sa aspekta nepovjerljivosti ulaznog signala</h3>
+	<p>Drugi problem se odnosi na lokalne konvektivne događaje poput kratkotrajnih pljuskova, nasumičnih udara vjetra, i oblačnosti koje ukupno mogu zauzeti samo nekoliko kvadratnih kilometara površine. Ovakvi događaji rijetko se mogu naći na prognozama velikih modela. Upravo u ovim događajima, kada ovaj podatak NE UĐE u prognozu, te se sam vremenski fenomen koji je u pitanju "parametarizuje", onda ni program nema šta da koriguje, te NE MOŽE upozoriti na ovakav neki događaj. Jer ako ne postoji ulazni signal, na izlazu ne može biti signal. Ovo se dijelom rješava radarskim nowcast-ing sistemom, ali on primarno funkcionira u domenu do 45min (viši prag do 2 sata ali validnost izvještaja opada znatno, \( M(t) = M_0 e^{-\frac{t}{\tau}} \), gdje je \(\tau\) tau atmosferska vremenska konstanta disipacije). Empirijska vrijednost atmosferskog tau je otprilike 5 do 8 minuta. Zbog toga što je ova formula samo gruba aproksimacija NESTAJANJA ćelije, ne može se koristiti za duži interval od samog trajanja disipacije. Same prilike u atmosferi za ovo neko grubo razdoblje se mogu znatno promijeniti i favorizovati stvaranje novih ćelija.</p>
+	
+	
+	<h3>Problem sa aspekta kreiranja pouzdanog signala za kišu</h3>
+	<p>Prventsveno u ljetnjim mjesecima dolazi do izražaja nepovjerljivosti velikih modela, prije svega za tačnu aproksimaciju padavina i nestabilnosti u atmosferi. Zbog ovoga, potrebno je kreirati pouzdan signal koji će se aktivirati samo tada kada su uslovi idealni za početak vremenskog događaja. Za ovo je potrebna još jedna aproksimacija.<br>\( S_{\text{onset}} = \alpha \left( \frac{\Delta P}{\Delta t} \right) + \beta (\Delta H) + \gamma (R_t) \) predstavlja prvi dio signala koji će aktivirati kišu u izvještaju. Sastoji se od više parametara, čiji ukupni zbroj, kada prevagne svoj namješteni prag, otvara gejt za drugi dio signala. Sastoji se od težinskih koeficijenata, promjene u pritisku relativno vremenu, promjene u relativnoj vlažnosti zraka, te prvom procijenjenom intezitetu kiše koji ulazi u sklop signala. Drugi dio signala je veliki model najveće rezolucije, koji je u ovom slučaju ICON2I od talijanske meteorološke službe. On je izabran prvenstveno zbog njegove visoke rezolucije naspram većine drugih javno dostupnih modela. Bez obzira na ovo i on sadrži mane, koje se najčešće manifestuju u pretjeranom deklarisanju padavina tokom ljetnjih i jesenjih mjeseci.</p>
+	
+	<h3>Težina problema šuma u signalu i nadovezivanje na prethodna dva problema</h3>
+	<p>Nadovezujem se na prethodne probleme koji ulaze u temu šuma signala. Dakle, u svim veliko-modelskim ansamblima postoji šum, koji u određenim situacijama, može kompromitovati glavni ulazni signal. Posljedica ovoga je netačna evaluacija vremenskih prilika. Ovo se tehnički može događati vrlo često, što je pokazala i praksa. Dovoljan udio šuma u ulazni signal kompromituje sam izlazni signal, jer modeli sa stablima odlučivanja nemaju funkcionalnost provjeravanja legitimiteta ulaznog signala. U haotičnim sistemima, ako je evolucija atmosfere definisana nelinearnim dinamičkim sistemom \(\frac{dx}{dt} = f(x)\), male perturbacije šuma u početnom signalu \(\delta x_0\) evoluiraju tokom vremena prema sledećoj jednačini: \[ \frac{d(\delta x)}{dt} = \mathbf{J}(x(t)) \cdot \delta x(t) + \eta(t) \] 
+	<ul>
+        <li>\(\delta x(t)\) — Rast šuma/greške tokom vremena.</li>
+        <li>\(\mathbf{J}(x(t))\) — Jakobijeva matrica (lokalna osetljivost jednačina atmosferskog sistema).</li>
+        <li>\(\eta(t)\) — Kontinuirani šum fizike modela (stohastička parametrizacija).</li>
+    </ul>
+
+    Pošto Jakobijeva matrica \(\mathbf{J}(x(t))\) u haotičnom sistemu ima pozitivne sopstvene vrijednosti, početni šum \(\delta x_0\) raste eksponencijalno kao \( e^{\lambda t} \). Šum se proizvodi na svako pogrešno mjerenje početnog parametra, prije pokretanja dotičnog velikog modela. Osim ovoga, mapiranje nepravilno raspoređenih podataka iz stvarnog svijeta na krutu matematičku mrežu se takođe pokazalo kao faktor uvođenja šuma. Kao što je prije navedeno, vremenski procesi koji su površinski manji ili čiji je koeficijent uticaja u fizičkim simulacijama atmosfere manji od postavljenog praga, dovodi do "parametarizacije" odnosno gubitka ovog podatka u signalu modela, te se može interpretirati kao šum ulaznog signala.<br>Elem, da remiziramo, nepravilan ulazni podatak, parametarizacija i gubitak težinski nebitnog fenomena, nepravilno mapiranje ulaznog podatka, a i niz drugih razloga, dovodi do nepoželjnog rasta (vrlo često i eksponencijalnog) magnitude šuma ulaznog signala modela za korigovanje (ovaj projekt).</p>
+	
+	<p><b>Cilj je kontinuirano poboljšavati tačnost podataka koje vi, posjetioci, vidite na ovoj stranici, ali prije svega potrebno je razumjeti taj cilj ali i limitacije u ostvarivanju tog cilja. U najvećem interesu mi je da ostanem transparentan tokom čitavog procesa, jer je bitno razumjeti koliko se možete oslanjati na sav sadržaj ove stranice.</b> Ukoliko ste razumjeli poruku autora o limitacijama projekta, možete nastaviti sa razumijevanjem njegovog načina rada:</p>
+	
+	<h2>Uvod</h2>
 
     <p>Ovo je lokalni sistem za korekciju vremenske prognoze za Budvu. Ne pokušavam da zamijenim ECMWF, GFS, ICON ili regionalne modele. Ideja je drugačija: uzeti njihove prognoze, uporediti ih sa stvarnim mjerenjima u Budvi, naučiti gdje sistematski griješe, pa napraviti korekciju za jednu konkretnu lokaciju.</p>
 
@@ -332,17 +361,16 @@
 
     <p>Sistem koristi 10 modela, mjerenja sa Weather Underground stanice IBUDVA5, šest godina istorijskih podataka (2020-2026), bias tabele, Day1/Day2 forecasts iz prethodnih runs, temperaturu mora i kombinaciju XGBoost + CatBoost + LightGBM korekcije. Rezultat se zapisuje u <code>forecast_48h.json</code>, a sajt ga prikazuje kao live prognozu.</p>
 
-    <p>Tokom 2026. sistem je dosta proširen po preporukama jedne naučne monografije o naknadnom procesiranju NWP prognoza. Najvažnije promjene: prešao je sa <strong>tačkastih</strong> na <strong>probabilističke</strong> prognoze (pune kvantilne trake p05–p95 sa konformnom kalibracijom umjesto samo jednog broja), dodao <strong>komšijske 5×5 padavinske mreže</strong> i <strong>prekodinaridski gradijent pritiska</strong> (za buru), uveo <strong>lead-time</strong> kao feature, i počeo da blenduje <strong>radarski nowcast</strong> sa NWP-om za prvih 6 sati. Sve mjereno rigoroznije — rolling-origin evaluacijom sa Diebold-Mariano testom umjesto jednog splita.</p>
+    <p>Tokom 2026. sistem je dosta proširen po preporukama jedne naučne monografije o naknadnom procesiranju NWP prognoza. Najvažnije promjene: prešao je sa <strong>tačkastih</strong> na <strong>probabilističke</strong> prognoze (pune kvantilne trake p05–p95 sa konformnom kalibracijom umjesto samo jednog broja), dodao <strong>komšijske 5×5 padavinske mreže</strong> i <strong>prekodinaridski gradijent pritiska</strong> (za buru), uveo <strong>lead-time</strong> kao feature, i počeo da blenduje <strong>radarski nowcast</strong> sa NWP-om za prvih 2 sata.</p>
 
     <h2>Šta se zapravo radi</h2>
 
-    <p>Svaki run prolazi kroz isti tok: preuzimanje prognoza, spajanje modela, kreiranje feature-a, primjena korekcionih modela i izvoz rezultata za sajt. Sve se radi u lokalnom vremenu <code>Europe/Podgorica</code>. Bez toga se lako desi da gledaš 17:00 u UTC, a misliš da gledaš 17:00 u Budvi.</p>
+    <p>Svaki run prolazi kroz isti tok: preuzimanje prognoza, spajanje modela, kreiranje feature-a, primjena korekcionih modela i izvoz rezultata za sajt.</p>
 
     <ol>
         <li>Open-Meteo se poziva za 10 modela na koordinatama Budve: 42.2864, 18.84.</li>
         <li>Za 8 od njih se dohvataju i Previous Runs — Day1 i Day2 forecasts iz prethodnih ciklusa.</li>
-        <li>Za 5 modela se dohvata i <strong>komšijska 5×5 mreža padavina</strong> (25 tačaka oko Budve, ~12 km razmak), plus pritisak iznad <strong>Podgorice</strong> (druga strana Lovćena) — za buru.</li>
-        <li>Svi satni podaci se poravnavaju u <code>Europe/Podgorica</code> vremenu (harmonike sat/dan se računaju u UTC-u da DST prelazi ne pomjere dnevnu fazu).</li>
+        <li>Za 5 modela se dohvata i <strong>komšijska 5×5 mreža padavina</strong> (25 tačaka oko Budve, ~12 km razmak)</li>
         <li>Računaju se ansambl statistike: prosjek, p25, p75, raspon, standardna devijacija i agreement.</li>
         <li>Iz istorije se prave bias tabele po satu, mjesecu i sezoni za svaki model i parametar.</li>
         <li>Dodaju se lokalni feature-i: mjesec, sat, sezona, SST, lead-time, prekodinaridski gradijent, gust faktor, komšijske padavinske statistike, cirkulacioni režimi (bura/maestral), cross-parameter signali i tendency-ji.</li>
@@ -727,10 +755,6 @@
         <img src="images/08_bias_heatmap.png" alt="Heatmap sezonskog biasa">
         <img src="images/13_overall_ranking.png" alt="Ukupno rangiranje modela">
     </details>
-
-    <h2>Zaključak</h2>
-
-    <p>Najbolja prognoza za Budvu ne dolazi iz slijepog vjerovanja jednom modelu. Dolazi iz mjerenja, poređenja, učenja grešaka i stalnog provjeravanja. Modeli daju fiziku atmosfere; lokalna stanica daje istinu na terenu; gradient boosting povezuje jedno i drugo, a trusted gate sprječava da entuzijazam o ML-u napravi lažne alarme za kišu.</p>
 
     <p>Produkcijska verzija je dostupna na <a href="forecast.html"><strong>live prognozi</strong></a>. Kod je otvoren na <a href="https://github.com/matko-iv/vrijeme" target="_blank" rel="noreferrer">GitHubu</a>.</p>
 

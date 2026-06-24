@@ -15,9 +15,11 @@
             padding: 0;
             box-sizing: border-box;
         }
+		
+		@import url('https://fonts.cdnfonts.com/css/liberation-sans');
 
         body {
-            font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+            font-family: 'Liberation Sans';
             font-weight: 400;
             font-size: 18px;
             line-height: 1.6;
@@ -910,13 +912,14 @@
     <h1>Matkov model v4</h1>
 	
 	<p>
-        Četvrta verzija modela objavljena je 16. juna 2026. godine. Mogućnosti ove verzije prevazilaze sve dosadašnje iteracije. Ona donosi prelazak sa tačkastih na pune probabilističke prognoze i statistički značajno nadmašuje i sirovi ansambl i EMOS, pa i starije verzije samog modela na svih devet parametara — prednost koja raste što je vremenska situacija lokalnija i složenija.
+        Dobro došli! Ovo je zvanična stranica live prognoze za Budvu koju sam razvio. Prije svega bitno je pročitati <a href="index.html">poruku autora</a> o limitacijama sistema. Nakon toga, dolje možete pronaći live prognozu za Budvu.
     </p>
 
     <p>
         Obavještenje za vremenske prilike za ljeto 2026: ovo ljeto će vjerovatno biti <b>drugo najtoplije ljeto</b> od kad se mjeri u Budvi. Dokument koji detaljnije objašnjava trend vremenskih prilika za ovogodišnju ljetnju turističku sezonu možete otvoriti klikom <a href="14_V_MMXXVI.pdf">ovđe</a>. <span style="font-size: 12px;font-style: italic;color:#6a737d; margin: 0 0 0;">Pošljednja izmjena: 15.5.2026.</span>
     </p>
-
+	
+	<p><span style="font-size: 12px;font-style: italic;color:#6a737d; margin: 0 0 0;">Matkov model verzija 4 najnovija je verzija ovog modela i objavljena je 16. juna 2026. godine.</span></p>
     <div class="generated-time" id="genTime"></div>
 	
 	<p>
@@ -1065,49 +1068,11 @@ function gateWeatherCode(code, cloud, offset, rs) {
     return isRainCode(code) ? cloudToCode(cloud) : code;   // radar dry -> strip model rain
 }
 
-// ---- SKALA satellite (cloud) gating of the near-term SKY icon ----
-// cloudState is populated by refreshCloud(); null/stale = no gating (trust model).
-let cloudState = null;
-// Satellite frames are inherently ~20-35 min old (dissemination latency), so the
-// freshness window is wider than the radar's — otherwise the icon gate would
-// flicker off every time latency nudged past 40 min.
-function cloudFresh(cs) { return !!(cs && cs.ok && cs.ageMin != null && cs.ageMin <= 60); }
-
-// SKALA CLOUD verdict state -> WMO cloud code (0 vedro · 1 pretežno vedro ·
-// 2 djelimično oblačno · 3 oblačno). Thin cirrus that lets the sun through reads
-// as "pretežno vedro", not "oblačno" — the satellite module's whole point.
-function cloudStateToCode(cs) {
-    const thin = !!(cs && cs.facts && cs.facts.thinVeil);
-    switch (cs && cs.state) {
-        case 'OVERCAST': return 3;
-        case 'PARTLY':   return thin ? 1 : 2;
-        case 'CLEARING': return 2;
-        case 'CLOUDS_APPROACHING': return thin ? 1 : 0;    // clear NOW; clouds later
-        case 'CLEAR':    return thin ? 1 : 0;
-        default:         return null;
-    }
-}
-
-// Reconcile an (already radar-gated) code with the satellite sky. Rain/thunder
-// always win (the satellite can't see rain); only clear/cloud codes are touched.
-// Current hour (offset 0) = the OBSERVED sky; next hour gets only a gentle nudge.
-function gateCloudCode(code, offset, cs) {
-    if (!cloudFresh(cs)) return code;
-    if (isRainCode(code) || code >= 95) return code;
-    const observed = cloudStateToCode(cs);
-    if (observed == null) return code;
-    if (offset === 0) return observed;
-    if (offset === 1) {
-        if (cs.state === 'CLOUDS_APPROACHING') return Math.max(code, 2);
-        if (cs.state === 'CLEARING') return Math.min(code, 2);
-    }
-    return code;
-}
-
-// Combined near-term gate: radar first (rain), then satellite (sky). Reads the
-// module globals radarState + cloudState.
+// Near-term gate: SKALA RAIN (radar) only. The SKALA CLOUD satellite module was
+// removed from forecast.html — its frames ran stale/misleading. (The SKALA CLOUD
+// page itself still lives in the budva-radar repo.)
 function gatedCode(code, cloud, offset) {
-    return gateCloudCode(gateWeatherCode(code, cloud, offset, radarState), offset, cloudState);
+    return gateWeatherCode(code, cloud, offset, radarState);
 }
 
 // Re-skin the current-weather icon + the current/next hourly cells after a refresh.
@@ -2361,11 +2326,10 @@ async function loadForecast() {
         forecastData = await resp.json();
         // Populate radar + satellite state before first paint so near-term icons
         // are gated immediately. Cap the wait so a slow source never blocks render.
-        await Promise.race([Promise.all([refreshRadar(), refreshCloud()]),
+        await Promise.race([refreshRadar(),
                             new Promise(r => setTimeout(r, 2500))]);
         render(forecastData);
         renderRadarStatusLine(radarState);
-        renderCloudStatusLine(cloudState);
         applyRadarGating();
     } catch(e) {
         document.getElementById('app').innerHTML =
@@ -2441,10 +2405,6 @@ function render(data) {
     });
     html += '</div>';
 
-    html += `<div style="margin-bottom:20px; margin-top:40px"><p>
-        Vrijednosti padavina, brzine vjetra i udara vjetra na mojoj platformi odnose se na naredni sat, pa za 12:00 = 1.5 mm znači da će 1.5 mm pasti između 12:00 i 13:00. Open-Meteo, platforma odakle dobijam sirove podatke (prije nego se koriguju) bilježi akumulaciju do kraja sata (za 12h govori koliko će pasti između 11:00 i 12:00), ali ovdje smo pomjerili unaprijed da prikaz bude intuitivniji, pa sat koji vidiš pokazuje šta dolazi, ne šta je bilo.
-    </p></div>`;
-
     const now = new Date();
     const currentHour = now.getHours();
     const currentData = data.hourly_forecast.find(h => h.hour === currentHour) || data.hourly_forecast[0];
@@ -2484,12 +2444,6 @@ function render(data) {
         }
 
         html += `
-        <p>
-            Kišu predviđamo u dva koraka: XGBoost model na osnovu svih ulaznih modela procjenjuje da li je kiša moguća (oznaka „Moguće"). Da li zaista pada potvrđuje SKALA sistem interpretacije. Zato ikonica za tekući i naredni sat prati radar: ako radar ne vidi kišu, prikazujemo stvarno stanje neba, a ne model. Kad kiša stvarno krene, ikonica se mijenja u odgovarajuću kišnu. Isto vrijedi i za nebo: SKALA sateliti (oblačnost/sunce) koriguju ikonicu tekućeg sata prema stvarno osmotrenom stanju.
-        </p>
-        <p>
-            Napomena: SKALA koriguje prikaz UŽIVO samo za tekući i naredni sat. Ta očitanja se ne arhiviraju u prognozu. Kad sat prođe, za taj prošli sat se vraćamo na čisto rješenje NWP modela. Zato prošli sati pokazuju model, a ne ono što je SKALA pokazivala uživo, pa se mogu razlikovati od stvarnih dešavanja.
-        </p>
         <div class="${cwClass}">
             <div class="cw-icon" id="cwIconBox" data-code="${currentData.weather_code}" data-cloud="${currentData.cloud_cover != null ? currentData.cloud_cover : ''}" data-hour="${currentData.hour}">${weatherIcon(cwIcon, 96)}</div>
             <div class="cw-main">
@@ -2511,7 +2465,6 @@ function render(data) {
                     })()}
                 </div>
                 <div id="radarStatusLine" class="cw-radar-line" style="margin-top:10px;padding-top:10px;border-top:1px solid rgba(0,0,0,0.08);font-size:14px;color:#555">Radar: ucitavam...</div>
-                <div id="cloudStatusLine" class="cw-cloud-line" style="margin-top:6px;font-size:14px;color:#555">Sateliti: ucitavam...</div>
             </div>
         </div>`;
     }
@@ -3239,83 +3192,8 @@ function renderRadarStatusLine(state) {
     }
 }
 
-// ============================================================================
-// SKALA CLOUD (satellite) status integration — mirrors the radar block above.
-// The same budva-radar repo publishes cloud_status.json; we render its canonical
-// verdict line (summary.cloud_verdict.line_sr) next to the radar line and gate
-// the near-term sky icon (gateCloudCode / gatedCode).
-// ============================================================================
-const CLOUD_STATUS_URLS = [
-    'cloud_status.json',
-    'https://matko-iv.github.io/budva-radar/cloud_status.json',
-];
-
-async function fetchCloudData() {
-    for (const url of CLOUD_STATUS_URLS) {
-        try {
-            const resp = await fetch(url + '?v=' + Date.now(), { cache: 'no-store' });
-            if (!resp.ok) throw new Error('HTTP ' + resp.status);
-            return await resp.json();
-        } catch (e) { /* try next url */ }
-    }
-    return null;
-}
-
-// Parse cloud JSON into the compact state used by the status line + icon gating.
-// Prefers the KANONSKI verdict precomputed by the budva-radar pipeline
-// (clouds/verdict.py), rendered verbatim on every surface so pages never disagree.
-function parseCloudState(data) {
-    const verdict = ((data && data.summary) || {}).cloud_verdict || null;
-    const facts = (verdict && verdict.facts) || (data && data.facts) || null;
-    // Age = age of the SATELLITE SNAPSHOT (sensing_time), not when the pipeline
-    // ran. The GeoColour/L2 frame is inherently ~20-35 min old (EUMETSAT
-    // dissemination latency), so that is the honest "podatak star N min".
-    const src = (data && data.source) || {};
-    const stamp = src.sensing_time || (data && data.generated);
-    let ageMin = null;
-    if (stamp) ageMin = Math.round((Date.now() - new Date(stamp).getTime()) / 60000);
-    return { ok: !!(verdict || facts), verdict, state: verdict ? verdict.state : null, facts, ageMin };
-}
-
-async function refreshCloud() {
-    const data = await fetchCloudData();
-    cloudState = data ? parseCloudState(data) : null;
-    renderCloudStatusLine(cloudState);
-    applyRadarGating();   // re-skin icons with the combined radar+satellite gate
-}
-
-function renderCloudStatusLine(state) {
-    const el = document.getElementById('cloudStatusLine');
-    if (!el) return;
-    const LINK = '<a href="https://matko-iv.github.io/budva-radar/cloud-map.html">Sateliti</a>: ';
-    if (!state || !state.ok) {
-        el.style.color = '#777';
-        el.style.fontWeight = '400';
-        el.innerHTML = LINK + 'nedostupno';
-        return;
-    }
-    const age = state.ageMin != null ? ' · podatak star ' + state.ageMin + ' min' : '';
-    // KANONSKI verdikt (line_sr/bold/color/weight) — ista rečenica kao na
-    // budva-radar cloud-map.html, samo kraći format.
-    const v = state.verdict;
-    if (v && v.line_sr) {
-        el.style.color = v.color_sr || '#777';
-        el.style.fontWeight = String(v.weight_sr || 400);
-        let line = v.line_sr;
-        if (v.line_sr_bold && line.indexOf(v.line_sr_bold) !== -1) {
-            line = line.replace(v.line_sr_bold, '<b>' + v.line_sr_bold + '</b>');
-        }
-        el.innerHTML = LINK + line + age;
-        return;
-    }
-    el.style.color = '#777';
-    el.style.fontWeight = '400';
-    el.innerHTML = LINK + 'nema podataka';
-}
-
-// Radar + sateliti se osvježavaju svake 2 min; inicijalno gejtovanje radi loadForecast().
+// Radar se osvježava svake 2 min; inicijalno gejtovanje radi loadForecast().
 setInterval(refreshRadar, 120000);
-setInterval(refreshCloud, 120000);
 </script>
 
 </body>
