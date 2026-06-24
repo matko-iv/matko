@@ -51,6 +51,17 @@ def test_dry_pools_contain_no_phantom_phenomena():
                 assert p not in low, f"{key}: phantom '{p}' in {phrase!r}"
 
 
+def test_rain_pools_all_mention_rain():
+    # Rain-branch phrasings must mention rain (kiša / padavine), so they stay
+    # faithful when the rule-based code reaches them (precip is present).
+    for key, pool in nv.VARIANTS.items():
+        if not key.startswith("rain_"):
+            continue
+        for phrase in pool:
+            low = phrase.lower()
+            assert ("kiš" in low or "padav" in low), f"{key}: no rain word in {phrase!r}"
+
+
 def test_canonical_phrasing_preserved_as_first_entry():
     # The original wording stays as one option (entry 0), so nothing is lost.
     assert nv.VARIANTS["sun_to_cloud"][0] == "Sunčano prije podne, oblaci od podneva"

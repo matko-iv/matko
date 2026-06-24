@@ -119,6 +119,48 @@ def test_daily_narrative_ai_falls_back_on_api_failure():
     assert out == "Pretežno vedro", out
 
 
+class _FakeResp:
+    def __init__(self, status, payload):
+        self.status_code = status
+        self._p = payload
+
+    def json(self):
+        return self._p
+
+    def raise_for_status(self):
+        pass
+
+
+def test_rephrase_rejects_truncated_output():
+    # finishReason MAX_TOKENS -> the sentence was cut off -> reject so the caller
+    # falls back to the complete rule-based one (the "opisi se ne završe" bug).
+    gn._http_post = lambda url, payload, timeout: _FakeResp(200, {
+        "candidates": [{"finishReason": "MAX_TOKENS",
+                        "content": {"parts": [{"text": "Tokom dana ved"}]}}]})
+    assert gn.rephrase("Vedro i sunčano tokom dana", api_key="x") is None
+
+
+def test_rephrase_accepts_complete_output():
+    gn._http_post = lambda url, payload, timeout: _FakeResp(200, {
+        "candidates": [{"finishReason": "STOP",
+                        "content": {"parts": [{"text": "Tokom dana vedro i sunčano."}]}}]})
+    assert gn.rephrase("Vedro i sunčano tokom dana", api_key="x") == "Tokom dana vedro i sunčano."
+
+
+def test_rephrase_disables_thinking_and_has_room():
+    # Guard the regression: thinking must be disabled and the token budget ample,
+    # else gemini-3.5-flash spends the budget thinking and truncates the sentence.
+    captured = {}
+    def _cap(url, payload, timeout):
+        captured.update(payload.get("generationConfig", {}))
+        return _FakeResp(200, {"candidates": [{"finishReason": "STOP",
+                         "content": {"parts": [{"text": "ok."}]}}]})
+    gn._http_post = _cap
+    gn.rephrase("Vedro", api_key="x")
+    assert captured.get("thinkingConfig", {}).get("thinkingBudget") == 0, captured
+    assert captured.get("maxOutputTokens", 0) >= 200, captured
+
+
 def main():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     fails = []

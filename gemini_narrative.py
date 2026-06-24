@@ -130,39 +130,55 @@ def _build_contents(correct_sentence):
     return contents
 
 
+def _http_post(url, payload, timeout):
+    """Single POST seam (so the call can be stubbed in tests). Lazy `requests`
+    import keeps the guardrail importable without the dependency."""
+    import requests
+    return requests.post(url, json=payload, timeout=timeout)
+
+
 def rephrase(correct_sentence, *, api_key=None, timeout=15, retries=4):
     """Ask Gemini to paraphrase the already-correct sentence into natural
     Montenegrin (transform-only). Returns the candidate string, or None on any
-    failure — the caller validates and falls back. Raw REST (matches the existing
-    code; no SDK dependency).
+    failure (the caller validates and falls back). Raw REST; no SDK dependency.
 
-    Gemini 3.x: temperature/top_p/top_k are deliberately NOT set (Google
-    discourages them on 3.x). `thinkingConfig` is omitted so the call cannot fail
-    on a wrong thinking field; to trim latency/cost once verified live, add
-    `"thinkingConfig": {"thinkingLevel": "minimal"}` (or the budget form your
-    account accepts).
+    CRITICAL — thinking must be DISABLED. gemini-3.5-flash defaults to *medium*
+    thinking, which spends the output-token budget reasoning and returns the
+    sentence TRUNCATED mid-word ("opisi se ne završe"). `thinkingBudget: 0` turns
+    it off (this near-mechanical rephrase needs none) and `maxOutputTokens` is set
+    well above the longest sentence. As a hard backstop, any response that did
+    NOT finish cleanly (finishReason != STOP) is rejected, so a half sentence can
+    never ship — the caller falls back to the complete rule-based sentence.
+
+    temperature/top_p/top_k are deliberately NOT set (discouraged on Gemini 3.x).
     """
     key = api_key if api_key is not None else GEMINI_API_KEY
     if not key or not correct_sentence:
         return None
     import time
-    import requests
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
            f"{MODEL}:generateContent?key={key}")
     payload = {
         "systemInstruction": {"parts": [{"text": SYSTEM}]},
         "contents": _build_contents(correct_sentence),
-        "generationConfig": {"maxOutputTokens": 120},
+        "generationConfig": {
+            "maxOutputTokens": 256,
+            "thinkingConfig": {"thinkingBudget": 0},
+        },
     }
     for attempt in range(retries):
         try:
-            resp = requests.post(url, json=payload, timeout=timeout)
+            resp = _http_post(url, payload, timeout)
             if resp.status_code == 429:                 # free-tier rate limit
                 time.sleep(2 ** attempt * 5)            # 5/10/20/40 s backoff
                 continue
             resp.raise_for_status()
-            data = resp.json()
-            text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            cand = (resp.json().get("candidates") or [{}])[0]
+            # Reject anything cut off (MAX_TOKENS) or not finished cleanly, so a
+            # truncated half-sentence never ships — fall back to rule-based.
+            if cand.get("finishReason") not in (None, "STOP"):
+                return None
+            text = cand["content"]["parts"][0]["text"].strip()
             return text.strip('"').strip()
         except Exception:
             return None

@@ -6298,39 +6298,39 @@ def _daily_narrative(grp):
         precip_str = f" ({total_precip:.1f} mm)" if total_precip >= 1 else ""
         if rain_m and rain_a and rain_e:
             if total_precip >= 15:
-                parts.append(f"Kiša cijeli dan")
+                parts.append(nv.variant("rain_all_day", _seed))
             elif total_precip >= 5:
                 parts.append(f"Kiša tokom cijelog dana ({total_precip:.0f} mm)")
             elif total_precip >= 1:
-                parts.append(f"Povremena kiša")
+                parts.append(nv.variant("rain_intermittent", _seed))
             else:
-                parts.append("Povremena slaba kiša")
+                parts.append(nv.variant("rain_light_intermittent", _seed))
         elif rain_m and rain_a and not rain_e:
-            parts.append(f"Kiša tokom dana do kasno poslijepodne, suvo predveče")
+            parts.append(nv.variant("rain_day_then_dry_eve", _seed))
         elif rain_m and not rain_a and not rain_e:
             if morn['precip'] >= 3:
                 parts.append(f"Jača kiša prijepodne ({morn['precip']:.1f} mm), suvo i vedrije od podneva")
             else:
-                parts.append(f"Kiša prijepodne, suvo od podneva")
+                parts.append(nv.variant("rain_morn_then_dry", _seed))
         elif rain_m and not rain_a and rain_e:
-            parts.append(f"Kiša ujutru i predveče, suvo od podneva do večeri")
+            parts.append(nv.variant("rain_morn_eve", _seed))
         elif not rain_m and rain_a and rain_e:
             if ms in ('clear', 'mostly_clear'):
-                parts.append(f"Sunčano ujutru, kiša od podneva")
+                parts.append(nv.variant("rain_sun_then_rain", _seed))
             else:
                 parts.append(f"Kiša od podneva do kraja dana{precip_str}")
         elif not rain_m and rain_a and not rain_e:
             if ms in ('clear', 'mostly_clear'):
-                parts.append(f"Sunčano ujutru, kiša od podneva do kasno poslijepodne")
+                parts.append(nv.variant("rain_sun_then_rain_pm", _seed))
             else:
-                parts.append(f"Oblačno, kiša od podneva do kasno poslijepodne")
+                parts.append(nv.variant("rain_cloud_then_rain_pm", _seed))
         elif not rain_m and not rain_a and rain_e:
-            parts.append(f"Suvo tokom dana, kiša predveče")
+            parts.append(nv.variant("rain_dry_then_eve", _seed))
         elif night['has_rain'] and not rain_m and not rain_a and not rain_e:
             if ms in ('clear', 'mostly_clear'):
-                parts.append("Kiša tokom noći, sunčano tokom dana")
+                parts.append(nv.variant("rain_night_then_sun", _seed))
             else:
-                parts.append("Kiša tokom noći, suvo tokom dana")
+                parts.append(nv.variant("rain_night_then_dry", _seed))
         else:
             parts.append(f"Povremena kiša{precip_str}")
     elif has_fog_morn:
@@ -6406,14 +6406,14 @@ def _daily_narrative(grp):
 
     if temp_max is not None:
         if temp_max >= 33:
-            parts.append("izuzetno vruće")
+            parts.append(nv.variant("temp_very_hot", _seed))
         elif temp_max >= 30:
-            parts.append("vruće")
+            parts.append(nv.variant("temp_hot", _seed))
     if temp_min is not None:
         if temp_min <= -5:
-            parts.append("jak mraz")
+            parts.append(nv.variant("temp_hard_frost", _seed))
         elif temp_min <= 0:
-            parts.append("mraz")
+            parts.append(nv.variant("temp_frost", _seed))
 
     narrative = "Promjenljivo"
     if len(parts) == 1:
