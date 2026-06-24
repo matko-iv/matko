@@ -2547,12 +2547,6 @@ function render(data) {
     if (data.precip_scenarios) {
         const ps = data.precip_scenarios;
         const pct = v => v != null ? Math.round(v * 100) + '%' : '–';
-        html += `<p style="font-size:13px;color:#586069;margin:6px 0 0 2px">` +
-            `Vjerovatnoća kiše (ECC scenariji): 0–12h <b>${pct(ps['p_rain_0_12h'])}</b>` +
-            ` · 12–24h <b>${pct(ps['p_rain_12_24h'])}</b>` +
-            ` · 24–48h <b>${pct(ps['p_rain_24_48h'])}</b>` +
-            (ps.expected_episodes != null ? ` · očekivano epizoda: <b>${ps.expected_episodes.toFixed(1)}</b>` : '') +
-            `</p>`;
     }
 
     html += `
