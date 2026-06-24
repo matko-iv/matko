@@ -18,7 +18,10 @@ PHANTOM_PREFIXES = ("kiš", "pljus", "snij", "snjež", "grmljav", "magl")
 # Pools that describe dry (no-precipitation) weather.
 DRY_KEYS = ("sun_to_cloud", "cloud_to_sun", "sun_to_partly", "partly_to_sun",
             "increasing_cloud", "cloud_to_partly", "variable",
-            "eve_clouding", "eve_clearing", "partly_steady")
+            "eve_clouding", "eve_clearing", "partly_steady",
+            "clear_all_day", "mostly_clear_all_day", "mostly_cloudy_all_day",
+            "cloudy_all_day", "sky_clear_short", "sky_mostly_clear_short",
+            "sky_partly_short", "sky_mostly_cloudy_short", "sky_cloudy_short")
 
 
 def test_variant_is_deterministic_for_same_seed():
@@ -60,6 +63,31 @@ def test_rain_pools_all_mention_rain():
         for phrase in pool:
             low = phrase.lower()
             assert ("kiš" in low or "padav" in low), f"{key}: no rain word in {phrase!r}"
+
+
+def test_snow_pools_mention_snow():
+    for key, pool in nv.VARIANTS.items():
+        if not key.startswith("snow_"):
+            continue
+        for phrase in pool:
+            low = phrase.lower()
+            assert ("snij" in low or "snjež" in low), f"{key}: no snow word in {phrase!r}"
+
+
+def test_thunder_pools_mention_thunder():
+    for key, pool in nv.VARIANTS.items():
+        if not key.startswith("thunder_"):
+            continue
+        for phrase in pool:
+            assert "grmljav" in phrase.lower(), f"{key}: no thunder word in {phrase!r}"
+
+
+def test_fog_pools_mention_fog():
+    for key, pool in nv.VARIANTS.items():
+        if not key.startswith("fog_"):
+            continue
+        for phrase in pool:
+            assert "magl" in phrase.lower(), f"{key}: no fog word in {phrase!r}"
 
 
 def test_canonical_phrasing_preserved_as_first_entry():

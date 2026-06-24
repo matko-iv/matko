@@ -161,6 +161,41 @@ def test_rephrase_disables_thinking_and_has_room():
     assert captured.get("maxOutputTokens", 0) >= 200, captured
 
 
+def test_generate_uses_hourly_prompt_and_legacy_model():
+    cap = {}
+    def _cap(url, payload, timeout):
+        cap['url'] = url
+        cap['prompt'] = payload['contents'][0]['parts'][0]['text']
+        return _FakeResp(200, {"candidates": [{"finishReason": "STOP",
+                         "content": {"parts": [{"text": "Sunčano prije podne"}]}}]})
+    gn._http_post = _cap
+    rows = [{"hour": 8, "temperature_2m": 20, "cloud_cover": 80, "precipitation": 0}]
+    out = gn.generate("2026-06-24", rows, {0: {"icon": "sun"}}, api_key="x")
+    assert out == "Sunčano prije podne", out
+    assert "gemini-3-flash-preview" in cap['url'], cap['url']
+    assert "Satni podaci za Budvu" in cap['prompt']
+    assert "Maksimalno 6-7 riječi" in cap['prompt']
+
+
+def test_generate_rejects_truncation():
+    gn._http_post = lambda u, p, t: _FakeResp(200, {"candidates": [
+        {"finishReason": "MAX_TOKENS", "content": {"parts": [{"text": "Sunčano pri"}]}}]})
+    assert gn.generate("2026-06-24", [{"hour": 8}], {}, api_key="x") is None
+
+
+def test_daily_narrative_ai_generate_path_is_validated():
+    # hourly_rows present -> uses generate(); phantom rain on a dry day -> fallback
+    gn.generate = lambda date, rows, wmo, **k: "Kiša poslije podne"
+    out = gn.daily_narrative_ai("Vedro i sunčano", DRY,
+                                hourly_rows=[{"hour": 8}], wmo_codes={})
+    assert out == "Vedro i sunčano", out
+    # valid generated text on a dry day -> kept
+    gn.generate = lambda date, rows, wmo, **k: "Vedro tokom dana"
+    out2 = gn.daily_narrative_ai("Vedro i sunčano", DRY,
+                                 hourly_rows=[{"hour": 8}], wmo_codes={})
+    assert out2 == "Vedro tokom dana", out2
+
+
 def main():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     fails = []

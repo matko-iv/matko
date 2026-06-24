@@ -2,9 +2,8 @@ name: Update Budva Weather Forecast
 
 on:
   schedule:
-    # Run every hour
-    - cron: '0 * * * *'
-  workflow_dispatch:  # Allow manual trigger
+    - cron: '17 */5 * * *'
+  workflow_dispatch: # Allow manual trigger
 
 permissions:
   contents: write

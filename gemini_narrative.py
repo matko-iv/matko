@@ -185,13 +185,79 @@ def rephrase(correct_sentence, *, api_key=None, timeout=15, retries=4):
     return None
 
 
-def daily_narrative_ai(correct_sentence, ds):
-    """Return Gemini's paraphrase of the rule-based sentence IF it passes the
-    deterministic guardrail, else the rule-based sentence itself (guaranteed-safe
-    fallback). Every factual claim is sourced from `correct_sentence`/`ds`."""
-    if not correct_sentence:
-        return correct_sentence
-    candidate = rephrase(correct_sentence)
+def generate(date_str, hourly_rows, wmo_codes, *, api_key=None, timeout=15, retries=4):
+    """FULL Gemini narrative generated from HOURLY data — the EXACT prompt of the
+    legacy forecast_48h_v3._gemini_narrative, copied verbatim, on
+    gemini-3-flash-preview. Returns the text, or None on any failure / truncation.
+
+    `wmo_codes` (the WMO_CODES table) is passed in by the caller to avoid a
+    circular import. The output is the caller's to validate() before use."""
+    key = api_key if api_key is not None else GEMINI_API_KEY
+    if not key or not hourly_rows:
+        return None
+    import time
+
+    def _ok(x):                       # not None and not NaN (avoid a pandas dep)
+        return x is not None and x == x
+
+    lines = []
+    for h in hourly_rows:
+        hour = h.get('hour', 0)
+        temp = h.get('temperature_2m', h.get('temperature_2m_ensemble', '?'))
+        hum = h.get('relative_humidity_2m', h.get('relative_humidity_2m_ensemble', '?'))
+        wind = h.get('wind_speed_10m', h.get('wind_speed_10m_ensemble', '?'))
+        press = h.get('surface_pressure', h.get('pressure_msl', '?'))
+        cloud = h.get('cloud_cover', '?')
+        precip_raw = h.get('precipitation', h.get('precipitation_ensemble', 0))
+        precip = precip_raw if _ok(precip_raw) else 0
+        wc_raw = h.get('weather_code', h.get('weather_code_raw', 0))
+        wc = int(wc_raw) if _ok(wc_raw) else 0
+        icon = (wmo_codes or {}).get(wc, {}).get('icon', 'unknown')
+        emoji = h.get('weather_emoji', '')
+        lines.append(
+            f"  {date_str} {hour:02d}:00 {icon} {emoji}  {temp}°   {hum}%   {wind}   {press}   {cloud}%   {precip}"
+        )
+    hourly_text = "\n".join(lines)
+
+    prompt = (
+        f"Satni podaci za Budvu, {date_str} (sat  ikonica  temp  vlažnost  vjetar_m/s  pritisak_hPa  oblačnost  padavine_mm):\n"
+        f"{hourly_text}\n\n"
+        "Na osnovu ovih satnih podataka za Budvu, napiši kratak izvještaj.\n\nPravila:\n1. Maksimalno 6-7 riječi.\n2. Fokusiraj se na glavnu promjenu vremena (npr. prelaz iz oblačnog u sunčano).\n3. Navedi doba dana kada se promjena dešava.\n4.Ako nema kiše ili vjetra, ne spominji ih."
+    )
+
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+           f"gemini-3-flash-preview:generateContent?key={key}")
+    payload = {"contents": [{"parts": [{"text": prompt}]}],
+               "generationConfig": {"temperature": 0.3, "maxOutputTokens": 200,
+                                    "thinkingConfig": {"thinkingBudget": 0}}}
+    for attempt in range(retries):
+        try:
+            resp = _http_post(url, payload, timeout)
+            if resp.status_code == 429:
+                time.sleep(2 ** attempt * 5)
+                continue
+            resp.raise_for_status()
+            cand = (resp.json().get("candidates") or [{}])[0]
+            if cand.get("finishReason") not in (None, "STOP"):
+                return None
+            text = cand["content"]["parts"][0]["text"].strip()
+            return text.strip('"').strip()
+        except Exception:
+            return None
+    return None
+
+
+def daily_narrative_ai(correct_sentence, ds, hourly_rows=None, wmo_codes=None):
+    """Gemini narrative behind the deterministic guardrail, with the rule-based
+    `correct_sentence` as the guaranteed-safe fallback. When HOURLY data is
+    available, Gemini GENERATES from it with the legacy hourly prompt
+    (`generate`); otherwise it REPHRASES the rule-based sentence. Either way the
+    candidate must pass validate(...) against `ds` — a phantom or truncation can
+    never reach the output."""
+    if hourly_rows:
+        candidate = generate(ds.get("date", ""), hourly_rows, wmo_codes)
+    else:
+        candidate = rephrase(correct_sentence) if correct_sentence else None
     if candidate and validate(candidate, ds):
         return candidate
     return correct_sentence

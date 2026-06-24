@@ -6266,32 +6266,30 @@ def _daily_narrative(grp):
     parts = []
 
     if has_snow:
-        snow_desc = "snijeg"
-        if total_precip >= 5:
-            snow_desc = "obilniji snijeg"
         if rain_m and rain_a and rain_e:
-            parts.append(f"Snijeg tokom cijelog dana ({total_precip:.0f} mm)")
+            parts.append(nv.variant("snow_all_day", _seed) + f" ({total_precip:.0f} mm)")
         elif rain_m and not rain_a:
-            parts.append("Snijeg prije podne, prestanak od podneva")
+            parts.append(nv.variant("snow_morn_then_dry", _seed))
         elif not rain_m and rain_a:
-            parts.append("Suvo ujutru, snijeg od podneva")
+            parts.append(nv.variant("snow_dry_then_pm", _seed))
         elif not rain_m and not rain_a and rain_e:
-            parts.append("Suvo tokom dana, snijeg predveče")
+            parts.append(nv.variant("snow_dry_then_eve", _seed))
         else:
-            parts.append(f"Povremeni {snow_desc}")
+            parts.append(nv.variant("snow_heavy_intermittent" if total_precip >= 5
+                                    else "snow_intermittent", _seed))
     elif has_thunder:
         if not rain_m and rain_a and not rain_e:
-            parts.append("Sunčano prije podne, grmljavinska kiša od podneva")
+            parts.append(nv.variant("thunder_sun_then_storm", _seed))
         elif rain_m and not rain_a:
-            parts.append("Grmljavina prije podne, smirivanje od podneva")
+            parts.append(nv.variant("thunder_morn_then_calm", _seed))
         elif not rain_m and not rain_a and rain_e:
-            parts.append("Pretežno suvo, grmljavina predveče")
+            parts.append(nv.variant("thunder_eve", _seed))
         elif rain_m and rain_a:
-            parts.append("Oblačno uz povremenu grmljavinu tokom dana")
+            parts.append(nv.variant("thunder_day", _seed))
         elif night['has_thunder'] and not morn['has_thunder'] and not aftn['has_thunder']:
-            parts.append("Grmljavina tokom noći, mirnije tokom dana")
+            parts.append(nv.variant("thunder_night", _seed))
         else:
-            parts.append("Nestabilno uz povremenu grmljavinu")
+            parts.append(nv.variant("thunder_unstable", _seed))
         if total_precip >= 5:
             parts[0] += f" ({total_precip:.0f} mm)"
     elif total_precip > 0.2:
@@ -6335,38 +6333,28 @@ def _daily_narrative(grp):
             parts.append(f"Povremena kiša{precip_str}")
     elif has_fog_morn:
         if as_ in ('clear', 'mostly_clear'):
-            parts.append("Magla ujutru, sunčano od podneva")
+            parts.append(nv.variant("fog_then_sun", _seed))
         elif as_ in ('partly_cloudy',):
-            parts.append("Magla ujutru, oblaci i sunce od podneva")
+            parts.append(nv.variant("fog_then_partly", _seed))
         else:
-            parts.append("Magla ujutru, oblačno od podneva")
+            parts.append(nv.variant("fog_then_cloud", _seed))
     else:
+        _short = {
+            'clear': 'sky_clear_short', 'mostly_clear': 'sky_mostly_clear_short',
+            'partly_cloudy': 'sky_partly_short', 'mostly_cloudy': 'sky_mostly_cloudy_short',
+            'cloudy': 'sky_cloudy_short',
+        }
         if morn['n'] == 0 and aftn['n'] == 0 and eve['n'] > 0:
-            sky_labels = {
-                'clear': 'Vedro', 'mostly_clear': 'Pretežno vedro',
-                'partly_cloudy': 'Po koji oblak', 'mostly_cloudy': 'Pretežno oblačno',
-                'cloudy': 'Oblačno',
-            }
-            parts.append(sky_labels.get(es, 'Promjenljivo'))
+            parts.append(nv.variant(_short.get(es, 'variable'), _seed))
         elif morn['n'] == 0 and aftn['n'] > 0:
-            sky_labels = {
-                'clear': 'Vedro i sunčano', 'mostly_clear': 'Pretežno sunčano',
-                'partly_cloudy': 'Po koji oblak', 'mostly_cloudy': 'Pretežno oblačno',
-                'cloudy': 'Oblačno',
-            }
-            parts.append(sky_labels.get(as_, 'Promjenljivo'))
+            parts.append(nv.variant(_short.get(as_, 'variable'), _seed))
         elif ms == as_:
-            sky_labels = {
-                'clear': 'Vedro i sunčano tokom dana',
-                'mostly_clear': 'Pretežno sunčano, poneki oblak',
-                'partly_cloudy': 'Oblačno sa sunčanim periodima',
-                'mostly_cloudy': 'Pretežno oblačno, malo sunca',
-                'cloudy': 'Oblačno tokom cijelog dana bez padavina',
+            _allday = {
+                'clear': 'clear_all_day', 'mostly_clear': 'mostly_clear_all_day',
+                'partly_cloudy': 'partly_steady', 'mostly_cloudy': 'mostly_cloudy_all_day',
+                'cloudy': 'cloudy_all_day',
             }
-            if ms == 'partly_cloudy':
-                parts.append(nv.variant("partly_steady", _seed))
-            else:
-                parts.append(sky_labels.get(ms, 'Promjenljivo'))
+            parts.append(nv.variant(_allday.get(ms, 'variable'), _seed))
         elif ms in ('clear', 'mostly_clear') and as_ in ('mostly_cloudy', 'cloudy'):
             parts.append(nv.variant("sun_to_cloud", _seed))
         elif ms in ('mostly_cloudy', 'cloudy') and as_ in ('clear', 'mostly_clear'):
@@ -6391,11 +6379,13 @@ def _daily_narrative(grp):
 
     wind_part = ""
     if max_wind >= 10:
-        wind_part = f"jak {wind_dir_str} vjetar" if wind_dir_str else "jak vjetar"
+        adj = nv.variant("wind_strong_adj", _seed)
+        wind_part = f"{adj} {wind_dir_str} vjetar" if wind_dir_str else f"{adj} vjetar"
     elif max_wind >= 7:
         wind_part = f"vjetrovito ({wind_dir_str})" if wind_dir_str else "vjetrovito"
     elif max_wind >= 5:
-        wind_part = f"umjeren {wind_dir_str} vjetar" if wind_dir_str else "umjeren vjetar"
+        adj = nv.variant("wind_moderate_adj", _seed)
+        wind_part = f"{adj} {wind_dir_str} vjetar" if wind_dir_str else f"{adj} vjetar"
 
     if wind_part:
         if max_gust >= 15:
@@ -6513,6 +6503,14 @@ def _build_daily_summary(date_str, day_name, grp_df, fc_raw=None):
 # Gemini AI narrative generation
 # ---------------------------------------------------------------------------
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
+
+# AI narrative mode — flip this ONE line to switch (no other change needed):
+#   'generate' = Gemini writes the FULL narrative from the data (richer wording,
+#                but can hallucinate; rule-based _daily_narrative is the fallback);
+#   'rephrase' = Gemini only REPHRASES the rule-based sentence, validated by a
+#                deterministic guardrail (factual-only; see gemini_narrative.py).
+NARRATIVE_MODE = 'generate'   # 'generate' | 'rephrase'
+import gemini_narrative
 
 def _gemini_narrative(date_str, hourly_rows):
     """Call Gemini to generate a short weather narrative from hourly data."""
@@ -6665,12 +6663,20 @@ def _enrich_narratives_with_ai(daily_list, hourly_data):
             count += 1
             continue
 
-        # FULL Gemini narrative: generate from the (hourly / daily) data. The
-        # rule-based _daily_narrative output is the fallback (no key / API error).
-        if has_hourly:
-            narrative = _gemini_narrative(date_str, rows)
+        if NARRATIVE_MODE == 'rephrase':
+            # Guarded Gemini: for hourly days it GENERATES with the legacy hourly
+            # prompt; for long-range it rephrases the rule-based sentence. Either
+            # way validate() guards it and falls back to `base` on any failure.
+            base = ds.get('day_narrative')
+            new = gemini_narrative.daily_narrative_ai(
+                base, ds, hourly_rows=rows if has_hourly else None,
+                wmo_codes=WMO_CODES) if base else None
+            narrative = new if (new and new != base) else None
         else:
-            narrative = _gemini_narrative_daily(date_str, ds)
+            # FULL Gemini narrative: generate from the (hourly / daily) data. The
+            # rule-based _daily_narrative output is the fallback (no key / API error).
+            narrative = (_gemini_narrative(date_str, rows) if has_hourly
+                         else _gemini_narrative_daily(date_str, ds))
         api_calls += 1
         if narrative:
             ds['day_narrative'] = narrative
@@ -6690,7 +6696,7 @@ def _enrich_narratives_with_ai(daily_list, hourly_data):
         except Exception:
             pass
 
-    print(f"  [Gemini] Generisano {count}/{len(daily_list)} AI opisa "
+    print(f"  [Gemini] Mode={NARRATIVE_MODE}: {count}/{len(daily_list)} opisa "
           f"({api_calls} API poziva, {count - api_calls} iz keša).")
 
 

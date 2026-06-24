@@ -186,6 +186,130 @@ VARIANTS = {
         "jak jutarnji mraz",
         "oštar mraz",
     ],
+
+    # --- snow (snow branches; every phrasing mentions snijeg/snježno) --------
+    "snow_all_day": [
+        "Snijeg tokom cijelog dana",
+        "Snijeg gotovo cijeli dan",
+        "Snježne padavine tokom dana",
+        "Snijeg s prekidima cijeli dan",
+        "Snijeg tokom čitavog dana",
+    ],
+    "snow_morn_then_dry": [
+        "Snijeg prije podne, prestanak od podneva",
+        "Snijeg ujutru, suvo od podneva",
+        "Jutarnji snijeg, potom prestanak",
+        "Snijeg do podneva, zatim suvo",
+    ],
+    "snow_dry_then_pm": [
+        "Suvo ujutru, snijeg od podneva",
+        "Suvo prijepodne, snijeg poslije podne",
+        "Vedrije ujutru, snijeg od podneva",
+    ],
+    "snow_dry_then_eve": [
+        "Suvo tokom dana, snijeg predveče",
+        "Suvo danju, snijeg u večernjim satima",
+        "Pretežno suvo, snijeg predveče",
+    ],
+    "snow_intermittent": [
+        "Povremeni snijeg",
+        "Mjestimično snijeg",
+        "Snijeg s prekidima",
+        "Povremene snježne padavine",
+    ],
+    "snow_heavy_intermittent": [
+        "Povremeni obilniji snijeg",
+        "Mjestimično jači snijeg",
+        "Obilniji snijeg s prekidima",
+    ],
+
+    # --- thunder (grmljavina branches) --------------------------------------
+    "thunder_sun_then_storm": [
+        "Sunčano prije podne, grmljavinska kiša od podneva",
+        "Vedro prijepodne, grmljavina od podneva",
+        "Sunčano ujutru, pljuskovi s grmljavinom poslije podne",
+        "Vedro jutro, grmljavinski pljuskovi od podneva",
+    ],
+    "thunder_morn_then_calm": [
+        "Grmljavina prije podne, smirivanje od podneva",
+        "Grmljavina ujutru, mirnije od podneva",
+        "Jutarnja grmljavina, potom smirivanje",
+    ],
+    "thunder_eve": [
+        "Pretežno suvo, grmljavina predveče",
+        "Suvo danju, grmljavina predveče",
+        "Pretežno suvo, grmljavina u večernjim satima",
+    ],
+    "thunder_day": [
+        "Oblačno uz povremenu grmljavinu tokom dana",
+        "Nestabilno uz grmljavinu tokom dana",
+        "Oblačno uz pljuskove i grmljavinu",
+    ],
+    "thunder_night": [
+        "Grmljavina tokom noći, mirnije tokom dana",
+        "Noćna grmljavina, danju mirnije",
+        "Grmljavina preko noći, smirivanje danju",
+    ],
+    "thunder_unstable": [
+        "Nestabilno uz povremenu grmljavinu",
+        "Nestabilno vrijeme uz grmljavinu",
+        "Promjenljivo i nestabilno, moguća grmljavina",
+    ],
+
+    # --- fog ----------------------------------------------------------------
+    "fog_then_sun": [
+        "Magla ujutru, sunčano od podneva",
+        "Jutarnja magla, potom sunčano",
+        "Magla ujutru, razvedravanje od podneva",
+        "Magla prije podne, sunčano poslije podne",
+    ],
+    "fog_then_partly": [
+        "Magla ujutru, oblaci i sunce od podneva",
+        "Jutarnja magla, potom promjenljivo",
+        "Magla ujutru, sunce i oblaci od podneva",
+    ],
+    "fog_then_cloud": [
+        "Magla ujutru, oblačno od podneva",
+        "Jutarnja magla, potom oblačno",
+        "Magla ujutru, tmurno od podneva",
+    ],
+
+    # --- steady sky all day (no AM/PM trend) --------------------------------
+    "clear_all_day": [
+        "Vedro i sunčano tokom dana",
+        "Sunčano cijeli dan",
+        "Vedro i sunčano cijelog dana",
+        "Pretežno vedro i sunčano",
+        "Sunčano i vedro tokom čitavog dana",
+    ],
+    "mostly_clear_all_day": [
+        "Pretežno sunčano, poneki oblak",
+        "Pretežno vedro uz poneki oblak",
+        "Sunčano uz malo oblaka",
+        "Pretežno sunčano tokom dana",
+    ],
+    "mostly_cloudy_all_day": [
+        "Pretežno oblačno, malo sunca",
+        "Pretežno oblačno tokom dana",
+        "Više oblaka, malo sunca",
+        "Uglavnom oblačno uz malo sunca",
+    ],
+    "cloudy_all_day": [
+        "Oblačno tokom cijelog dana bez padavina",
+        "Oblačno cijeli dan, bez padavina",
+        "Tmurno tokom dana, bez padavina",
+        "Oblačno čitav dan",
+    ],
+    # short sky labels (used when only part of the day is sampled)
+    "sky_clear_short": ["Vedro", "Vedro i sunčano", "Sunčano"],
+    "sky_mostly_clear_short": ["Pretežno vedro", "Pretežno sunčano", "Uglavnom vedro"],
+    "sky_partly_short": ["Po koji oblak", "Promjenljivo oblačno", "Djelimično oblačno"],
+    "sky_mostly_cloudy_short": ["Pretežno oblačno", "Uglavnom oblačno"],
+    "sky_cloudy_short": ["Oblačno", "Tmurno", "Potpuno oblačno"],
+
+    # --- wind adjectives (composed as "<adj> <smjer> vjetar") ---------------
+    "wind_strong_adj": ["jak", "snažan", "izražen"],
+    "wind_moderate_adj": ["umjeren", "osjetan", "umjeren do svjež"],
 }
 
 
