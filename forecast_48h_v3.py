@@ -6514,16 +6514,8 @@ def _build_daily_summary(date_str, day_name, grp_df, fc_raw=None):
 # ---------------------------------------------------------------------------
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
 
-# Factual-only narratives: Gemini REPHRASES the rule-based sentence (never
-# generates from the table) behind a deterministic guardrail + fallback. See
-# gemini_narrative.py.
-import gemini_narrative
-
 def _gemini_narrative(date_str, hourly_rows):
-    """DEPRECATED (no longer called): generated the narrative FROM the hourly
-    table, which hallucinates phantom rain/wind/thunder. Replaced by
-    gemini_narrative.daily_narrative_ai(), which REPHRASES the rule-based
-    sentence behind a deterministic guardrail. Kept only for reference."""
+    """Call Gemini to generate a short weather narrative from hourly data."""
     if not GEMINI_API_KEY or not hourly_rows:
         return None
     lines = []
@@ -6567,7 +6559,12 @@ def _gemini_narrative(date_str, hourly_rows):
                 continue
             resp.raise_for_status()
             data = resp.json()
-            text = data['candidates'][0]['content']['parts'][0]['text'].strip()
+            cand = data['candidates'][0]
+            # Reject truncated output (finishReason != STOP) so a half sentence
+            # never ships — the rule-based _daily_narrative stays as the fallback.
+            if cand.get('finishReason') not in (None, 'STOP'):
+                return None
+            text = cand['content']['parts'][0]['text'].strip()
             if text.startswith('"') and text.endswith('"'):
                 text = text[1:-1]
             return text
@@ -6578,8 +6575,7 @@ def _gemini_narrative(date_str, hourly_rows):
 
 
 def _gemini_narrative_daily(date_str, ds):
-    """DEPRECATED (no longer called): see _gemini_narrative. Replaced by the
-    rephrase-and-validate path in gemini_narrative.daily_narrative_ai()."""
+    """Call Gemini for long-range days that lack hourly data."""
     if not GEMINI_API_KEY:
         return None
     tmin = ds.get('temp_min', '?')
@@ -6612,7 +6608,12 @@ def _gemini_narrative_daily(date_str, ds):
                 continue
             resp.raise_for_status()
             data = resp.json()
-            text = data['candidates'][0]['content']['parts'][0]['text'].strip()
+            cand = data['candidates'][0]
+            # Reject truncated output (finishReason != STOP) so a half sentence
+            # never ships — the rule-based _daily_narrative stays as the fallback.
+            if cand.get('finishReason') not in (None, 'STOP'):
+                return None
+            text = cand['content']['parts'][0]['text'].strip()
             if text.startswith('"') and text.endswith('"'):
                 text = text[1:-1]
             return text
@@ -6648,34 +6649,34 @@ def _enrich_narratives_with_ai(daily_list, hourly_data):
             hourly_by_date[d] = []
         hourly_by_date[d].append(h)
 
-    cached = 0      # served from cache
-    applied = 0     # AI rephrase accepted by the guardrail
+    count = 0
     api_calls = 0
     for ds in daily_list:
         date_str = ds.get('date', '')
-        base = ds.get('day_narrative')          # the rule-based correct sentence
-        if not base:
-            continue
         rows = hourly_by_date.get(date_str, [])
+        rows.sort(key=lambda r: r.get('hour', 0))
         has_hourly = len(rows) >= 8
 
-        # Cache strategy: only cache long-range days (no hourly). Hourly-covered
-        # days are ALWAYS re-rephrased so the wording tracks the latest forecast.
+        # Cache strategy: only use cache for long-range days (no hourly available).
+        # Hourly-covered days are ALWAYS regenerated so the narrative reflects the
+        # latest forecast.
         if not has_hourly and date_str in cache:
             ds['day_narrative'] = cache[date_str]
-            cached += 1
+            count += 1
             continue
 
-        # REPHRASE the already-correct sentence (never generate from the table),
-        # validated by the deterministic guardrail; on any failure this returns
-        # `base` unchanged, so a phantom can never reach the output.
-        new = gemini_narrative.daily_narrative_ai(base, ds)
+        # FULL Gemini narrative: generate from the (hourly / daily) data. The
+        # rule-based _daily_narrative output is the fallback (no key / API error).
+        if has_hourly:
+            narrative = _gemini_narrative(date_str, rows)
+        else:
+            narrative = _gemini_narrative_daily(date_str, ds)
         api_calls += 1
-        if new and new != base:
-            ds['day_narrative'] = new
-            applied += 1
+        if narrative:
+            ds['day_narrative'] = narrative
             if not has_hourly:
-                cache[date_str] = new
+                cache[date_str] = narrative
+            count += 1
         if api_calls < len(daily_list):
             time.sleep(12)
 
@@ -6689,9 +6690,8 @@ def _enrich_narratives_with_ai(daily_list, hourly_data):
         except Exception:
             pass
 
-    print(f"  [Gemini] Preformulisano {applied}/{len(daily_list)} opisa "
-          f"({api_calls} API poziva, {cached} iz keša, "
-          f"{api_calls - applied} fallback na pravilo-bazirani opis).")
+    print(f"  [Gemini] Generisano {count}/{len(daily_list)} AI opisa "
+          f"({api_calls} API poziva, {count - api_calls} iz keša).")
 
 
 def generate_output(corrected, trained, results, fc_raw=None, marine=None, onset=None):
