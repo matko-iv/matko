@@ -1016,9 +1016,58 @@ function getWeatherIcon(code, hour) {
     return map[code] || (isNight ? 'clear_night' : 'clear_day');
 }
 
-// ---- SKALA radar gating of near-term rain icons ----
-// radarState is populated by refreshRadar(); null/stale = no gating (trust model).
+// ---- SKALA gating of near-term rain icons ----
+// radarState (SKALA RAIN) is populated by refreshRadar(); null/stale = no gating.
 let radarState = null;
+// SKALA NOWCAST (DGMR) forecast status — the PRIMARY near-term driver now; SKALA
+// RAIN is only the fallback when the nowcast is missing/stale. Set by refreshRadar().
+let nowcastState = null;
+function nowcastFresh(ns) {
+    // the forecast BASE time (not the run time) must be within the ~80-min skill
+    // window — an old run can't drive 'now', and this also rejects a stale/demo file.
+    if (!ns || !ns.ok || !ns.base_epoch_ms) return false;
+    return (Date.now() - ns.base_epoch_ms) / 60000 <= 90;
+}
+// Rain over the hour window [offset*60, (offset+1)*60) min from the nowcast base,
+// capped at the DGMR horizon. Returns {rain, mmh}, or null = no opinion (beyond horizon).
+function nowcastWindow(ns, offset) {
+    const lo = offset * 60, hi = (offset + 1) * 60;
+    if (lo >= ns.horizon_min && !(offset === 0 && ns.now && ns.now.raining)) return null;
+    let peak = (offset === 0 && ns.now && ns.now.raining) ? (ns.now.disc_max_mmh || 0) : 0;
+    for (const s of (ns.series || [])) {
+        if (s.lead_min > lo && s.lead_min <= hi) peak = Math.max(peak, s.disc_max_mmh || 0);
+    }
+    return { rain: peak >= 0.2, mmh: peak };
+}
+// Integrated mm over a lead window (point rate × dt), for the hourly-cell mm override.
+function nowcastMm(ns, loMin, hiMin) {
+    const dt = ns.timestep_min || 5; let mm = 0;
+    for (const s of (ns.series || [])) {
+        if (s.lead_min > loMin && s.lead_min <= hiMin) mm += (s.point_mmh || 0) * dt / 60;
+    }
+    return mm;
+}
+function nowcastIntensityCode(mmh) {
+    if (mmh >= 20) return 95;     // grmljavina / vrlo jako
+    if (mmh >= 7.6) return 82;    // jaki pljuskovi
+    if (mmh >= 2.5) return 63;    // kiša
+    return 61;                    // slaba kiša
+}
+// IMMINENT rain: DGMR says onset in <= 10 min (or it is already raining in its
+// 'now' frame) while SKALA RAIN hasn't caught it yet -> rain is essentially here,
+// so force the rain icon for the CURRENT hour (both the hourly cell and the big
+// 'now' icon). This is the explicit guarantee on top of the 0-60 min gate.
+function nowcastImminent() {
+    const ns = nowcastState;
+    if (!nowcastFresh(ns)) return false;
+    const v = ns.verdict || {};
+    const soon = (v.eta_min != null && v.eta_min <= 10) || !!(ns.now && ns.now.raining);
+    return soon && !(radarState && radarState.rainAtLocation);
+}
+function nowcastImminentCode() {
+    const w = nowcastWindow(nowcastState, 0);
+    return nowcastIntensityCode(w ? w.mmh : 0.5);
+}
 
 function isRainCode(c) { return c >= 51 && c <= 82; }  // drizzle/rain/showers; thunder 95-99 excluded
 function cloudToCode(cc) {
@@ -1050,38 +1099,52 @@ function radarIntensityCode(rs) {
     return 61;                        // Slaba kiša
 }
 
-// Reconcile a model weather code with the radar for hour offset 0 (current) or 1 (next).
+// Reconcile a model weather code with SKALA for hour offset 0 (current) or 1 (next).
+// SKALA NOWCAST (the DGMR forecast) drives this; SKALA RAIN is the fallback and,
+// being current-state ONLY now, gates just offset 0 ("is it raining right now").
 function gateWeatherCode(code, cloud, offset, rs) {
-    if (!radarFresh(rs)) return code;                 // radar down/stale -> trust the model
-    const confirms = (offset === 0) ? rs.rainAtLocation
-                   : (offset === 1) ? (rs.approaching || rs.rainAtLocation)
-                   : null;
-    if (confirms === null) return code;               // offsets other than 0/1 untouched
-    if (confirms) {
-        // Radar confirms rain (now) / incoming (next hour): show the WORSE of the
-        // model code vs the radar's intensity — so heavy rain on the radar upgrades
-        // a light model icon, but a heavier model code (e.g. thunder) is kept.
-        const rc = radarIntensityCode(rs);
-        return wcSeverity(code) >= wcSeverity(rc) ? code : rc;
+    if (offset !== 0 && offset !== 1) return code;
+    // 1) SKALA NOWCAST — the forecast source.
+    if (nowcastFresh(nowcastState)) {
+        const nc = nowcastWindow(nowcastState, offset);
+        if (nc) {
+            if (nc.rain) {                                  // upgrade a light model icon, keep a heavier one
+                const rc = nowcastIntensityCode(nc.mmh);
+                return wcSeverity(code) >= wcSeverity(rc) ? code : rc;
+            }
+            return isRainCode(code) ? cloudToCode(cloud) : code;   // nowcast dry -> strip model rain
+        }
     }
-    return isRainCode(code) ? cloudToCode(cloud) : code;   // radar dry -> strip model rain
+    // 2) Fallback: SKALA RAIN, current state ONLY (offset 0).
+    if (offset === 0 && radarFresh(rs)) {
+        if (rs.rainAtLocation) {
+            const rc = radarIntensityCode(rs);
+            return wcSeverity(code) >= wcSeverity(rc) ? code : rc;
+        }
+        return isRainCode(code) ? cloudToCode(cloud) : code;
+    }
+    return code;
 }
 
-// Near-term gate: SKALA RAIN (radar) only. The SKALA CLOUD satellite module was
-// removed from forecast.html — its frames ran stale/misleading. (The SKALA CLOUD
-// page itself still lives in the budva-radar repo.)
+// Near-term gate: SKALA NOWCAST (DGMR) primary, SKALA RAIN fallback. (SKALA CLOUD
+// was removed from forecast.html earlier — its frames ran stale/misleading; the
+// SKALA CLOUD page itself still lives in the budva-radar repo.)
 function gatedCode(code, cloud, offset) {
     return gateWeatherCode(code, cloud, offset, radarState);
 }
 
 // Re-skin the current-weather icon + the current/next hourly cells after a refresh.
 function applyRadarGating() {
+    const imminent = nowcastImminent();
+    const imminentCode = imminent ? nowcastImminentCode() : null;
     const box = document.getElementById('cwIconBox');
     if (box) {
         const code = +box.dataset.code;
         const cloud = box.dataset.cloud === '' ? null : +box.dataset.cloud;
         const hour = +box.dataset.hour;
-        box.innerHTML = weatherIcon(getWeatherIcon(gatedCode(code, cloud, 0), hour), 96);
+        let code0 = gatedCode(code, cloud, 0);
+        if (imminent && wcSeverity(code0) === 0) code0 = imminentCode;  // DGMR rain ≤10 min -> force rain
+        box.innerHTML = weatherIcon(getWeatherIcon(code0, hour), 96);
     }
     document.querySelectorAll('.hourly-cell[data-gate]').forEach(cell => {
         const offset = +cell.dataset.gate;
@@ -1089,7 +1152,21 @@ function applyRadarGating() {
         const code = +cell.dataset.code;
         const cloud = cell.dataset.cloud === '' ? null : +cell.dataset.cloud;
         const iconEl = cell.querySelector('.h-icon');
-        if (iconEl) iconEl.innerHTML = weatherIcon(getWeatherIcon(gatedCode(code, cloud, offset), hour), 48);
+        let cellCode = gatedCode(code, cloud, offset);
+        if (imminent && offset === 0 && wcSeverity(cellCode) === 0) cellCode = imminentCode;  // current hour -> force rain
+        if (iconEl) iconEl.innerHTML = weatherIcon(getWeatherIcon(cellCode, hour), 48);
+        // SKALA NOWCAST mm override for the near-term cells: for the next ~80 min the
+        // DGMR forecast is more accurate than the NWP precipitation, so replace the mm.
+        const rainEl = cell.querySelector('.h-rain');
+        if (rainEl && nowcastFresh(nowcastState) && (offset === 0 || offset === 1)
+            && offset * 60 < nowcastState.horizon_min) {
+            const mm = nowcastMm(nowcastState, offset * 60,
+                                 Math.min((offset + 1) * 60, nowcastState.horizon_min));
+            rainEl.textContent = mm > 0.05 ? mm.toFixed(1) + 'mm' : '';
+            rainEl.style.color = '#0366d6';
+            rainEl.title = 'SKALA NOWCAST (DGMR) — mm u narednih ' +
+                           (offset === 0 ? '~sat' : '~sat (60–80 min)');
+        }
     });
 }
 
@@ -2328,7 +2405,7 @@ async function loadForecast() {
         await Promise.race([refreshRadar(),
                             new Promise(r => setTimeout(r, 2500))]);
         render(forecastData);
-        renderRadarStatusLine(radarState);
+        renderStatusLine();
         applyRadarGating();
     } catch(e) {
         document.getElementById('app').innerHTML =
@@ -3082,10 +3159,46 @@ function parseRadarState(data) {
     };
 }
 
+// SKALA NOWCAST status (budva-radar repo): the DGMR rain forecast for Budva.
+const NOWCAST_STATUS_URLS = [
+    'nowcast_status.json',
+    'https://matko-iv.github.io/budva-radar/nowcast_status.json',
+];
+async function fetchNowcastData() {
+    for (const url of NOWCAST_STATUS_URLS) {
+        try {
+            const r = await fetch(url + '?v=' + Date.now(), { cache: 'no-store' });
+            if (r.ok) { const j = await r.json(); if (j && j.ok) return j; }
+        } catch (e) { /* try next */ }
+    }
+    return null;
+}
+
+// SKALA NOWCAST drives the verdict line; SKALA RAIN (binary 'pada/ne pada SADA') is
+// the fallback only when the nowcast is missing or older than its ~80-min skill window.
+function renderStatusLine() {
+    const el = document.getElementById('radarStatusLine');
+    if (!el) return;
+    if (nowcastFresh(nowcastState)) {
+        const v = nowcastState.verdict || {};
+        const ageMin = Math.round((Date.now() - nowcastState.base_epoch_ms) / 60000);
+        const age = ' · podatak star ' + ageMin + ' min';
+        const LINK = '<a href="https://matko-iv.github.io/budva-radar/nowcast-compare.html">SKALA NOWCAST</a>: ';
+        const color = v.state === 'RAIN_NOW' ? '#1565c0'
+                    : v.state === 'RAIN_SOON' ? '#bf360c' : '#2e7d32';
+        el.style.color = color;
+        el.style.fontWeight = (v.state === 'NO_RAIN') ? '400' : '700';
+        el.innerHTML = LINK + (v.line_sr || '—') + age;
+        return;
+    }
+    renderRadarStatusLine(radarState);              // fallback: SKALA RAIN (current state)
+}
+
 async function refreshRadar() {
-    const data = await fetchRadarData();
-    radarState = data ? parseRadarState(data) : null;
-    renderRadarStatusLine(radarState);
+    const [rdata, ndata] = await Promise.all([fetchRadarData(), fetchNowcastData()]);
+    radarState = rdata ? parseRadarState(rdata) : null;
+    nowcastState = (ndata && ndata.ok) ? ndata : null;
+    renderStatusLine();
     applyRadarGating();
 }
 
