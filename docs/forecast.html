@@ -1030,12 +1030,17 @@ function nowcastFresh(ns) {
 }
 // Rain over the hour window [offset*60, (offset+1)*60) min from the nowcast base,
 // capped at the DGMR horizon. Returns {rain, mmh}, or null = no opinion (beyond horizon).
-function nowcastWindow(ns, offset) {
+// Rain over the hour window [offset*60,(offset+1)*60) for field `key`: 'point_mmh'
+// = AT Budva (the verdict), 'disc_max_mmh' = the ~8 km region (for the icon's
+// nearby-cell nudge). Capped at the DGMR horizon. Returns {rain,mmh} or null.
+function nowcastWindow(ns, offset, key) {
+    key = key || 'point_mmh';
     const lo = offset * 60, hi = (offset + 1) * 60;
-    if (lo >= ns.horizon_min && !(offset === 0 && ns.now && ns.now.raining)) return null;
-    let peak = (offset === 0 && ns.now && ns.now.raining) ? (ns.now.disc_max_mmh || 0) : 0;
+    const nowVal = (ns.now && ns.now[key] != null) ? ns.now[key] : 0;
+    if (lo >= ns.horizon_min && !(offset === 0 && nowVal >= 0.2)) return null;
+    let peak = (offset === 0) ? nowVal : 0;
     for (const s of (ns.series || [])) {
-        if (s.lead_min > lo && s.lead_min <= hi) peak = Math.max(peak, s.disc_max_mmh || 0);
+        if (s.lead_min > lo && s.lead_min <= hi) peak = Math.max(peak, s[key] || 0);
     }
     return { rain: peak >= 0.2, mmh: peak };
 }
@@ -1053,6 +1058,7 @@ function nowcastIntensityCode(mmh) {
     if (mmh >= 2.5) return 63;    // kiša
     return 61;                    // slaba kiša
 }
+const STRONG_NEARBY_MMH = 25;     // a nearby cell (disc-max) at/above this -> thunderstorm icon
 // IMMINENT rain: DGMR says onset in <= 10 min (or it is already raining in its
 // 'now' frame) while SKALA RAIN hasn't caught it yet -> rain is essentially here,
 // so force the rain icon for the CURRENT hour (both the hourly cell and the big
@@ -1060,8 +1066,13 @@ function nowcastIntensityCode(mmh) {
 function nowcastImminent() {
     const ns = nowcastState;
     if (!nowcastFresh(ns)) return false;
-    const v = ns.verdict || {};
-    const soon = (v.eta_min != null && v.eta_min <= 10) || !!(ns.now && ns.now.raining);
+    // EXACT-Budva (point) onset <= 10 min, or already raining at the point — the
+    // icon represents Budva itself (the verdict LINE is the wider region/disc-max).
+    var pOnset = null;
+    for (var i = 0; i < (ns.series || []).length; i++) {
+        if ((ns.series[i].point_mmh || 0) >= 0.2) { pOnset = ns.series[i].lead_min; break; }
+    }
+    const soon = (pOnset != null && pOnset <= 10) || !!(ns.now && (ns.now.point_mmh || 0) >= 0.2);
     return soon && !(radarState && radarState.rainAtLocation);
 }
 function nowcastImminentCode() {
@@ -1076,6 +1087,15 @@ function cloudToCode(cc) {
     if (cc < 40) return 1;
     if (cc < 75) return 2;
     return 3;
+}
+// Nudge the cloudiness icon up ONE step when there is rain in the REGION around
+// Budva but not at Budva itself: clear/mostly-clear -> partly cloudy, partly cloudy
+// -> overcast. Rain/thunderstorm codes are already heavier, so they are kept.
+function escalateCloud(code) {
+    if (isRainCode(code) || code >= 95) return code;
+    if (code <= 1) return 2;     // vedro / pretežno vedro -> djelimično oblačno
+    if (code === 2) return 3;    // djelimično oblačno -> oblačno
+    return code;                 // već oblačno (3) / magla -> ostaje isto
 }
 function radarFresh(rs) { return !!(rs && rs.ok && rs.ageMin != null && rs.ageMin <= 40); }
 
@@ -1106,13 +1126,19 @@ function gateWeatherCode(code, cloud, offset, rs) {
     if (offset !== 0 && offset !== 1) return code;
     // 1) SKALA NOWCAST — the forecast source.
     if (nowcastFresh(nowcastState)) {
-        const nc = nowcastWindow(nowcastState, offset);
-        if (nc) {
-            if (nc.rain) {                                  // upgrade a light model icon, keep a heavier one
-                const rc = nowcastIntensityCode(nc.mmh);
+        const pt = nowcastWindow(nowcastState, offset, 'point_mmh');     // rain AT Budva
+        const dc = nowcastWindow(nowcastState, offset, 'disc_max_mmh');  // rain in the ~8 km region
+        if (pt) {                                            // nowcast has an opinion (within horizon)
+            if (pt.rain) {                                   // raining AT Budva -> rain icon (point intensity)
+                const rc = nowcastIntensityCode(pt.mmh);
                 return wcSeverity(code) >= wcSeverity(rc) ? code : rc;
             }
-            return isRainCode(code) ? cloudToCode(cloud) : code;   // nowcast dry -> strip model rain
+            if (dc && dc.rain) {                             // dry at Budva, but a cell is NEARBY:
+                if (dc.mmh >= STRONG_NEARBY_MMH)             //   strong cell -> thunderstorm
+                    return wcSeverity(code) >= 5 ? code : 95;
+                return escalateCloud(code);                  //   weaker -> just nudge cloudiness one step
+            }
+            return isRainCode(code) ? cloudToCode(cloud) : code;   // nothing near Budva -> strip model rain
         }
     }
     // 2) Fallback: SKALA RAIN, current state ONLY (offset 0).
@@ -2545,6 +2571,10 @@ function render(data) {
         </div>`;
     }
 
+    html += '<p class="cw-skala-note" style="margin:2px 0 14px;font-size:12px;color:#888;line-height:1.45">'
+      + 'Verdikt SKALA NOWCAST i satna prognoza (mm) su za <b>tačku Budva</b>. '
+      + 'Ikona dodatno odražava ćelije u okolini: vedro → djelimično oblačno, '
+      + 'a jača ćelija u blizini → grmljavina.</p>';
     html += '<div class="hourly-strip"><h3>Prognoza po satima</h3><div class="hourly-row">';
     data.hourly_forecast.forEach((h, i) => {
         const t = h.temperature_2m != null ? Math.round(h.temperature_2m) + '°' : '-';
