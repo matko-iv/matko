@@ -3093,8 +3093,9 @@ loadForecast();
 // Radar status integration (budva-radar repo, this is my repo however it is a separate project with its own codebase and hosting, this just fetches the latest status as JSON and renders a line in the header)
 // ============================================================================
 const RADAR_STATUS_URLS = [
+    'https://pub-3d539da10a4c4aa8a3f0048f8dcb067c.r2.dev/radar_status.json',  // R2 (instant)
     'radar_status.json',
-    'https://matko-iv.github.io/budva-radar/radar_status.json',
+    'https://matko-iv.github.io/budva-radar/radar_status.json',               // GH Pages fallback
 ];
 
 async function fetchRadarData() {
@@ -3191,8 +3192,9 @@ function parseRadarState(data) {
 
 // SKALA NOWCAST status (budva-radar repo): the DGMR rain forecast for Budva.
 const NOWCAST_STATUS_URLS = [
+    'https://pub-3d539da10a4c4aa8a3f0048f8dcb067c.r2.dev/nowcast_status.json',  // R2 (instant)
     'nowcast_status.json',
-    'https://matko-iv.github.io/budva-radar/nowcast_status.json',
+    'https://matko-iv.github.io/budva-radar/nowcast_status.json',               // GH Pages fallback
 ];
 async function fetchNowcastData() {
     for (const url of NOWCAST_STATUS_URLS) {
