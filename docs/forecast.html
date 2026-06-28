@@ -919,7 +919,7 @@
     </p>
 	
 	<p>
-        <b>Crnu Goru zahvata jak toplotni udar.</b> Ako morate da ste napolje, nosite laganu i svijetlu odjeću. Zaštitite lice i oči sa šeširom za sunce širokog oboda i naočare za sunce sa UV zaštitom. Sve zahtijevajuće aktivnosti ostavite za kasno uveče ili rano ujtro. Hidrirajte se konstanto. Širom cijele Evrope, ekstremne vrućine odnesu u prosjeku preko 175.000 života svake godine.
+        <b>Crnu Goru zahvata jak toplotni val.</b> Ako morate da ste napolje, nosite laganu i svijetlu odjeću. Zaštitite lice i oči sa šeširom za sunce širokog oboda i naočare za sunce sa UV zaštitom. Sve zahtijevajuće aktivnosti ostavite za kasno uveče ili rano ujtro. Hidrirajte se konstanto. Širom cijele Evrope, ekstremne vrućine odnesu u prosjeku preko 175.000 života svake godine.
     </p>
 	
 	<p><span style="font-size: 12px;font-style: italic;color:#6a737d; margin: 0 0 0;">Matkov model verzija 4 najnovija je verzija ovog modela i objavljena je 16. juna 2026. godine.</span></p>
@@ -2575,10 +2575,6 @@ function render(data) {
         </div>`;
     }
 
-    html += '<p class="cw-skala-note" style="margin:2px 0 14px;font-size:12px;color:#888;line-height:1.45">'
-      + 'Verdikt SKALA NOWCAST i satna prognoza (mm) su za <b>tačku Budva</b>. '
-      + 'Ikona dodatno odražava ćelije u okolini: vedro → djelimično oblačno, '
-      + 'a jača ćelija u blizini → grmljavina.</p>';
     html += '<div class="hourly-strip"><h3>Prognoza po satima</h3><div class="hourly-row">';
     data.hourly_forecast.forEach((h, i) => {
         const t = h.temperature_2m != null ? Math.round(h.temperature_2m) + '°' : '-';
