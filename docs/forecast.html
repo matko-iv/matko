@@ -2171,6 +2171,7 @@ function maeToAccuracy(param, mae) {
 
 let currentChart = null;
 let forecastData = null;
+let currentUv = null;          // live UV index (Open-Meteo); shown in the card only when > 7
 
 // Beach-level wind amplification estimate based on direction.
 // Open-Meteo's coastal grid cells smooth over land+sea; right at the waterline,
@@ -2437,6 +2438,7 @@ async function loadForecast() {
         render(forecastData);
         renderStatusLine();
         applyRadarGating();
+        fetchUv();                       // async; reveals the UV row only when UV > 7
     } catch(e) {
         document.getElementById('app').innerHTML =
             '<div class="loading" style="color:#d73a49">Greška: ' + e.message +
@@ -2569,6 +2571,7 @@ function render(data) {
                         if (beachGust < 8) return '';
                         return `<div class="cw-detail" title="${beach.hint}">${weatherIcon('wind', 20)} <span>Na plaži udari do ~${beachGust} m/s (${beach.label})</span></div>`;
                     })()}
+                    <div class="cw-detail" id="cwUvDetail" style="display:none"></div>
                 </div>
                 <div id="radarStatusLine" class="cw-radar-line" style="margin-top:10px;padding-top:10px;border-top:1px solid rgba(0,0,0,0.08);font-size:14px;color:#555">Radar: ucitavam...</div>
             </div>
@@ -3232,6 +3235,41 @@ async function refreshRadar() {
     nowcastState = (ndata && ndata.ok) ? ndata : null;
     renderStatusLine();
     applyRadarGating();
+}
+
+// Live UV index for Budva from Open-Meteo. Read in UTC (timezone=GMT) so the hour
+// match works regardless of the visitor's browser timezone; the card shows it only
+// when UV > 7 (see renderUvLine). UV is optional: any failure leaves the row hidden.
+const UV_URL = 'https://api.open-meteo.com/v1/forecast?latitude=42.2864&longitude=18.84'
+             + '&hourly=uv_index&timezone=GMT&forecast_days=2';
+
+async function fetchUv() {
+    try {
+        const r = await fetch(UV_URL, { cache: 'no-store' });
+        if (!r.ok) return;
+        const j = await r.json();
+        const times = j.hourly && j.hourly.time;
+        const vals = j.hourly && j.hourly.uv_index;
+        if (!times || !vals) return;
+        const key = new Date().toISOString().slice(0, 13) + ':00';   // current UTC hour
+        let idx = times.indexOf(key);
+        if (idx < 0) idx = vals.reduce((b, v, i) => (v > vals[b] ? i : b), 0);  // fallback: day peak
+        currentUv = (vals[idx] != null) ? vals[idx] : null;
+        renderUvLine();
+    } catch (e) { /* UV is optional; leave the row hidden */ }
+}
+
+function renderUvLine() {
+    const el = document.getElementById('cwUvDetail');
+    if (!el) return;
+    if (currentUv == null || currentUv <= 7) { el.style.display = 'none'; return; }
+    const uv = currentUv;
+    const band = uv >= 11 ? { c: '#6b49b6', t: 'ekstreman' }
+               : uv >= 8  ? { c: '#d73a49', t: 'vrlo visok' }
+               :            { c: '#e8590c', t: 'visok' };
+    el.innerHTML = `<img src="${ICON_CDN}uv-index.svg" width="20" height="20" style="vertical-align:middle" alt="UV"> `
+                 + `<span style="color:${band.c};font-weight:600">UV ${Math.round(uv)} (${band.t})</span>`;
+    el.style.display = '';
 }
 
 function renderRadarStatusLine(state) {
