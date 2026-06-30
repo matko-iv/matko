@@ -449,6 +449,11 @@
             font-size: 12px;
             margin-top: 3px;
         }
+        .hourly-cell .h-uv {
+            font-size: 11px;
+            font-weight: 700;
+            margin-top: 4px;
+        }
 
         /* Marine forecast — sits below Dugorocna prognoza. */
         .marine-section { margin-top: 32px; margin-bottom: 32px; }
@@ -2172,6 +2177,7 @@ function maeToAccuracy(param, mae) {
 let currentChart = null;
 let forecastData = null;
 let currentUv = null;          // live UV index (Open-Meteo); shown in the card only when > 7
+let uvByHour = {};             // "YYYY-MM-DDTHH" (local) -> uv_index, for the hourly strip
 
 // Beach-level wind amplification estimate based on direction.
 // Open-Meteo's coastal grid cells smooth over land+sea; right at the waterline,
@@ -2594,13 +2600,14 @@ function render(data) {
         const isNow = h.hour === currentHour;
         const gateAttr = gateOffset >= 0 ? ` data-gate="${gateOffset}" data-hour="${h.hour}" data-code="${h.weather_code}" data-cloud="${h.cloud_cover != null ? h.cloud_cover : ''}"` : '';
         html += `
-        <div class="hourly-cell"${gateAttr} ${isNow ? 'style="background:#f1f8ff;border-top:2px solid #0366d6"' : ''}>
+        <div class="hourly-cell"${gateAttr} data-uvkey="${(h.datetime || '').slice(0, 13)}" ${isNow ? 'style="background:#f1f8ff;border-top:2px solid #0366d6"' : ''}>
             <span class="h-time">${String(h.hour).padStart(2,'0')}h</span>
             <span class="h-icon">${weatherIcon(iconKey, 48)}</span>
             <span class="h-temp">${t}</span>
             <span class="h-rain">${rain}</span>
             ${pop ? `<span class="h-pop" style="font-size:11px;color:#0366d6;font-weight:600">${pop}</span>` : ''}
             <span class="h-wind"${gustWarn ? ` title="P(udar > 17 m/s) = ${Math.round(h.p_gust_gt17 * 100)}%"` : ''}>${wind ? windArrow(h.wind_direction_10m) + ' ' + wind + ' m/s' + (gustWarn ? ' ⚠' : '') : ''}</span>
+            <span class="h-uv" style="display:none"></span>
         </div>`;
     });
     html += '</div></div>';
@@ -3237,11 +3244,13 @@ async function refreshRadar() {
     applyRadarGating();
 }
 
-// Live UV index for Budva from Open-Meteo. Read in UTC (timezone=GMT) so the hour
-// match works regardless of the visitor's browser timezone; the card shows it only
-// when UV > 7 (see renderUvLine). UV is optional: any failure leaves the row hidden.
+// Live hourly UV index for Budva from Open-Meteo. timezone=auto returns the hourly
+// timestamps in Budva local time, matching the model's hourly_forecast[].datetime, so we
+// can key UV onto every cell of the hourly strip (not just the current hour). The current
+// card shows UV only when > 7 (see renderUvLine); the strip shows it for every daylight
+// hour (see renderHourlyUv). UV is optional: any failure leaves the rows hidden.
 const UV_URL = 'https://api.open-meteo.com/v1/forecast?latitude=42.2864&longitude=18.84'
-             + '&hourly=uv_index&timezone=GMT&forecast_days=2';
+             + '&hourly=uv_index&timezone=auto&forecast_days=3';
 
 async function fetchUv() {
     try {
@@ -3251,25 +3260,51 @@ async function fetchUv() {
         const times = j.hourly && j.hourly.time;
         const vals = j.hourly && j.hourly.uv_index;
         if (!times || !vals) return;
-        const key = new Date().toISOString().slice(0, 13) + ':00';   // current UTC hour
-        let idx = times.indexOf(key);
-        if (idx < 0) idx = vals.reduce((b, v, i) => (v > vals[b] ? i : b), 0);  // fallback: day peak
-        currentUv = (vals[idx] != null) ? vals[idx] : null;
+        uvByHour = {};
+        for (let i = 0; i < times.length; i++) {
+            if (vals[i] != null) uvByHour[times[i].slice(0, 13)] = vals[i];   // "YYYY-MM-DDTHH"
+        }
+        const now = new Date(), p = n => String(n).padStart(2, '0');
+        const curKey = `${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())}T${p(now.getHours())}`;
+        currentUv = (uvByHour[curKey] != null) ? uvByHour[curKey] : null;
         renderUvLine();
-    } catch (e) { /* UV is optional; leave the row hidden */ }
+        renderHourlyUv();
+    } catch (e) { /* UV is optional; leave the rows hidden */ }
+}
+
+// WHO UV bands -> colour + Montenegrin label.
+function uvBand(uv) {
+    return uv >= 11 ? { c: '#6b49b6', t: 'ekstreman' }
+         : uv >= 8  ? { c: '#d73a49', t: 'vrlo visok' }
+         : uv >= 6  ? { c: '#e8590c', t: 'visok' }
+         : uv >= 3  ? { c: '#f59f00', t: 'umjeren' }
+         :            { c: '#1f883d', t: 'nizak' };
 }
 
 function renderUvLine() {
     const el = document.getElementById('cwUvDetail');
     if (!el) return;
     if (currentUv == null || currentUv <= 7) { el.style.display = 'none'; return; }
-    const uv = currentUv;
-    const band = uv >= 11 ? { c: '#6b49b6', t: 'ekstreman' }
-               : uv >= 8  ? { c: '#d73a49', t: 'vrlo visok' }
-               :            { c: '#e8590c', t: 'visok' };
+    const band = uvBand(currentUv);
     el.innerHTML = `<img src="${ICON_CDN}uv-index.svg" width="20" height="20" style="vertical-align:middle" alt="UV"> `
-                 + `<span style="color:${band.c};font-weight:600">UV ${Math.round(uv)} (${band.t})</span>`;
+                 + `<span style="color:${band.c};font-weight:600">UV ${Math.round(currentUv)} (${band.t})</span>`;
     el.style.display = '';
+}
+
+// Fill the per-hour UV badge on each cell of the hourly strip from uvByHour. Hidden at
+// night / very low UV (rounds to 0) to avoid clutter; coloured by WHO band otherwise.
+function renderHourlyUv() {
+    document.querySelectorAll('.hourly-cell[data-uvkey]').forEach(cell => {
+        const el = cell.querySelector('.h-uv');
+        if (!el) return;
+        const uv = uvByHour[cell.getAttribute('data-uvkey')];
+        if (uv == null || Math.round(uv) < 1) { el.style.display = 'none'; el.textContent = ''; return; }
+        const band = uvBand(uv);
+        el.textContent = 'UV ' + Math.round(uv);
+        el.style.color = band.c;
+        el.title = 'UV indeks: ' + band.t;
+        el.style.display = '';
+    });
 }
 
 function renderRadarStatusLine(state) {
