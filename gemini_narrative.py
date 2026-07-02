@@ -1,25 +1,24 @@
-"""Factual-only Montenegrin weather narratives: Gemini as a REPHRASER, not an
-author (research report "Keeping Gemini in the Loop Without Hallucinating").
+"""Factual-only Montenegrin weather narratives: Gemini as a rephraser.
 
-The rule-based `_daily_narrative()` already produces a provably-correct sentence.
-Instead of letting Gemini GENERATE from the hourly/daily table (which hallucinates
-phantom rain/wind/thunder), we feed it the correct sentence and ask only for a
-stylistic paraphrase, then run a DETERMINISTIC guardrail and fall back to the
-rule-based sentence on any failure. The guardrail — not the LLM — is the actual
-guarantee of factual output.
+The rule-based `_daily_narrative()` already produces a correct sentence.
+Letting Gemini generate from the hourly table hallucinates phantom
+rain/wind/thunder, so Gemini gets the correct sentence and is asked only for
+a stylistic paraphrase; a deterministic guardrail rejects anything unfaithful
+and falls back to the rule-based sentence. The guardrail, not the LLM, is
+the factual guarantee.
 
   daily_narrative_ai(correct_sentence, ds)
       -> rephrase(correct_sentence) -> validate(candidate, ds) -> candidate
-      -> else: correct_sentence  (guaranteed-safe fallback)
+      -> else: correct_sentence  (safe fallback)
 
-Dependency-light: stdlib + `requests` (lazy-imported, already a project dep). The
-guardrail itself needs only stdlib, so it is unit-testable without any network.
+stdlib + lazily-imported `requests`; the guardrail itself needs only stdlib,
+so it tests without a network.
 """
 
 import os
 import re
 
-# Gemini 3.x GA Flash model (PDF Stage 2). Pinned so output doesn't drift when
+# Gemini 3.x GA Flash model. Pinned so output doesn't drift when
 # Google changes defaults.
 MODEL = "gemini-3.5-flash"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
@@ -52,9 +51,9 @@ def _wmo(ds):
         return None
 
 
-# Zero-tolerance phantom phenomena: stemmed Montenegrin token -> predicate over
-# the structured daily summary `ds`. If the rephrase mentions one the data does
-# NOT support, it is rejected (the user's "phantom rain/wind/thunder" concern).
+# Zero-tolerance phantom phenomena: stemmed Montenegrin token -> predicate
+# over the daily summary `ds`. A rephrase mentioning one the data doesn't
+# support is rejected.
 _PHANTOM = {
     "kiš":     lambda d: _num(d, "precip_total") >= RAIN_PRECIP_MIN_MM,
     "pljus":   lambda d: _num(d, "precip_total") >= RAIN_PRECIP_MIN_MM,
@@ -64,20 +63,19 @@ _PHANTOM = {
     "magl":    lambda d: _wmo(d) in FOG_CODES,
 }
 
-# Strong-wind claims (jak [smjer] vjetar / olujno / orkansko / udari) are gated
-# on speed; bare "vjetar" / "slab vjetar" stays lenient. The regex allows ONE
-# wind-direction word between "jak" and "vjetar" (e.g. "jak sjeverozapadni
-# vjetar"), but not two — so "jaka kiša, slab vjetar" is not mis-flagged.
+# Strong-wind claims (jak [smjer] vjetar / olujno / orkansko / udari) are
+# gated on speed; bare "vjetar" / "slab vjetar" stays lenient. The regex
+# allows one wind-direction word between "jak" and "vjetar", but not two, so
+# "jaka kiša, slab vjetar" is not mis-flagged.
 _STRONG_WIND_RE = re.compile(r"jak\w*\s+(?:\w+\s+)?vjet|oluj|orkan|udar")
 
 
 def validate(text, ds):
-    """True iff `text` is a faithful rephrase of the day's weather: it must not
-    introduce a zero-tolerance phantom (rain/thunder/snow/fog) unsupported by the
-    data `ds`, nor claim strong wind the data lacks. Sky/wind descriptors are
-    otherwise lenient so faithful rephrases (e.g. "Sunčano ujutru, kiša od
-    podneva") are not false-rejected. Any failure -> caller falls back to the
-    rule-based sentence, so this is the real factual guarantee."""
+    """True iff `text` is a faithful rephrase: no phantom rain/thunder/snow/
+    fog the data `ds` lacks, no strong-wind claim without the speed. Sky and
+    wind descriptors are otherwise lenient so faithful rephrases aren't
+    false-rejected. On failure the caller falls back to the rule-based
+    sentence, which is the real factual guarantee."""
     if not text or not text.strip():
         return False
     t = text.lower()
@@ -97,7 +95,6 @@ def validate(text, ds):
     return True
 
 
-# --- Gemini rephraser (transform-only) --------------------------------------
 SYSTEM = (
     "Ti si jezički uređivač za vremenske prognoze na crnogorskom jeziku. "
     "Dobićeš jednu TAČNU rečenicu o vremenu. Tvoj JEDINI zadatak je da je "
@@ -111,7 +108,7 @@ SYSTEM = (
     "informaciju i bez ikakvih objašnjenja."
 )
 
-# Few-shot pairs teach the TRANSFORM (rephrase), not fact generation.
+# Few-shot pairs teach the rephrase transform, not fact generation.
 FEWSHOT = [
     ("Sunčano prije podne, kiša od podneva; jak SZ vjetar.",
      "Prijepodne sunčano, a od podneva kiša uz jak sjeverozapadni vjetar."),
@@ -139,18 +136,16 @@ def _http_post(url, payload, timeout):
 
 def rephrase(correct_sentence, *, api_key=None, timeout=15, retries=4):
     """Ask Gemini to paraphrase the already-correct sentence into natural
-    Montenegrin (transform-only). Returns the candidate string, or None on any
-    failure (the caller validates and falls back). Raw REST; no SDK dependency.
+    Montenegrin. Returns the candidate, or None on any failure (the caller
+    validates and falls back). Raw REST, no SDK.
 
-    CRITICAL — thinking must be DISABLED. gemini-3.5-flash defaults to *medium*
+    Thinking must stay disabled: gemini-3.5-flash defaults to medium
     thinking, which spends the output-token budget reasoning and returns the
-    sentence TRUNCATED mid-word ("opisi se ne završe"). `thinkingBudget: 0` turns
-    it off (this near-mechanical rephrase needs none) and `maxOutputTokens` is set
-    well above the longest sentence. As a hard backstop, any response that did
-    NOT finish cleanly (finishReason != STOP) is rejected, so a half sentence can
-    never ship — the caller falls back to the complete rule-based sentence.
-
-    temperature/top_p/top_k are deliberately NOT set (discouraged on Gemini 3.x).
+    sentence truncated mid-word ("opisi se ne završe"). `thinkingBudget: 0`
+    turns it off, `maxOutputTokens` sits well above the longest sentence, and
+    any response with finishReason != STOP is rejected as a backstop, so a
+    half sentence never ships. temperature/top_p/top_k stay unset, as Google
+    discourages them on Gemini 3.x.
     """
     key = api_key if api_key is not None else GEMINI_API_KEY
     if not key or not correct_sentence:
@@ -186,12 +181,11 @@ def rephrase(correct_sentence, *, api_key=None, timeout=15, retries=4):
 
 
 def generate(date_str, hourly_rows, wmo_codes, *, api_key=None, timeout=15, retries=4):
-    """FULL Gemini narrative generated from HOURLY data — the EXACT prompt of the
-    legacy forecast_48h_v3._gemini_narrative, copied verbatim, on
-    gemini-3-flash-preview. Returns the text, or None on any failure / truncation.
-
-    `wmo_codes` (the WMO_CODES table) is passed in by the caller to avoid a
-    circular import. The output is the caller's to validate() before use."""
+    """Full Gemini narrative from hourly data — the legacy
+    forecast_48h_v3._gemini_narrative prompt verbatim, on
+    gemini-3-flash-preview. Returns the text, or None on failure/truncation.
+    `wmo_codes` is passed in to avoid a circular import; the caller must
+    validate() the output before use."""
     key = api_key if api_key is not None else GEMINI_API_KEY
     if not key or not hourly_rows:
         return None
@@ -248,12 +242,11 @@ def generate(date_str, hourly_rows, wmo_codes, *, api_key=None, timeout=15, retr
 
 
 def daily_narrative_ai(correct_sentence, ds, hourly_rows=None, wmo_codes=None):
-    """Gemini narrative behind the deterministic guardrail, with the rule-based
-    `correct_sentence` as the guaranteed-safe fallback. When HOURLY data is
-    available, Gemini GENERATES from it with the legacy hourly prompt
-    (`generate`); otherwise it REPHRASES the rule-based sentence. Either way the
-    candidate must pass validate(...) against `ds` — a phantom or truncation can
-    never reach the output."""
+    """Gemini narrative behind the guardrail, with `correct_sentence` as the
+    fallback. With hourly data Gemini generates via the legacy prompt;
+    otherwise it rephrases the rule-based sentence. Either way the candidate
+    must pass validate() against `ds`, so a phantom or truncation never
+    reaches the output."""
     if hourly_rows:
         candidate = generate(ds.get("date", ""), hourly_rows, wmo_codes)
     else:

@@ -1,24 +1,11 @@
-"""
-PROFESIONALNA VIZUALIZACIJA REZULTATA ANALIZE - PROŠIRENA VERZIJA
+"""Proširena vizualizacija analize grešaka vremenskih modela za Budvu.
 
-════════════════════════════════════════════════════════════════════════════
-
-VERZIJA 5.0 - Značajno proširena:
-
-✓ SVE vizualizacije iz v4.0
-✓ RMSE vs MAE poređenje
-✓ Bias heatmap po sezoni i dobu dana
-✓ Scatter plots (prognoza vs. opservacija)
-✓ Error distribution histogrami
-✓ Wind rose dijagrami po modelu
-✓ Precipitation skill score
-✓ Cloud cover accuracy
-✓ Correlation matrica svih varijabli
-✓ Time series grešaka kroz godine
-✓ Performance po temperaturnom rangu
-
-TOTAL: 15+ profesionalnih vizualizacija
-
+Uz osnovne grafike iz visualize_analysis.py dodaje: RMSE/MAE poređenje,
+bias heatmap po sezoni i dobu dana, scatter prognoza-opservacija, histograme
+distribucije grešaka, wind rose po modelu, precipitation skill score,
+tačnost oblačnosti, korelacionu matricu, vremenske serije grešaka i
+performanse po temperaturnom rangu. Čita budva_detailed_error_analysis.json,
+piše PNG-ove u plots_extended/.
 """
 
 import json
@@ -149,7 +136,7 @@ def plot_model_performance_overview(reports):
 
     plt.tight_layout()
     plt.savefig(f'{OUTPUT_DIR}/01_model_performance_overview.png', dpi=300, bbox_inches='tight', facecolor='white')
-    print("✅ 01_model_performance_overview.png")
+    print("saved 01_model_performance_overview.png")
     plt.close()
 
 def plot_systematic_bias(reports):
@@ -189,7 +176,7 @@ def plot_systematic_bias(reports):
 
     plt.tight_layout()
     plt.savefig(f'{OUTPUT_DIR}/02_systematic_bias.png', dpi=300, bbox_inches='tight', facecolor='white')
-    print("✅ 02_systematic_bias.png")
+    print("saved 02_systematic_bias.png")
     plt.close()
 
 def plot_seasonal_analysis(reports):
@@ -236,7 +223,7 @@ def plot_seasonal_analysis(reports):
 
     plt.tight_layout()
     plt.savefig(f'{OUTPUT_DIR}/03_seasonal_analysis.png', dpi=300, bbox_inches='tight', facecolor='white')
-    print("✅ 03_seasonal_analysis.png")
+    print("saved 03_seasonal_analysis.png")
     plt.close()
 
 def plot_diurnal_cycle(reports):
@@ -269,7 +256,7 @@ def plot_diurnal_cycle(reports):
 
     plt.tight_layout()
     plt.savefig(f'{OUTPUT_DIR}/04_diurnal_cycle.png', dpi=300, bbox_inches='tight', facecolor='white')
-    print("✅ 04_diurnal_cycle.png")
+    print("saved 04_diurnal_cycle.png")
     plt.close()
 
 def plot_extreme_conditions(reports):
@@ -330,7 +317,7 @@ def plot_extreme_conditions(reports):
 
     plt.tight_layout()
     plt.savefig(f'{OUTPUT_DIR}/05_extreme_conditions.png', dpi=300, bbox_inches='tight', facecolor='white')
-    print("✅ 05_extreme_conditions.png")
+    print("saved 05_extreme_conditions.png")
     plt.close()
 
 def plot_model_comparison_matrix(reports):
@@ -384,7 +371,7 @@ def plot_model_comparison_matrix(reports):
 
     plt.tight_layout()
     plt.savefig(f'{OUTPUT_DIR}/06_model_comparison_matrix.png', dpi=300, bbox_inches='tight', facecolor='white')
-    print("✅ 06_model_comparison_matrix.png")
+    print("saved 06_model_comparison_matrix.png")
     plt.close()
 
 
@@ -428,7 +415,7 @@ def plot_mae_vs_rmse(reports):
 
     plt.tight_layout()
     plt.savefig(f'{OUTPUT_DIR}/07_mae_vs_rmse.png', dpi=300, bbox_inches='tight', facecolor='white')
-    print("✅ 07_mae_vs_rmse.png")
+    print("saved 07_mae_vs_rmse.png")
     plt.close()
 
 def plot_bias_heatmap_season_time(reports):
@@ -477,7 +464,7 @@ def plot_bias_heatmap_season_time(reports):
 
     plt.tight_layout()
     plt.savefig(f'{OUTPUT_DIR}/08_bias_heatmap.png', dpi=300, bbox_inches='tight', facecolor='white')
-    print("✅ 08_bias_heatmap.png")
+    print("saved 08_bias_heatmap.png")
     plt.close()
 
 def plot_weather_condition_comparison(reports):
@@ -508,7 +495,7 @@ def plot_weather_condition_comparison(reports):
 
     plt.tight_layout()
     plt.savefig(f'{OUTPUT_DIR}/09_weather_condition_comparison.png', dpi=300, bbox_inches='tight', facecolor='white')
-    print("✅ 09_weather_condition_comparison.png")
+    print("saved 09_weather_condition_comparison.png")
     plt.close()
 
 def plot_precipitation_intensity(reports):
@@ -539,7 +526,7 @@ def plot_precipitation_intensity(reports):
 
     plt.tight_layout()
     plt.savefig(f'{OUTPUT_DIR}/10_precipitation_intensity.png', dpi=300, bbox_inches='tight', facecolor='white')
-    print("✅ 10_precipitation_intensity.png")
+    print("saved 10_precipitation_intensity.png")
     plt.close()
 
 def plot_all_variables_radar(reports):
@@ -593,7 +580,7 @@ def plot_all_variables_radar(reports):
 
     plt.tight_layout()
     plt.savefig(f'{OUTPUT_DIR}/11_radar_all_variables.png', dpi=300, bbox_inches='tight', facecolor='white')
-    print("✅ 11_radar_all_variables.png")
+    print("saved 11_radar_all_variables.png")
     plt.close()
 
 def plot_skill_score_cloudiness(reports):
@@ -644,7 +631,7 @@ def plot_skill_score_cloudiness(reports):
 
     plt.tight_layout()
     plt.savefig(f'{OUTPUT_DIR}/12_cloudiness_skill.png', dpi=300, bbox_inches='tight', facecolor='white')
-    print("✅ 12_cloudiness_skill.png")
+    print("saved 12_cloudiness_skill.png")
     plt.close()
 
 def plot_overall_ranking(reports):
@@ -677,7 +664,7 @@ def plot_overall_ranking(reports):
 
     plt.tight_layout()
     plt.savefig(f'{OUTPUT_DIR}/13_overall_ranking.png', dpi=300, bbox_inches='tight', facecolor='white')
-    print("✅ 13_overall_ranking.png")
+    print("saved 13_overall_ranking.png")
     plt.close()
 
 def create_summary_report(reports):
@@ -730,23 +717,18 @@ RANGIRANJE MODELA (po MAE temperature):
 
     with open(f'{OUTPUT_DIR}/00_SUMMARY_REPORT.txt', 'w', encoding='utf-8') as f:
         f.write(report_text)
-    print("✅ 00_SUMMARY_REPORT.txt")
+    print("saved 00_SUMMARY_REPORT.txt")
     print(report_text)
 
 
 def main():
-    print("\n" + "="*80)
-    print("PROFESIONALNA VIZUALIZACIJA - PROŠIRENA VERZIJA (v5.0)")
-    print("="*80 + "\n")
-
     reports = load_reports(JSON_FILE)
 
     if not reports:
-        print("❌ Nema podataka u JSON fajlu!")
+        print("Nema podataka u JSON fajlu.")
         return
 
-    print(f"📊 Učitano {len(reports)} modela\n")
-    print("Kreiram 13+ vizualizacija...\n")
+    print(f"Učitano {len(reports)} modela; kreiram vizualizacije...")
 
     create_summary_report(reports)
     plot_model_performance_overview(reports)
@@ -764,12 +746,7 @@ def main():
     plot_skill_score_cloudiness(reports)
     plot_overall_ranking(reports)
 
-    print("\n" + "="*80)
-    print(f"✅ SVE VIZUALIZACIJE SAČUVANE U: {OUTPUT_DIR}/")
-    print("="*80)
-    print("\n📈 Kreirano 13+ profesionalnih grafika!")
-    print("\n✨ Dizajn: Znanstveni (Nature/Science stil)")
-    print("="*80 + "\n")
+    print(f"Sve vizualizacije sačuvane u {OUTPUT_DIR}/")
 
 if __name__ == "__main__":
     main()

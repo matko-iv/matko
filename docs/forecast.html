@@ -2444,7 +2444,7 @@ async function loadForecast() {
     } catch(e) {
         document.getElementById('app').innerHTML =
             '<div class="loading" style="color:#d73a49">Greška: ' + e.message +
-            '<br><small>Pokrenite forecast_48h_v2.py za generisanje prognoze</small></div>';
+            '<br><small>Pokrenite forecast_48h_v3.py za generisanje prognoze</small></div>';
     }
 }
 
@@ -2585,7 +2585,7 @@ function render(data) {
         const t = h.temperature_2m != null ? Math.round(h.temperature_2m) + '°' : '-';
         const rain = h.precipitation > 0.05 ? h.precipitation.toFixed(1) + 'mm' : '';
         const wind = h.wind_speed_10m != null ? h.wind_speed_10m.toFixed(1) : '';
-        // PDF2 §3.5: calibrated PoP + gust-exceedance badge (fields exist only
+        // Calibrated PoP + gust-exceedance badge (fields exist only
         // after the quantile-upgrade retrain; render nothing on old JSONs)
         const pop = (h.precipitation_pop != null && h.precipitation_pop >= 0.15)
             ? Math.round(h.precipitation_pop * 100) + '%' : '';
@@ -2608,7 +2608,7 @@ function render(data) {
     });
     html += '</div></div>';
 
-    // PDF2 §5.2: ECC-scenario window probabilities (temporally coherent PoP)
+    // ECC-scenario window probabilities (temporally coherent PoP)
     if (data.precip_scenarios) {
         const ps = data.precip_scenarios;
         const pct = v => v != null ? Math.round(v * 100) + '%' : '–';
@@ -2988,7 +2988,7 @@ function drawChart(type) {
         }
     };
 
-    // --- PDF2 §3.5: distributional layers (only when the JSON has quantiles) ---
+    // Distributional layers (only when the JSON has quantiles).
     // Temp fan chart: q05-q95 (light) + q25-q75 (darker) bands around the line.
     if (hours.some(h => h.temperature_2m_q05 != null)) {
         const band = (key, color) => ({ label: '_' + key, data: hours.map(h => h[key]),
@@ -3095,9 +3095,8 @@ function drawChart(type) {
 
 loadForecast();
 
-// ============================================================================
-// Radar status integration (budva-radar repo, this is my repo however it is a separate project with its own codebase and hosting, this just fetches the latest status as JSON and renders a line in the header)
-// ============================================================================
+// Radar status from the separate budva-radar project: fetch the latest
+// status JSON and render a line in the header.
 const RADAR_STATUS_URLS = [
     'https://pub-3d539da10a4c4aa8a3f0048f8dcb067c.r2.dev/radar_status.json',  // R2 (instant)
     'radar_status.json',

@@ -1,7 +1,7 @@
 """
 XGBoost +48h forecast correction for Budva.
 Historical bias tables + multi-model ensemble + XGBoost per parameter.
-Run: .venv/Scripts/python.exe forecast_48h_v2.py
+Run: .venv/Scripts/python.exe forecast_48h_v3.py [--skip-training]
 Author: Matija Ivanović (@matko-iv)
 """
 
@@ -20,9 +20,9 @@ from sklearn.linear_model import RidgeCV
 
 
 def meteorological_metrics(y_true, y_pred_binary, p_proba=None):
-    """PDF §6.2: contingency-table metrics for precipitation classification.
+    """contingency-table metrics for precipitation classification.
     Returns dict with POD (recall), FAR (1-precision), CSI, HSS, SEDI plus
-    Brier score and reliability-diagram RMSE if p_proba is provided (PDF §6.3).
+    Brier score and reliability-diagram RMSE if p_proba is provided.
     Use these instead of F1 for precision-first rain detection."""
     y_true = np.asarray(y_true).astype(int)
     y_pred = np.asarray(y_pred_binary).astype(int)
@@ -60,7 +60,7 @@ def meteorological_metrics(y_true, y_pred_binary, p_proba=None):
         brier_clim = float(np.mean((base_rate - y_true) ** 2)) if len(y_true) else 1.0
         out["brier_skill_score"] = float(1 - out["brier"] / brier_clim) if brier_clim > 0 else 0.0
         # Reliability-diagram RMSE: bin predictions, compare to observed frequency
-        # PDF §6.3: target < 0.05 annually, < 0.07 in Jun-Sep
+        # target < 0.05 annually, < 0.07 in Jun-Sep
         bins = np.linspace(0.0, 1.0, 11)  # 10 bins of width 0.1
         rel_sq_err, total_weight = 0.0, 0
         for lo, hi in zip(bins[:-1], bins[1:]):
@@ -187,7 +187,7 @@ def temporal_fss(pred_wet, obs_wet, window=3):
 
 def threshold_for_precision_at_recall(y_true, p_proba, min_recall=0.5,
                                        fallback_thresh=0.5):
-    """PDF §1.3: precision-first threshold tuning.
+    """precision-first threshold tuning.
     Pick threshold that MAXIMIZES precision subject to recall >= min_recall.
     Fallback to argmax precision if no feasible point."""
     prec, rec, thr = precision_recall_curve(y_true, p_proba)
@@ -203,7 +203,7 @@ def threshold_for_precision_at_recall(y_true, p_proba, min_recall=0.5,
 
 
 def focal_loss_xgb_objective(gamma: float = 2.0, alpha: float = 0.25):
-    """PDF §1.2: focal loss as XGBoost custom objective for binary classification.
+    """focal loss as XGBoost custom objective for binary classification.
 
     Wang, Deng & Wang (2020), "Imbalance-XGBoost: leveraging weighted and focal
     losses for binary label-imbalanced classification with XGBoost"
@@ -239,7 +239,7 @@ def focal_loss_xgb_objective(gamma: float = 2.0, alpha: float = 0.25):
         # dL/dz = at * (1-pt)^gamma * (gamma*pt*log(pt) + pt - 1) * sgn
         grad = at * one_minus_pt_g * (gamma * pt * log_pt + pt - 1) * sgn
         # Second derivative wrt raw margin (correct full derivation; NOT the
-        # PDF's simplified formula which can go NEGATIVE for small pt and
+        # the simplified textbook formula, which can go negative for small pt and
         # destabilizes XGBoost's Newton step).
         # d^2L/dz^2 = at * pt * (1-pt)^gamma * [ gamma*log(pt)*(1 - pt*(gamma+1))
         #                                       - pt*(3*gamma + 1) + 2*gamma + 1 ]
@@ -274,7 +274,7 @@ def focal_loss_xgb_feval(gamma: float = 2.0, alpha: float = 0.25):
 
 
 def seasonal_sample_weights(months, y, summer_months=(6, 7, 8, 9)):
-    """PDF §1.1: asymmetric sample weights conditioned on month.
+    """asymmetric sample weights conditioned on month.
 
     Relax positives in summer (we already over-forecast), penalize negatives in
     summer more (false alarms hurt user trust most). Push positives in winter
@@ -506,7 +506,7 @@ def _cache_path(endpoint, model_id, lat, lon):
 
 def _cache_age_hours(path):
     """Cache age in hours from the stored fetch time (`.fetched` sidecar), NOT
-    file mtime. CRITICAL on GitHub Actions: `git checkout` rewrites every file's
+    file mtime. On GitHub Actions this matters: `git checkout` rewrites every file's
     mtime to the checkout time, so a committed cache always looked 0.0h fresh and
     the TTL check NEVER refetched (frozen stale data — the long-range bug). The
     sidecar stores the real fetch unix time inside the repo content, which git
@@ -615,7 +615,7 @@ PREV_RUNS_API = "https://previous-runs-api.open-meteo.com/v1/forecast"
 WU_STATION_ID = os.environ.get("WU_STATION_ID", "IBUDVA5")
 WU_API_KEY = os.environ.get("WU_API_KEY", "")
 
-# --- Monograph-2 aux data (PDF2 §4.2 neighborhood, §7.1 transdinaric gradient) ---
+# --- Monograph-2 aux data ---
 # Grid must match fetch_neighborhood.py exactly (row-major, lats S->N, lons W->E,
 # Budva = p12, ~12 km spacing).
 NBR_LATS = [42.0664, 42.1764, 42.2864, 42.3964, 42.5064]
@@ -626,14 +626,14 @@ NEIGHBORHOOD_MODELS = ["ITALIAMETEO_ICON2I", "ECMWF_IFS025", "GFS_SEAMLESS",
                        "METEOFRANCE", "KNMI_SEAMLESS"]
 PG_LAT, PG_LON = 42.4411, 19.2626  # Podgorica — inland side of the Lovcen ridge
 
-# SKALA radar status (PDF2 §4.3 nowcast blending) — the budva-radar pipeline
+# SKALA radar status — the budva-radar pipeline
 # mirrors its radar_status.json into our docs/; the repo path is the fallback.
 RADAR_STATUS_CANDIDATES = [
     os.path.join(BASE_DIR, 'docs', 'radar_status.json'),
     r'C:\Users\Matija\Documents\GitHub\budva-radar\docs\radar_status.json',
 ]
 
-# PDF2 §8.6: HP budget — 10-15 Optuna trials is too small for XGBoost's
+# HP budget — 10-15 Optuna trials is too small for XGBoost's
 # learning_rate/n_estimators/min_child_weight; ~50 with early stopping.
 # Override per run: FC_TRIALS=15 for a quick retrain.
 N_TRIALS = int(os.environ.get('FC_TRIALS', '50'))
@@ -686,7 +686,7 @@ def compute_clear_sky(dt_series):
 
 def fetch_sst_data(start_date, end_date):
     """Fetch sea surface temperature from Open-Meteo Marine API.
-    NOTE: Marine API only provides recent + forecast data (~16 days), NOT historical.
+    The Marine API only provides recent + forecast data (~16 days), not historical.
     For historical training use ERA5 archive instead."""
     sst_cache = os.path.join(BASE_DIR, 'budva_sst_cache.csv')
     if os.path.exists(sst_cache):
@@ -786,13 +786,13 @@ def station_says_dry_now(obs):
 
 
 def read_radar_nowcast(max_age_min=25):
-    """SKALA radar nowcast for 0-6h precip blending (PDF2 §4.3).
+    """SKALA radar nowcast for 0-6h precip blending.
 
     Reads radar_status.json produced by the budva-radar pipeline (mirrored
     into our docs/). Uses sources.dhmz.approaching.nowcast_details.p_by_lead
     {15,30,60,120 min} + the dominant-cell receding flag. Returns a dict or
     None when the file is missing/stale — callers must degrade gracefully.
-    NOTE: the SKALA verification log has no overlap with the training period
+    The SKALA verification log has no overlap with the training period
     yet, so the radar is inference-time evidence only ("collect now, train
     later" for the onset model)."""
     for path in RADAR_STATUS_CANDIDATES:
@@ -926,7 +926,7 @@ def load_historical_data():
     # Za korišćenje SST kao istorijski feature za treniranje, trebalo bi koristiti
     # ERA5 archive (drugi izvor) - nije implementirano.
 
-    # --- Stability/synoptic features (PDF §2.4) ---
+    # --- Stability/synoptic features ---
     # Merge in CAPE/CIN/lifted_index/wind@500-700hPa per model. Generated by
     # fetch_stability_features.py. Missing files are silently skipped (no break).
     stab_loaded = 0
@@ -944,7 +944,7 @@ def load_historical_data():
     if stab_loaded > 0:
         print(f"  Stability features: merged {stab_loaded} model stability CSV(s)")
 
-    # --- Neighborhood 5x5 precip (PDF2 §4.2) ---
+    # --- Neighborhood 5x5 precip ---
     # Generated by fetch_neighborhood.py. Columns get the model prefix here so
     # multiple models' grids can coexist ({M}_nbr_p00..p24).
     nbr_dir = os.path.join(BASE_DIR, 'neighborhood_data')
@@ -965,7 +965,7 @@ def load_historical_data():
     if nbr_loaded > 0:
         print(f"  Neighborhood precip: merged {nbr_loaded} model grid CSV(s)")
 
-    # --- Podgorica MSLP (PDF2 §7.1 transdinaric gradient) ---
+    # --- Podgorica MSLP ---
     pg_dir = os.path.join(BASE_DIR, 'podgorica_data')
     pg_loaded = 0
     if os.path.isdir(pg_dir):
@@ -982,7 +982,7 @@ def load_historical_data():
     if pg_loaded > 0:
         print(f"  Podgorica MSLP: merged {pg_loaded} model CSV(s)")
 
-    # --- Observation QC (PDF1 §12) ---
+    # --- Observation QC ---
     # Flag physically impossible values as NaN to prevent training on bad data.
     qc_limits = {
         'temperature_2m_obs': (-20, 50),
@@ -1066,7 +1066,7 @@ def engineer_features(df):
     out['hour'] = out['datetime'].dt.hour
     out['month'] = out['datetime'].dt.month
     out['day_of_year'] = out['datetime'].dt.dayofyear
-    # PDF2 §5.4: harmonics must follow the SUN, not the wall clock. Local
+    # harmonics must follow the SUN, not the wall clock. Local
     # (Europe/Podgorica) hours jump by 1h at each DST transition, which shifts
     # the learned diurnal phase between winter and summer. Convert to UTC for
     # the cyclic encodings; 'hour'/'month'/'season' stay local for the
@@ -1100,7 +1100,7 @@ def engineer_features(df):
     out['is_daytime'] = (clear > 20).astype(float)
     out['clear_sky_rad'] = clear
 
-    # --- Missingness indicators per model (PDF1 §1, PDF2: NaN passthrough) ---
+    # --- Missingness indicators per model ---
     # XGBoost's sparsity-aware splits handle NaN natively; indicators let it learn
     # that model availability itself carries information.
     for m in MODELS:
@@ -1142,10 +1142,10 @@ def engineer_features(df):
 
     if 'temperature_2m_ens_mean' in out.columns and 'dew_point_2m_ens_mean' in out.columns:
         out['temp_dew_spread'] = out['temperature_2m_ens_mean'] - out['dew_point_2m_ens_mean']
-        # Dew point deficit feature (PDF1 §8: predict deficit instead of Td directly)
+        # Dew point deficit feature
         out['dew_point_deficit'] = out['temperature_2m_ens_mean'] - out['dew_point_2m_ens_mean']
 
-    # --- Clear-sky index (CSI) features for solar radiation (PDF1 §4) ---
+    # --- Clear-sky index (CSI) features for solar radiation ---
     # CSI = GHI / GHI_clearsky normalizes out the diurnal cycle and solar geometry,
     # constraining the target to approximately [0, 1.2]. 15-25% MAE reduction expected.
     if 'shortwave_radiation_ens_mean' in out.columns and 'clear_sky_rad' in out.columns:
@@ -1174,7 +1174,7 @@ def engineer_features(df):
         out['rain_model_count'] = (rain_vals > 0.1).sum(axis=1)
         out['rain_agreement'] = out['rain_model_count'] / max(len(rain_mcols), 1)
 
-        # --- PDF Tier A: precision-first false-alarm fingerprint features ---
+        # Precision-first false-alarm fingerprint features.
         # High-res LAMs vs global models. Real frontal rain shows up in both;
         # weakly-forced summer convection often only triggers in high-res LAMs.
         HIGH_RES = ["ITALIAMETEO_ICON2I", "ICON_SEAMLESS", "KNMI_SEAMLESS", "DMI_SEAMLESS"]
@@ -1191,7 +1191,7 @@ def engineer_features(df):
             out['regional_minus_global_wet'] = out['frac_high_res_wet'] - out['frac_global_wet']
 
         # italiameteo_isolated = ICON-2I says rain but <= 30% of others do.
-        # Direct false-alarm fingerprint per PDF §2.2. NOT a gate, just a feature.
+        # Direct false-alarm fingerprint per NOT a gate, just a feature.
         icon2i_col = "ITALIAMETEO_ICON2I_precipitation_model"
         if icon2i_col in out.columns:
             icon2i_wet = (pd.to_numeric(out[icon2i_col], errors='coerce') >= 0.1)
@@ -1258,7 +1258,7 @@ def engineer_features(df):
         if wd in out.columns and ws in out.columns:
             d = pd.to_numeric(out[wd], errors='coerce')
             s = pd.to_numeric(out[ws], errors='coerce')
-            # Widened bura detection: full NE quadrant 0-90° at 7 m/s (PDF2 §bura)
+            # Widened bura detection: full NE quadrant 0-90° at 7 m/s
             out[f'{m}_bura'] = (((d >= 315) | (d <= 90)) & (s >= 7)).astype(float)
     bura_cols = [f'{m}_bura' for m in MODELS if f'{m}_bura' in out.columns]
     if bura_cols:
@@ -1357,13 +1357,13 @@ def engineer_features(df):
     if 'precipitation_ens_std' in out.columns:
         out['precip_model_certainty'] = 1.0 / (1.0 + out['precipitation_ens_std'])
 
-    # --- PDF Tier A: ICON-2I MICROFISICA-NEW regime change flag ---
+    # ICON-2I MICROFISICA-NEW regime change flag.
     # ItaliaMeteo confirmed on 26-May-2025 that pre-fix ICON-2I systematically
     # overestimated weakly-forced summer convection. Training data straddles
     # both regimes; let XGB learn the bias change.
     out['icon2i_era'] = (out['datetime'] >= pd.Timestamp('2025-05-26')).astype(float)
 
-    # --- PDF §2.4: stability/synoptic features (require stability CSVs) ---
+    # --- stability/synoptic features (require stability CSVs) ---
     # CAPE: ensemble across all models that have it.
     cape_cols = [f"{m}_cape_model" for m in MODELS if f"{m}_cape_model" in out.columns]
     if cape_cols:
@@ -1379,11 +1379,11 @@ def engineer_features(df):
         cin_vals = out[cin_cols].apply(pd.to_numeric, errors='coerce')
         out['cin_ens_mean'] = cin_vals.mean(axis=1)
         # CIN is typically negative (energy needed to overcome capping).
-        # Per PDF §2.4: high CIN suppresses convection despite high CAPE.
+        # Per high CIN suppresses convection despite high CAPE.
         # low_cin_indicator: 1 if mean CIN > -50 J/kg (= little/no inhibition)
         out['low_cin_indicator'] = (out['cin_ens_mean'] > -50).astype(float)
         if 'cape_ens_mean' in out.columns:
-            # PDF §2.4: CAPE × low_CIN_indicator = genuine triggering potential
+            # CAPE × low_CIN_indicator = genuine triggering potential
             out['cape_x_low_cin'] = out['cape_ens_mean'] * out['low_cin_indicator']
 
     # Lifted index: only GFS. LI < -2 with low CIN = real convection.
@@ -1392,8 +1392,8 @@ def engineer_features(df):
         out['lifted_index_gfs'] = pd.to_numeric(out[li_col], errors='coerce')
 
     # Synoptic forcing: mean wind at 500-700hPa.
-    # PDF §3.2: low values (<5 m/s) flag weakly-forced regime = worst-FAR.
-    # IMPORTANT: Open-Meteo returns wind in km/h by default. Convert to m/s.
+    # low values (<5 m/s) flag weakly-forced regime = worst-FAR.
+    # Open-Meteo returns wind in km/h by default; convert to m/s.
     KMH_TO_MS = 1.0 / 3.6
     w500_cols = [f"{m}_wind_speed_500hPa_model" for m in MODELS
                  if f"{m}_wind_speed_500hPa_model" in out.columns]
@@ -1413,7 +1413,7 @@ def engineer_features(df):
     if pw_col in out.columns:
         out['precipitable_water_ecmwf'] = pd.to_numeric(out[pw_col], errors='coerce')
 
-    # Convection regime classifier (PDF §3.2):
+    # Convection regime classifier:
     # "high CAPE + low ensemble agreement + low synoptic forcing" = canonical
     # FAR pattern (models hallucinate convection that won't materialize).
     if 'cape_ens_mean' in out.columns and 'mean_wind_500_700' in out.columns:
@@ -1424,7 +1424,7 @@ def engineer_features(df):
         )
         out['hallucination_convection_flag'] = hallucination_regime.astype(float)
 
-    # PDF Key Finding #6: high CAPE + STRONG CIN (capping) + low ensemble
+    # High CAPE + strong CIN (capping) + low ensemble
     # agreement = the OTHER canonical "models hallucinate" pattern. Strong
     # CIN means a thermal cap prevents convection from triggering despite
     # plenty of CAPE; without an external lift mechanism (front, orographic),
@@ -1438,9 +1438,9 @@ def engineer_features(df):
             (out.get('rain_agreement', pd.Series(0, index=out.index)) < 0.30)
         ).astype(float)
 
-    # --- PDF Tier A: dry_spell_length (hours since last observed rain) ---
+    # dry_spell_length: hours since last observed rain.
     # Long dry spells in summer should raise the bar for predicting onset.
-    # CRITICAL: must NOT use current hour's obs (that would leak the target).
+    # Must not use the current hour's obs: that would leak the target.
     # We shift wet by 1 so the count is "consecutive dry hours immediately
     # preceding hour t (not including t itself)". For a wet hour t this
     # reports the length of the dry spell that just ENDED — informative,
@@ -1452,7 +1452,7 @@ def engineer_features(df):
         grp = wet_lag.cumsum()
         out['dry_spell_length'] = wet_lag.groupby(grp).cumcount().clip(upper=168).astype(float)
 
-    # --- PDF Tier A: monthly climatological rain frequency ---
+    # Monthly climatological rain frequency.
     # P(rain | month, hour) from training data only. Strong corrector of
     # summer over-forecasts. Computed on train portion (datetime < SPLIT_DATE)
     # to avoid leakage, then broadcast to all rows by (month, hour) lookup.
@@ -1807,9 +1807,8 @@ def engineer_features(df):
     if 'temperature_2m_ens_std' in out.columns and 'temperature_2m_ens_mean' in out.columns:
         out['temp_cv'] = out['temperature_2m_ens_std'] / (out['temperature_2m_ens_mean'].abs().clip(lower=0.1))
 
-    # ===== MULTI-FACTOR BIAS INTERACTION FEATURES =====
-    # Based on ScienceDirect paper: multi-factor NWP bias correction outperforms single-factor.
-    # Cross-variable bias interactions capture when model errors correlate with other conditions.
+    # Multi-factor bias interactions: model errors correlate with other
+    # conditions, and multi-factor NWP bias correction beats single-factor.
 
     # Temperature bias conditioned on humidity regime
     for m in MODELS:
@@ -1845,8 +1844,7 @@ def engineer_features(df):
             out[f'{param}_bias_x_hour_sin'] = mean_bias * out['hour_sin']
             out[f'{param}_bias_x_hour_cos'] = mean_bias * out['hour_cos']
 
-    # ===== MULTI-OBJECTIVE ENSEMBLE STATISTICS =====
-    # From Frontiers paper: enriching feature representation with additional statistical measures
+    # Extra ensemble statistics to enrich the feature representation.
     for param in ['temperature_2m', 'dew_point_2m', 'wind_speed_10m', 'pressure_msl',
                   'cloud_cover', 'relative_humidity_2m']:
         mcols = [f"{m}_{param}_model" for m in MODELS if f"{m}_{param}_model" in out.columns]
@@ -1864,9 +1862,8 @@ def engineer_features(df):
             if iqr_col in out.columns and range_col in out.columns:
                 out[f'{param}_range_iqr_ratio'] = out[range_col] / out[iqr_col].clip(lower=0.01)
 
-    # ===== LAG-ERROR AUTOREGRESSIVE FEATURES (PDF2 §3) =====
-    # error_lag_k = obs[t-k] - forecast[t-k] captures persistent model bias.
-    # Highly predictive for short-range correction: recent error likely persists.
+    # Lag-error features: error_lag_k = obs[t-k] - forecast[t-k]. Recent
+    # error tends to persist, so these carry short-range correction.
     for param in ['temperature_2m', 'dew_point_2m', 'relative_humidity_2m',
                   'wind_speed_10m', 'pressure_msl', 'cloud_cover']:
         obs_col = f'{param}_obs'
@@ -1881,8 +1878,8 @@ def engineer_features(df):
             out[f'{param}_error_ma6'] = error_series.shift(1).rolling(6, min_periods=1).mean()
             out[f'{param}_error_ma24'] = error_series.shift(1).rolling(24, min_periods=1).mean()
 
-    # ===== SST-DERIVED FEATURES (PDF1 §10) =====
-    # SST moderates coastal Budva temps; land-sea gradient drives sea breeze / onshore flow.
+    # SST features: SST moderates coastal Budva temps; the land-sea
+    # gradient drives sea breeze / onshore flow.
     if 'sst' in out.columns:
         sst = pd.to_numeric(out['sst'], errors='coerce')
         out['sst_ma24'] = sst.rolling(24, min_periods=1).mean()
@@ -1894,9 +1891,8 @@ def engineer_features(df):
             out['land_sea_gradient'] = pd.to_numeric(out['temperature_2m_ens_mean'], errors='coerce') - sst
             out['land_sea_gradient_abs'] = out['land_sea_gradient'].abs()
 
-    # ===== KALMAN FILTER BIAS TRACKING (PDF2 §5) =====
-    # Exponentially weighted moving average of model error — tracks adaptive bias.
-    # Q (process noise) and R (observation noise) control the filter gain.
+    # Kalman-style bias tracking: EWMA of model error; Q (process noise)
+    # and R (observation noise) control the filter gain.
     # Higher Q → more responsive; higher R → smoother. We use Q/R ≈ 0.1 for stability.
     for param in ['temperature_2m', 'dew_point_2m', 'relative_humidity_2m',
                   'wind_speed_10m', 'pressure_msl', 'cloud_cover']:
@@ -1922,13 +1918,11 @@ def engineer_features(df):
                 P = (1 - K) * P_pred
         out[f'{param}_kalman_bias'] = kalman_bias
 
-    # =========================================================================
-    # MONOGRAPH-2 FEATURES (PDF2: neighborhood §4.2, bura gradient §7.1,
-    # sea-breeze §7.2, NWP-proxy regimes §6.2). All computed identically at
-    # train and inference time because both paths run through this function.
-    # =========================================================================
+    # Monograph-2 features (neighborhood, bura gradient, sea breeze,
+    # NWP-proxy regimes). Computed identically at train and inference time
+    # because both paths run through this function.
 
-    # --- Neighborhood 5x5 precipitation stats (§4.2) ---
+    # Neighborhood 5x5 precipitation stats.
     # Columns {M}_nbr_p00..p24 come from neighborhood_data CSVs (training) or
     # the live multi-point fetch. Grid is row-major, lats S->N, lons W->E;
     # Budva itself is p12. "Upwind" = the western band (p05,p06,p10,p11,p15,p16)
@@ -1968,7 +1962,7 @@ def engineer_features(df):
         if 'is_daytime' in out.columns:
             out['sea_breeze_ix'] = out['onshore_frac'] * out['is_daytime']
 
-    # --- Transdinaric pressure gradient (§7.1: bura forcing) ---
+    # Transdinaric pressure gradient (bura forcing).
     # Positive gradient (Podgorica > Budva MSL) pushes air over the Lovcen
     # ridge -> katabatic NE flow on the coast.
     _grad_cols = []
@@ -1985,7 +1979,7 @@ def engineer_features(df):
         if 'ne_sector_frac' in out.columns:
             out['mslp_grad_x_ne'] = out['mslp_grad_ens_mean'] * out['ne_sector_frac']
 
-    # --- Gust factor G = U_gust / U_mean (§7.1), stability-conditioned ---
+    # Gust factor G = U_gust / U_mean, stability-conditioned.
     _gf_cols = []
     for m in MODELS:
         gu = f'{m}_wind_gusts_10m_model'
@@ -2001,9 +1995,9 @@ def engineer_features(df):
         if 'cape_ens_mean' in out.columns:
             out['gf_x_cape'] = out['gust_factor_ens_mean'] * (out['cape_ens_mean'] / 1000.0)
 
-    # --- NWP-proxy circulation regimes (§6.2 without ERA5 Lamb) ---
-    # Used directly as features AND by the regime x model meta-learner (§6.1)
-    # and the regime-conditional rain-gate evaluation (§4.5).
+    # NWP-proxy circulation regimes (no ERA5 Lamb needed).
+    # Used directly as features, by the regime x model meta-learner,
+    # and by the regime-conditional rain-gate evaluation.
     out['is_summer'] = out['month'].isin([6, 7, 8, 9]).astype(float)
     if 'ne_sector_frac' in out.columns:
         out['regime_ne'] = (out['ne_sector_frac'] > 0.5).astype(float)
@@ -2012,7 +2006,7 @@ def engineer_features(df):
         out['regime_wet'] = (pd.to_numeric(out['rain_agreement'], errors='coerce')
                              .fillna(0) >= 0.5).astype(float)
 
-    # --- Lead-time interactions (PDF2 §5.3, Mlakar et al. 2024 pooling) ---
+    # --- Lead-time interactions ---
     # 'lead_time' is set by the caller: 12 for day-0 archive rows, 36/60 for the
     # previous-runs stacked rows, true hours-ahead at inference.
     if 'lead_time' in out.columns:
@@ -2096,13 +2090,13 @@ def _compute_sample_weights(y, datetime_index=None, decay_half_life_days=365):
 def _optuna_tune_hp(X_tr, y_tr, param_name, n_trials=15, base_objective='reg:quantileerror',
                     train_datetimes=None):
     """Bayesian hyperparameter optimization using Optuna with TimeSeriesSplit CV.
-    Uses reg:quantileerror α=0.5 which directly minimizes MAE (PDF2 §1).
-    3-fold TimeSeriesSplit with embargo gap (PDF1 §8, PDF2 §validation).
-    Wider search bounds + more trials (PDF1 §4).
-    Optionally tunes decay_half_life_days (PDF2 §2)."""
+    Uses reg:quantileerror α=0.5 which directly minimizes MAE.
+    3-fold TimeSeriesSplit with embargo gap.
+    Wider search bounds + more trials.
+    Optionally tunes decay_half_life_days."""
     tscv = TimeSeriesSplit(n_splits=3, gap=72)  # 3-fold with 72h embargo gap
 
-    # Variable-specific objective selection (PDF1 §6, PDF2 §1)
+    # Variable-specific objective selection
     def get_objective_for_param(trial, param):
         if param in ('temperature_2m', 'dew_point_2m', 'relative_humidity_2m'):
             # Huber: robust to occasional extreme errors from bura/Saharan events
@@ -2126,10 +2120,10 @@ def _optuna_tune_hp(X_tr, y_tr, param_name, n_trials=15, base_objective='reg:qua
 
     def objective(trial):
         obj_name, obj_params = get_objective_for_param(trial, param_name)
-        # Tunable temporal decay half-life (PDF2 §2)
+        # Tunable temporal decay half-life
         decay_hl = trial.suggest_categorical('decay_half_life', [90, 180, 365, 545, 730])
         hp = {
-            'n_estimators': 1500,  # Use early stopping to find optimal count (PDF1 §4)
+            'n_estimators': 1500,  # Use early stopping to find optimal count
             'max_depth': trial.suggest_int('max_depth', 4, 8),
             'learning_rate': trial.suggest_float('learning_rate', 0.005, 0.3, log=True),
             'subsample': trial.suggest_float('subsample', 0.5, 0.95),
@@ -2141,7 +2135,7 @@ def _optuna_tune_hp(X_tr, y_tr, param_name, n_trials=15, base_objective='reg:qua
             'gamma': trial.suggest_float('gamma', 0.0, 0.5),
             'objective': obj_name,
             'tree_method': 'hist',
-            'max_bin': 512,  # Higher bins for constrained trees (PDF1 §6)
+            'max_bin': 512,  # Higher bins for constrained trees
             'random_state': 42,
             'n_jobs': -1,
             'early_stopping_rounds': 30,
@@ -2195,7 +2189,7 @@ def _optuna_tune_hp(X_tr, y_tr, param_name, n_trials=15, base_objective='reg:qua
 
 def _select_features_by_importance(model, feature_cols, X_tr, y_tr, X_val, y_val,
                                    min_features=80, importance_type='gain'):
-    """SHAP-based feature pruning (PDF2 §4): uses SHAP values for more accurate importance.
+    """SHAP-based feature pruning: uses SHAP values for more accurate importance.
     Falls back to gain-based if SHAP fails. Removes bottom 5% of features."""
     try:
         import shap
@@ -2273,11 +2267,11 @@ def _train_residual_blended(X_tr, y_tr, X_te, y_te, hp, param, ens_col, df_v_tr,
     if use_optuna:
         hp = _optuna_tune_hp(X_tr, y_tr, param, n_trials=N_TRIALS, base_objective='reg:absoluteerror',
                              train_datetimes=train_datetimes)
-        # Use the Optuna-tuned decay half-life for sample weights (PDF2 §2)
+        # Use the Optuna-tuned decay half-life for sample weights
         tuned_hl = hp.pop('_decay_half_life', 365)
         if train_datetimes is not None:
             sample_weight = _compute_sample_weights(y_tr, train_datetimes, decay_half_life_days=tuned_hl)
-            # PDF2 §5.3: keep the half-weight of stacked long-lead rows after
+            # keep the half-weight of stacked long-lead rows after
             # the tuned-half-life recompute
             if 'lead_time' in X_tr.columns:
                 _lt_rb = pd.to_numeric(X_tr['lead_time'], errors='coerce').fillna(12).values
@@ -2304,7 +2298,7 @@ def _train_residual_blended(X_tr, y_tr, X_te, y_te, hp, param, ens_col, df_v_tr,
         X_tr_sel = X_tr
         X_te_sel = X_te
 
-    # --- Monotonic constraints (PDF1 §9) ---
+    # --- Monotonic constraints ---
     # Enforce: higher ensemble mean → higher corrected value (positive monotonicity)
     ens_mean_feature = f'{param}_ens_mean'
     sel_feature_list = list(X_tr_sel.columns) if hasattr(X_tr_sel, 'columns') else selected_features
@@ -2337,7 +2331,7 @@ def _train_residual_blended(X_tr, y_tr, X_te, y_te, hp, param, ens_col, df_v_tr,
     mse_model, _ = _train_xgb(X_train_c, y_train_c, X_val_c, y_val_c, hp_mse, sample_weight=sample_weight)
     mse_pred = mse_model.predict(X_te_sel)
 
-    # --- CatBoost base learner (PDF2 §1: multi-algorithm diversity) ---
+    # --- CatBoost base learner ---
     try:
         cb_hp = {
             'iterations': 500,
@@ -2361,7 +2355,7 @@ def _train_residual_blended(X_tr, y_tr, X_te, y_te, hp, param, ens_col, df_v_tr,
         cb_model = None
         has_catboost = False
 
-    # --- LightGBM base learner (PDF2 §1: multi-algorithm diversity) ---
+    # --- LightGBM base learner ---
     try:
         lgb_hp = {
             'n_estimators': 500,
@@ -2387,7 +2381,7 @@ def _train_residual_blended(X_tr, y_tr, X_te, y_te, hp, param, ens_col, df_v_tr,
         lgb_model = None
         has_lightgbm = False
 
-    # --- RidgeCV meta-learner (PDF2 §1, PDF1 §11) ---
+    # --- RidgeCV meta-learner ---
     # Stack predictions from all base learners using RidgeCV for optimal linear combination.
     # Use out-of-fold predictions on train set to avoid overfitting the meta-learner.
     base_preds_te = [direct_pred, resid_pred, mse_pred]
@@ -2409,7 +2403,7 @@ def _train_residual_blended(X_tr, y_tr, X_te, y_te, hp, param, ens_col, df_v_tr,
     ] + ([cb_model.predict(X_train_a)] if has_catboost else [])
       + ([lgb_model.predict(X_train_a)] if has_lightgbm else []))
 
-    # --- PDF2 §6.1: regime x model interactions ("mixture-of-experts za
+    # --- regime x model interactions ("mixture-of-experts za
     # siromašne"). Each base prediction also enters multiplied by the NWP-proxy
     # regime flags, letting Ridge learn per-regime weights. Layout MUST be
     # mirrored exactly at inference (apply_correction) and reload.
@@ -2505,7 +2499,7 @@ def _train_residual_blended(X_tr, y_tr, X_te, y_te, hp, param, ens_col, df_v_tr,
 
 
 def _pop_blend_inputs(frame, cls_proba, model_cols):
-    """PDF2 §4.5: input matrix for the calibrated PoP blend — per-model wet
+    """input matrix for the calibrated PoP blend — per-model wet
     flags + log1p amounts + agreement features + the XGB classifier proba.
     Must build identically at train and inference (column spec is persisted)."""
     feats = []
@@ -2523,24 +2517,23 @@ def _pop_blend_inputs(frame, cls_proba, model_cols):
 
 def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_cols):
     """Enhanced two-stage precipitation: Optuna-tuned classifier + regressor.
-    PDF-spec precision-first pipeline:
-      * focal loss (PDF §1.2, recommended starting gamma=2, alpha=0.25, joint-tuned)
-      * asymmetric seasonal sample weights (PDF §1.1)
-      * PDF §5.1 hyperparam ranges: lower LR, more trees, higher min_child_weight, reg_alpha > 0
-      * isotonic calibration (PDF §1.4)
-      * precision@recall threshold tuning (PDF §1.3)
-      * full meteorological scorecard incl. Brier + reliability (PDF §6.2-3)
-      * sanity-check baselines vs ICON-2I alone / ensemble / climatology / always-dry (PDF §6.5)
+    precision-first pipeline:
+      * focal loss
+      * asymmetric seasonal sample weights
+      * hyperparam ranges: lower LR, more trees, higher min_child_weight, reg_alpha > 0
+      * isotonic calibration
+      * precision@recall threshold tuning
+      * full meteorological scorecard incl. Brier + reliability
+      * sanity-check baselines vs ICON-2I alone / ensemble / climatology / always-dry
     """
     RAIN_THRESH = 0.1
 
     y_cls_tr = (y_tr >= RAIN_THRESH).astype(int)
     y_cls_val = (y_val >= RAIN_THRESH).astype(int)
     rain_ratio = float(y_cls_tr.mean())
-    # NB: we DO NOT use scale_pos_weight together with focal loss (PDF §1.2
-    # warning about double-correcting). Sample weights handle imbalance instead.
+    # NB: we DO NOT use scale_pos_weight together with focal loss. Sample weights handle imbalance instead.
 
-    # PDF §1.1: asymmetric seasonal sample weights conditioned on month.
+    # asymmetric seasonal sample weights conditioned on month.
     if 'month' in X_tr.columns:
         sw_tr = seasonal_sample_weights(X_tr['month'].values, y_cls_tr.values)
         sw_val = seasonal_sample_weights(X_val['month'].values, y_cls_val.values)
@@ -2558,10 +2551,10 @@ def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_
 
     # --- Optuna joint tuning: focal-loss hyperparams + tree hyperparams ---
     def cls_objective(trial):
-        # PDF §1.2 recommended ranges
+        # recommended ranges
         gamma_focal = trial.suggest_float('focal_gamma', 1.0, 3.0)
         alpha_focal = trial.suggest_float('focal_alpha', 0.20, 0.45)
-        # PDF §5.1 tightened ranges
+        # tightened ranges
         params = {
             'max_depth': trial.suggest_int('max_depth', 4, 6),
             'learning_rate': trial.suggest_float('learning_rate', 0.02, 0.05, log=True),
@@ -2620,7 +2613,7 @@ def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_
     )
     cls_best_n = max(cls_val_booster.best_iteration + 1, 100)
 
-    # PDF §1.3 + §1.4: pick precision-maximizing threshold + isotonic calibration
+    # Pick the precision-maximizing threshold + isotonic calibration.
     margins_val = cls_val_booster.predict(dval, iteration_range=(0, cls_best_n))
     proba_val_raw = 1.0 / (1.0 + np.exp(-margins_val))
     if len(proba_val_raw) >= 500:
@@ -2632,7 +2625,7 @@ def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_
         iso_cal = None
         proba_val = proba_val_raw
 
-    # PDF2 §4.4: optimize the decision threshold directly on SEDI (robust to the
+    # optimize the decision threshold directly on SEDI (robust to the
     # base-rate problem at 0.1-0.2mm), bounded so FAR doesn't blow past the old
     # precision@recall criterion by more than 5pp.
     thresh_pr = threshold_for_precision_at_recall(y_cls_val.values, proba_val, min_recall=0.50)
@@ -2649,9 +2642,9 @@ def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_
           f"FAR={mets_sedi['far']:.3f} CSI={mets_sedi['csi']:.3f} SEDI={mets_sedi['sedi']:.3f}")
     best_thresh = thresh_sedi if mets_sedi['sedi'] >= mets_pr['sedi'] else thresh_pr
     pred_at_thresh = (proba_val >= best_thresh).astype(int)
-    # Full scorecard incl. Brier + reliability (PDF §6.2-3)
+    # Full scorecard incl. Brier + reliability
     mets = meteorological_metrics(y_cls_val.values, pred_at_thresh, p_proba=proba_val)
-    # PDF2 §3.4: CORP decomposition of the calibrated PoP
+    # CORP decomposition of the calibrated PoP
     _corp = pf.corp_reliability(y_cls_val.values.astype(float), proba_val)
     print(f"    CORP: Brier={_corp['brier']:.4f} MCB={_corp['mcb']:.4f} "
           f"DSC={_corp['dsc']:.4f} UNC={_corp['unc']:.4f}")
@@ -2661,7 +2654,7 @@ def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_
           f"Brier={mets['brier']:.4f}, BSS={mets['brier_skill_score']:.3f}, "
           f"RelRMSE={mets['reliability_rmse']:.4f}")
 
-    # PDF §6.5: sanity-check baselines on the same validation set.
+    # sanity-check baselines on the same validation set.
     # (a) ICON-2I alone (>= RAIN_THRESH)
     # (b) Ensemble mean >= 0.1 mm
     # (c) Climatology (always predict base rate, threshold 0.5 -> always-dry)
@@ -2685,7 +2678,7 @@ def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_
         print(f"    Baselines on val (POD / FAR / CSI):")
         for name, b in baselines_info.items():
             print(f"      {name:18s} POD={b['pod']:.3f}  FAR={b['far']:.3f}  CSI={b['csi']:.3f}")
-        # PDF §6.5 acceptance test: we must beat ICON-2I-alone + ensemble on FAR
+        # acceptance test: we must beat ICON-2I-alone + ensemble on FAR
         # while staying within ~10% POD.
         for ref in ('icon2i_alone', 'ensemble_mean'):
             if ref in baselines_info:
@@ -2696,7 +2689,7 @@ def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_
     except Exception as _e:
         print(f"    Baseline computation skipped: {_e}")
 
-    # --- PDF2 §4.5: calibrated PoP blend vs the single-LAM trusted gate ---
+    # --- calibrated PoP blend vs the single-LAM trusted gate ---
     # The hard ICON-2I veto throws away the other 9 models' information. Train
     # a logistic blend over per-model PoP inputs on the TRAIN fold, then play
     # both deciders on the VAL fold, split by regime. The winner is persisted
@@ -2934,7 +2927,7 @@ def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_
         (1 - confidence) * single_pred * 0.5
     )
 
-    # --- Tweedie model (PDF1 §3): unified zero-inflation + continuous positive density ---
+    # --- Tweedie model: unified zero-inflation + continuous positive density ---
     # Tweedie with p∈(1,2) handles point mass at zero naturally via log-link.
     # Replaces classifier+regressor with a single model, eliminating threshold sensitivity.
     # Tighter search space: shallower trees + stronger regularization to reduce false alarms.
@@ -3050,21 +3043,19 @@ def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_
         'best_method': best_method, 'threshold': best_thresh,
         'mae': mae, 'rmse': rmse, 'features': feature_cols,
         'use_sqrt': rain_mask_tr.sum() >= 100,
-        'iso_calibrator': iso_cal,  # PDF §1.4: isotonic calibrator for cls proba
+        'iso_calibrator': iso_cal,  # isotonic calibrator for cls proba
         # HP info for production retrain on all data
         'cls_hp_final': cls_hp_final,
         'reg_hp_final': reg_hp_final,
         'single_hp_final': single_hp_final,
         'tweedie_hp_final': tw_hp_final,
-        'pop_blend': pop_blend_info,  # PDF2 §4.5 (None -> trusted gate)
+        'pop_blend': pop_blend_info,  # (None -> trusted gate)
     }
 
 
-# ===========================================================================
-# RAIN-ONSET TIMING — discrete-time conditional-hazard model (report Part B)
-# ===========================================================================
-# Our historical data is a continuous valid-time series (no archived per-run
-# lead tables), so we adapt the discrete-time hazard to "dry spells":
+# Rain-onset timing: discrete-time conditional-hazard model. The historical
+# data is a continuous valid-time series (no archived per-run lead tables),
+# so the discrete-time hazard is adapted to "dry spells":
 #   onset = first hour with obs precip >= ONSET_THRESHOLD_MM after >=
 #           ONSET_DRY_GAP_HOURS dry hours. We model h(t) = P(onset this hour |
 #           dry through t-1) as a function of atmospheric state + dry_age (t).
@@ -3374,7 +3365,7 @@ def predict_onset_timing(fc, bundle):
 
 
 def compute_bias_drift(df, out_path=None):
-    """PDF2 §6.3: NWP archives drift when upstream model versions change. Track
+    """NWP archives drift when upstream model versions change. Track
     per model x param MONTHLY mean bias; flag pairs whose last-3-month bias
     departs from the prior history by > 1.5 prior std."""
     drift = {}
@@ -3405,7 +3396,7 @@ def compute_bias_drift(df, out_path=None):
             }
     flagged = sorted(k for k, v in drift.items() if v['drift_flag'])
     if flagged:
-        print(f"  [Drift §6.3] WARN — {len(flagged)} model-param parova driftuje: "
+        print(f"  [Drift] WARN — {len(flagged)} model-param parova driftuje: "
               f"{', '.join(flagged[:8])}{'...' if len(flagged) > 8 else ''}")
     if out_path:
         try:
@@ -3417,7 +3408,7 @@ def compute_bias_drift(df, out_path=None):
 
 
 def _snapshot_champion():
-    """PDF2 Pogl. 9: snapshot current production artifacts to MODEL_DIR/_champion
+    """Snapshot current production artifacts to MODEL_DIR/_champion
     BEFORE a retrain overwrites them, and return the champion's stored results
     for the promotion gate. Rollback = copy _champion/* back."""
     import shutil
@@ -3443,7 +3434,7 @@ def _snapshot_champion():
 
 
 def _champion_gate(results, results_prev):
-    """PDF2 Pogl. 9 (lite guardrail): flag any target whose report-half MAE
+    """Lite guardrail: flag any target whose report-half MAE
     regressed >15% vs the stored champion. We deliberately do NOT auto-restore
     per-target artifacts (mixed MODEL_DIR would desync training_results.json);
     the loud verdict + _champion/ snapshot make rollback a copy away. The
@@ -3468,7 +3459,7 @@ def _champion_gate(results, results_prev):
     bad = {p: v for p, v in verdicts.items() if v.startswith('WARN')}
     if bad:
         print("\n  " + "!" * 64)
-        print("  CHAMPION GATE — regresije (PDF2 Pogl. 9):")
+        print("  CHAMPION GATE — regresije:")
         for p, v in bad.items():
             print(f"    {p}: {v}")
         print("  " + "!" * 64)
@@ -3478,7 +3469,7 @@ def _champion_gate(results, results_prev):
 
 
 def _append_run_history(results, df, gate_verdicts=None):
-    """PDF2 Pogl. 9: lightweight experiment registry (one JSON entry per
+    """Lightweight experiment registry (one JSON entry per
     training run) — MLflow-lite for a solo workstation."""
     path = os.path.join(MODEL_DIR, 'runs_history.json')
     hist = []
@@ -3513,14 +3504,14 @@ def _append_run_history(results, df, gate_verdicts=None):
 
 QUANTILE_TARGETS = ('temperature_2m', 'wind_speed_10m', 'wind_gusts_10m', 'precipitation')
 
-# PDF2 §5.3: targets that get synthetic lead-24/48h training rows from the
+# targets that get synthetic lead-24/48h training rows from the
 # previous-runs archive. Disable with FC_LEAD_STACK=0 (e.g. low-RAM machines).
 LEAD_STACK_TARGETS = ('temperature_2m', 'wind_speed_10m', 'wind_gusts_10m', 'precipitation')
 LEAD_STACK_ENABLED = os.environ.get('FC_LEAD_STACK', '1') not in ('0', 'false', 'False')
 
 
 def build_lead_stacked_frames(hist_raw, bias_tables):
-    """PDF2 §5.3 (Mlakar et al. 2024): one model pooled across lead times beats
+    """(Mlakar et al. 2024): one model pooled across lead times beats
     per-lead models in small data — but our archive rows are all short-lead,
     while live inference at +24-48h runs on long-lead inputs (train/serve lead
     mismatch). Fix: synthesize lead-36/60 rows where {M}_{v}_model holds the
@@ -3575,7 +3566,7 @@ def build_lead_stacked_frames(hist_raw, bias_tables):
 
 
 def _train_target_quantiles(param, X_tr, y_tr, X_te_rep, y_te_rep):
-    """PDF2 §3.1-3.3: multi-quantile LightGBM wrapped in CQR.
+    """multi-quantile LightGBM wrapped in CQR.
 
     Calibration fold = last 12% of the TRAIN period (72h embargo before it),
     so the conformal offsets never see the test set. Reported coverage/CRPS
@@ -3620,7 +3611,7 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
     """Unified training: all params use full 50K dataset. No splits.
     - Precipitation: two-stage (cls+reg) + optional blend
     - Everything else: residual+blended (direct/residual/blend)
-    lead_frames: optional engineered lead-36/60 frames (PDF2 §5.3) pooled into
+    lead_frames: optional engineered lead-36/60 frames pooled into
     the TRAIN portion of LEAD_STACK_TARGETS; the test set stays day-0 only so
     reported MAEs remain comparable across runs.
     only_targets: if set, train ONLY these params and MERGE into existing
@@ -3631,7 +3622,7 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
     _fl_path = os.path.join(MODEL_DIR, 'feature_lists.json')
     _res_path = os.path.join(MODEL_DIR, 'training_results.json')
 
-    # PDF2 Pogl. 9: snapshot the reigning champion before overwriting anything.
+    # Snapshot the reigning champion before overwriting anything.
     # On RESUME (only_targets set) we must NOT re-snapshot: trained_models_v2
     # already holds a mix of new + old models, so a fresh snapshot would corrupt
     # the champion. Read the existing _champion snapshot for the gate instead.
@@ -3646,7 +3637,7 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
                     results_prev = json.load(_cf)
             except Exception:
                 results_prev = None
-    # PDF2 §6.3: per-model bias drift report
+    # per-model bias drift report
     compute_bias_drift(df, os.path.join(OUTPUT_DIR, 'bias_drift.json'))
 
     feature_cols = get_feature_columns(df)
@@ -3669,7 +3660,7 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
               f"zadržavam {len(results)} postojećih rezultata")
 
     def _persist_artifacts():
-        """Write feature_lists + results after EACH target (PDF2 Pogl. 9
+        """Write feature_lists + results after EACH target (champion-gate bookkeeping
         robustness: a crash mid-run no longer loses completed-target metadata)."""
         fl = dict(feature_lists_acc)
         fl.update({k: v['features'] for k, v in trained.items()})
@@ -3720,7 +3711,7 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
                   f"{vf_before} -> {len(vf)} features")
 
         # NaN passthrough: let XGBoost's native sparsity-aware split-finding handle missing data
-        # (PDF1 §1: removing fillna(0) is the "single easiest win" — 5-15% MAE improvement)
+        # is the "single easiest win" — 5-15% MAE improvement)
         X_tr, y_tr = df_v.loc[tr, vf], y_v[tr]
         X_te, y_te = df_v.loc[te, vf], y_v[te]
 
@@ -3729,7 +3720,7 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
         # lead-stacking applies, so every downstream consumer stays aligned.
         df_tr_frame = df_v.loc[tr]
 
-        # --- PDF2 §5.3: pool synthetic lead-36/60 rows into TRAIN only ---
+        # --- pool synthetic lead-36/60 rows into TRAIN only ---
         if lead_frames and param in LEAD_STACK_TARGETS:
             _aug_X, _aug_y, _aug_f = [], [], []
             _meta_cols = ['datetime', f'{param}_ens_mean',
@@ -3767,7 +3758,7 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
                 print(f"    Lead-stack ({param}): +{n_stacked} redova "
                       f"(train {len(X_tr) - n_stacked} -> {len(X_tr)})")
 
-        # --- Dew point deficit target (PDF1 §8) ---
+        # --- Dew point deficit target ---
         # Predict T − Td (≥ 0) instead of Td directly; derive Td = T_corrected − deficit.
         # The deficit is physically constrained ≥ 0, improving learnability.
         dew_deficit_mode = False
@@ -3784,7 +3775,7 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
                 y_te = y_te_deficit
                 print(f"    Dew point: using deficit target (T - Td ≥ 0)")
 
-        # --- CSI target for solar radiation (PDF1 §4) ---
+        # --- CSI target for solar radiation ---
         # Train on clear-sky index (CSI = GHI/GHI_clearsky) instead of raw irradiance.
         # Back-transform predictions to W/m² at evaluation and production time.
         csi_mode = False
@@ -3987,7 +3978,7 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
             single_prod = xgb.XGBRegressor(**precip_result['single_hp_final'])
             single_prod.fit(X_all, y_all, verbose=False)
 
-            # Retrain Tweedie model on all data (PDF1 §3)
+            # Retrain Tweedie model on all data
             tweedie_prod = xgb.XGBRegressor(**precip_result['tweedie_hp_final'])
             tweedie_prod.fit(X_all, y_all.clip(lower=0), verbose=False)
 
@@ -4003,7 +3994,7 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
             single_prod.save_model(os.path.join(MODEL_DIR, f"xgb_{param}.json"))
             tweedie_prod.save_model(os.path.join(MODEL_DIR, f"xgb_{param}_tweedie.json"))
 
-            # PDF §1.2: persist focal-loss hyperparams as a sidecar JSON next to the
+            # persist focal-loss hyperparams as a sidecar JSON next to the
             # classifier. Skip-training reload needs gamma/alpha to wrap the Booster
             # in the same adapter (probabilities from raw margins via sigmoid).
             try:
@@ -4014,13 +4005,13 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
             except Exception as _e:
                 print(f"    WARN: couldn't persist focal sidecar: {_e}")
 
-            # PDF §1.4: persist isotonic calibrator (for inference + skip-training mode)
+            # persist isotonic calibrator (for inference + skip-training mode)
             _iso = precip_result.get('iso_calibrator')
             if _iso is not None:
                 import joblib
                 joblib.dump(_iso, os.path.join(MODEL_DIR, f"xgb_{param}_iso_calibrator.joblib"))
 
-            # PDF2 §4.5: persist the PoP blend (LR + spec) for reload
+            # persist the PoP blend (LR + spec) for reload
             _pb = precip_result.get('pop_blend')
             if _pb is not None:
                 import joblib
@@ -4051,7 +4042,7 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
                 'is_precip': True,
                 'rain_gate_mode': (precip_result.get('pop_blend') or {}).get('mode', 'trusted'),
             }
-            # PDF2 §3: predictive distribution for precipitation amounts
+            # predictive distribution for precipitation amounts
             qb = _train_target_quantiles(param, X_tr, y_tr, X_te_rep, y_te_rep)
             if qb is not None:
                 trained[param]['quantiles'] = qb
@@ -4087,10 +4078,10 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
                       early_stopping_rounds=30)
 
         # Compute temporal sample weights (exponential decay — recent data weighted more)
-        # PDF2 §2: half-life should be tuned, not fixed. We expose it as part of model selection.
+        # half-life should be tuned, not fixed. We expose it as part of model selection.
         train_datetimes = df_tr_frame['datetime']
         sample_weight = _compute_sample_weights(y_tr, train_datetimes, decay_half_life_days=365)
-        # PDF2 §5.3: stacked long-lead rows count half
+        # stacked long-lead rows count half
         if 'lead_time' in X_tr.columns:
             _lt = pd.to_numeric(X_tr['lead_time'], errors='coerce').fillna(12).values
             sample_weight = sample_weight * np.where(_lt > 24, 0.5, 1.0)
@@ -4128,7 +4119,7 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
         elif param in ['wind_speed_10m', 'wind_gusts_10m', 'shortwave_radiation']:
             y_pred = np.clip(y_pred, 0, None)
 
-        # Evaluation target for the report half. NOTE: we do NOT mutate y_te here
+        # Evaluation target for the report half; y_te is not mutated here
         # (the old code did `y_te = y_te_orig`, which left y_tr in CSI/deficit
         # space but y_te in original space → the production retrain below then
         # trained on a MIXED target). Keep y_te in model space; evaluate against
@@ -4223,7 +4214,7 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
         mse_prod = xgb.XGBRegressor(**hp_mse_prod)
         mse_prod.fit(X_all_sel, y_all, verbose=False, sample_weight=sw_all)
 
-        # Retrain CatBoost on all data (PDF2 §1)
+        # Retrain CatBoost on all data
         cb_prod = None
         if rb_result.get('has_catboost') and rb_result.get('cb_model') is not None:
             cb_prod = cb.CatBoostRegressor(
@@ -4235,7 +4226,7 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
             )
             cb_prod.fit(cb.Pool(X_all_sel, y_all, weight=sw_all))
 
-        # Retrain LightGBM on all data (PDF2 §1)
+        # Retrain LightGBM on all data
         lgb_prod = None
         if rb_result.get('has_lightgbm') and rb_result.get('lgb_model') is not None:
             lgb_params = rb_result['lgb_model'].get_params()
@@ -4320,7 +4311,7 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
             'is_precip': False,
         }
 
-        # PDF2 §3: predictive distribution (T2m / wind / gusts; raw-target only,
+        # predictive distribution (T2m / wind / gusts; raw-target only,
         # so CSI- and deficit-transformed params are skipped by the tuple).
         if param in QUANTILE_TARGETS:
             qb = _train_target_quantiles(param, X_tr, y_tr, X_te_rep, y_te_rep)
@@ -4333,7 +4324,7 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
 
     _persist_artifacts()  # final write (also covers the no-target-trained case)
 
-    # PDF2 Pogl. 9: promotion gate + experiment registry
+    # Promotion gate + experiment registry
     gate_verdicts = _champion_gate(results, results_prev)
     _append_run_history(results, df, gate_verdicts)
 
@@ -4377,7 +4368,7 @@ def load_trained_models():
                 print(f"  {rinfo['display']:20s} --- SKIP (fajlovi ne postoje)")
                 continue
 
-            # PDF §1.2: classifier was trained with focal loss (custom objective)
+            # classifier was trained with focal loss (custom objective)
             # using xgb.train, so we reload it as a Booster and wrap it in a thin
             # adapter that exposes predict_proba (sigmoid of raw margin).
             _cls_booster = xgb.Booster()
@@ -4432,13 +4423,13 @@ def load_trained_models():
             if tweedie_model is not None:
                 precip_info['tweedie_model'] = tweedie_model
 
-            # PDF §1.4: load isotonic calibrator if persisted
+            # load isotonic calibrator if persisted
             iso_path = os.path.join(MODEL_DIR, f"xgb_{param}_iso_calibrator.joblib")
             if os.path.exists(iso_path):
                 import joblib
                 precip_info['iso_calibrator'] = joblib.load(iso_path)
 
-            # PDF2 §4.5: reload PoP blend gate if persisted
+            # reload PoP blend gate if persisted
             pb_jl = os.path.join(MODEL_DIR, f"xgb_{param}_pop_blend.joblib")
             pb_js = os.path.join(MODEL_DIR, f"xgb_{param}_pop_blend.json")
             if os.path.exists(pb_jl) and os.path.exists(pb_js):
@@ -4546,7 +4537,7 @@ def load_trained_models():
             }
             print(f"  {rinfo['display']:20s} loaded (MAE={rinfo['mae']}) [{rinfo.get('method', 'direct')}]")
 
-    # PDF2 §3: reload quantile+CQR bundles where present
+    # reload quantile+CQR bundles where present
     for param in QUANTILE_TARGETS:
         if param not in trained:
             continue
@@ -4569,7 +4560,7 @@ def load_trained_models():
 
 
 def _fetch_aux_live(fc_all):
-    """Live neighborhood 5x5 precip + Podgorica MSLP (PDF2 §4.2/§7.1).
+    """Live neighborhood 5x5 precip + Podgorica MSLP.
     Best-effort: any failure leaves the columns absent, and engineer_features
     simply skips the derived stats (NaN passthrough keeps models usable)."""
     URL = "https://api.open-meteo.com/v1/forecast"
@@ -4858,7 +4849,7 @@ def fetch_live_forecasts():
                 print(f"    {model_name}: FAIL ({e})")
         time.sleep(1.5)
 
-    # Fetch SST for forecast period (PDF1 §10)
+    # Fetch SST for forecast period
     sst_df = fetch_sst_data(
         fc_all['datetime'].min() - pd.Timedelta(days=30),
         fc_all['datetime'].max()
@@ -4880,10 +4871,8 @@ def fetch_live_forecasts():
     return fc_all
 
 
-# ----------------------------------------------------------------------------
-# Marine forecast (Phase 1: ensemble of 2 wave models + offshore wind, no
-# bias correction). Lives in its own pipeline so atmospheric path stays clean.
-# ----------------------------------------------------------------------------
+# Marine forecast: ensemble of 2 wave models + offshore wind, no bias
+# correction. Its own pipeline, so the atmospheric path stays clean.
 
 # Beaufort thresholds (m/s, upper bound of each Bft 0..11).
 _BEAUFORT_THRESHOLDS = [0.3, 1.6, 3.4, 5.5, 8.0, 10.8, 13.9, 17.2, 20.8, 24.5, 28.5, 32.7]
@@ -5576,7 +5565,7 @@ def apply_correction(fc_df, trained, bias_tables, local_dry_nowcast=False):
     print("\n[5/6] Primjena korekcije...")
 
     fc = apply_bias_features(fc_df.copy(), bias_tables)
-    # PDF2 §5.3: true lead time in hours (0 at the current hour); training rows
+    # true lead time in hours (0 at the current hour); training rows
     # carry 12 (day-0 archive) / 36 / 60 (previous-runs stack).
     _lead_now = local_now().floor('h')
     fc['lead_time'] = ((pd.to_datetime(fc['datetime']) - _lead_now)
@@ -5693,7 +5682,7 @@ def apply_correction(fc_df, trained, bias_tables, local_dry_nowcast=False):
             trusted_signal_amount = np.where(trusted_signal, trusted_vals_filled, 0)
             no_signal = ~trusted_signal
 
-            # PDF §3.3 + §1.5: SUMMER CONVECTION ABSTENTION
+            # Summer convection abstention.
             # ItaliaMeteo's own May-2025 admission: ICON-2I systematically over-
             # predicts weakly-forced summer convection. When in summer AND only
             # high-res LAMs see rain (low global agreement), DON'T let ICON-2I
@@ -5714,12 +5703,12 @@ def apply_correction(fc_df, trained, bias_tables, local_dry_nowcast=False):
                     trusted_signal = trusted_signal & ~italiameteo_isolated_signal
                     no_signal = ~trusted_signal
                     trusted_signal_amount = np.where(trusted_signal, trusted_vals_filled, 0)
-                    print(f"  PDF abstention: {n_suppressed} summer hour(s) with isolated "
+                    print(f"  Abstention: {n_suppressed} summer hour(s) with isolated "
                           f"ICON-2I rain signal SUPPRESSED (weakly-forced convection regime)")
             except Exception as _e:
                 pass  # be defensive; don't break inference if any field missing
 
-            # --- PDF2 §4.5: calibrated PoP-blend gate (only when it beat the
+            # --- calibrated PoP-blend gate (only when it beat the
             # single-LAM veto in the regime-conditional eval). The fetch-level
             # TrustedRainGateError integrity check above applies either way;
             # the summer abstention is ICON-2I-specific and stays trusted-only.
@@ -5770,7 +5759,7 @@ def apply_correction(fc_df, trained, bias_tables, local_dry_nowcast=False):
                 )
                 pred[trusted_signal] = np.maximum(pred[trusted_signal], trusted_floor[trusted_signal])
 
-            # PDF2 §3.5: calibrated PoP (isotonic classifier proba), GATED by the
+            # calibrated PoP (isotonic classifier proba), GATED by the
             # trusted rain gate so the probabilistic view agrees with the
             # deterministic one. Where the gate is closed (ICON-2I dry / summer
             # abstention), the system asserts dry, so PoP -> 0. Set BEFORE the
@@ -5778,7 +5767,7 @@ def apply_correction(fc_df, trained, bias_tables, local_dry_nowcast=False):
             corrected['precipitation_pop'] = np.clip(
                 np.where(no_signal, 0.0, cls_proba), 0.0, 1.0)
 
-            # --- PDF2 §4.3: SKALA radar nowcast as a WEIGHTED 0-6h member ---
+            # --- SKALA radar nowcast as a WEIGHTED 0-6h member ---
             # Replaces "hard override" thinking: weight w(lead) falls linearly
             # from 1 (now) to 0 (+6h); PoP is blended, amounts are only nudged
             # (dry-suppressed or wet-floored) when the radar is confident.
@@ -5859,7 +5848,7 @@ def apply_correction(fc_df, trained, bias_tables, local_dry_nowcast=False):
             mse_pred = minfo['mse_model'].predict(X) if minfo.get('mse_model') else direct_pred
             pred = w_d * direct_pred + w_r * resid_pred + w_m * mse_pred
         elif method_name == 'ridge_meta' and minfo.get('ridge_meta') is not None:
-            # RidgeCV meta-learner stacking (PDF2 §1, PDF1 §11)
+            # RidgeCV meta-learner stacking
             ens_col = f'{param}_ens_mean'
             ens_vals = pd.to_numeric(fc[ens_col], errors='coerce').fillna(0).values if ens_col in fc.columns else np.zeros(len(X))
             base_preds = [
@@ -5871,7 +5860,7 @@ def apply_correction(fc_df, trained, bias_tables, local_dry_nowcast=False):
                 base_preds.append(minfo['cb_model'].predict(X))
             if minfo.get('has_lightgbm') and minfo.get('lgb_model') is not None:
                 base_preds.append(minfo['lgb_model'].predict(X))
-            # PDF2 §6.1: mirror the regime x model interaction layout used at
+            # mirror the regime x model interaction layout used at
             # training time ([base | base*flag1 | base*flag2 | ...]).
             base_mat = np.column_stack(base_preds)
             meta_parts = [base_mat]
@@ -5943,13 +5932,13 @@ def apply_correction(fc_df, trained, bias_tables, local_dry_nowcast=False):
         elif param in ['wind_speed_10m', 'wind_gusts_10m', 'shortwave_radiation']:
             pred = np.clip(pred, 0, None)
 
-        # CSI back-transform for solar radiation (PDF1 §4)
+        # CSI back-transform for solar radiation
         if param == 'shortwave_radiation' and minfo.get('csi_mode', False):
             cs_prod = compute_clear_sky(fc['datetime']).values
             pred = pred * cs_prod
             pred = np.clip(pred, 0, None)
 
-        # Dew deficit back-transform (PDF1 §8): Td = T_corrected - deficit
+        # Dew deficit back-transform: Td = T_corrected - deficit
         if param == 'dew_point_2m' and minfo.get('dew_deficit_mode', False):
             pred = np.clip(pred, 0, None)  # deficit ≥ 0
             # Use corrected temperature if available, else ensemble mean
@@ -5982,7 +5971,7 @@ def apply_correction(fc_df, trained, bias_tables, local_dry_nowcast=False):
                   if minfo.get('mae') is not None else "n/a (resumed)")
         print(f"  {TARGET_PARAMS[param]['display']:20s} (MAE={_mae_s}) [{method_name}]")
 
-    # --- PDF2 §3: predictive distributions (multi-quantile + CQR) + exceedance ---
+    # --- predictive distributions (multi-quantile + CQR) + exceedance ---
     for param, minfo in trained.items():
         qb = minfo.get('quantiles')
         if not qb:
@@ -6001,7 +5990,7 @@ def apply_correction(fc_df, trained, bias_tables, local_dry_nowcast=False):
             print(f"  Kvantili {param}: preskočeno ({_e})")
             continue
 
-        # --- PDF2 §3/§4.1: zero-inflate the PRECIP quantiles ---
+        # Zero-inflate the precip quantiles.
         # Precipitation is ~92% dry, but the bare quantile model (+ CQR widening)
         # leaks rain mass into the upper tail even on dry hours, which made the
         # exceedance probs and ECC scenarios contradict the (gated) dry point
@@ -6025,7 +6014,7 @@ def apply_correction(fc_df, trained, bias_tables, local_dry_nowcast=False):
             vals = qdf[col].values.astype(float).copy()
             vals[_nan_mask] = np.nan
             corrected[f'{param}_{col}'] = vals
-        # Exceedance probabilities (PDF2 §3.5) from the calibrated CDF
+        # Exceedance probabilities from the calibrated CDF
         try:
             if param == 'precipitation':
                 for thr, name in ((1.0, 'p_precip_gt1'), (5.0, 'p_precip_gt5')):
@@ -6093,7 +6082,7 @@ def apply_correction(fc_df, trained, bias_tables, local_dry_nowcast=False):
         'wind_gusts_10m_xgb', 'wind_gusts_10m_ensemble',
         'weather_code_raw',
         'rain_ens', 'snowfall_ens',
-        # PDF2 §3: distributional columns of end-of-hour-labelled quantities
+        # distributional columns of end-of-hour-labelled quantities
         # follow their point forecasts (precip + wind; temp stays instantaneous).
         'precipitation_pop', 'p_precip_gt1', 'p_precip_gt5',
         'p_gust_gt10', 'p_gust_gt17',
@@ -6499,9 +6488,7 @@ def _build_daily_summary(date_str, day_name, grp_df, fc_raw=None):
     return ds
 
 
-# ---------------------------------------------------------------------------
-# Gemini AI narrative generation
-# ---------------------------------------------------------------------------
+# Gemini narrative generation.
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
 
 # AI narrative mode — flip this ONE line to switch (no other change needed):
@@ -6744,7 +6731,7 @@ def generate_output(corrected, trained, results, fc_raw=None, marine=None, onset
             if v is not None and pd.notna(v):
                 entry[extra] = round(float(v), 2)
 
-        # PDF2 §3.5: distributional fields (quantile bands, PoP, exceedance).
+        # distributional fields (quantile bands, PoP, exceedance).
         # Skipped silently when models predate the quantile upgrade.
         for qcol in ['temperature_2m_q05', 'temperature_2m_q10', 'temperature_2m_q25',
                      'temperature_2m_q50', 'temperature_2m_q75', 'temperature_2m_q90',
@@ -6824,7 +6811,7 @@ def generate_output(corrected, trained, results, fc_raw=None, marine=None, onset
     if long_range:
         print(f"  Long range: {len(long_range)} dana")
 
-    # --- PDF2 §5.2: ECC scenarios — temporally coherent precip trajectories ---
+    # --- ECC scenarios — temporally coherent precip trajectories ---
     # Quantile marginals per hour have no hour-to-hour correlation; reordering
     # samples by the raw-ensemble rank structure restores realistic episode
     # durations, from which we get window PoPs + episode stats.
@@ -6941,7 +6928,7 @@ if __name__ == "__main__":
 
         print("\n[2/6] Feature engineering + tabele biasa...")
         bias_tables = compute_bias_tables(hist)
-        # PDF2 §5.3: lead-36/60 frames built from the RAW frame + train-only
+        # lead-36/60 frames built from the RAW frame + train-only
         # bias tables, BEFORE the base frame is engineered below.
         lead_frames = build_lead_stacked_frames(hist, bias_tables)
         hist = apply_bias_features(hist, bias_tables)

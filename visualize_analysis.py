@@ -132,7 +132,7 @@ def plot_model_performance_overview(reports):
 
     plt.tight_layout()
     plt.savefig(f'{OUTPUT_DIR}/01_model_performance_overview.png', dpi=300, bbox_inches='tight', facecolor='white')
-    print("✅ 01_model_performance_overview.png")
+    print("saved 01_model_performance_overview.png")
     plt.close()
 
 
@@ -180,7 +180,7 @@ def plot_systematic_bias(reports):
 
     plt.tight_layout()
     plt.savefig(f'{OUTPUT_DIR}/02_systematic_bias.png', dpi=300, bbox_inches='tight', facecolor='white')
-    print("✅ 02_systematic_bias.png")
+    print("saved 02_systematic_bias.png")
     plt.close()
 
 
@@ -231,7 +231,7 @@ def plot_seasonal_analysis(reports):
 
     plt.tight_layout()
     plt.savefig(f'{OUTPUT_DIR}/03_seasonal_analysis.png', dpi=300, bbox_inches='tight', facecolor='white')
-    print("✅ 03_seasonal_analysis.png")
+    print("saved 03_seasonal_analysis.png")
     plt.close()
 
 
@@ -265,7 +265,7 @@ def plot_diurnal_cycle(reports):
 
     plt.tight_layout()
     plt.savefig(f'{OUTPUT_DIR}/04_diurnal_cycle.png', dpi=300, bbox_inches='tight', facecolor='white')
-    print("✅ 04_diurnal_cycle.png")
+    print("saved 04_diurnal_cycle.png")
     plt.close()
 
 
@@ -330,7 +330,7 @@ def plot_extreme_conditions(reports):
 
     plt.tight_layout()
     plt.savefig(f'{OUTPUT_DIR}/05_extreme_conditions.png', dpi=300, bbox_inches='tight', facecolor='white')
-    print("✅ 05_extreme_conditions.png")
+    print("saved 05_extreme_conditions.png")
     plt.close()
 
 
@@ -386,7 +386,7 @@ def plot_model_comparison_matrix(reports):
 
     plt.tight_layout()
     plt.savefig(f'{OUTPUT_DIR}/06_model_comparison_matrix.png', dpi=300, bbox_inches='tight', facecolor='white')
-    print("✅ 06_model_comparison_matrix.png")
+    print("saved 06_model_comparison_matrix.png")
     plt.close()
 
 
@@ -431,7 +431,7 @@ RANGIRANJE MODELA (po MAE temperature):
     with open(f'{OUTPUT_DIR}/00_SUMMARY_REPORT.txt', 'w', encoding='utf-8') as f:
         f.write(report_text)
 
-    print("✅ 00_SUMMARY_REPORT.txt")
+    print("saved 00_SUMMARY_REPORT.txt")
     print(report_text)
 
 

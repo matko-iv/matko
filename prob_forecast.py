@@ -1,17 +1,17 @@
-"""Probabilistic post-processing toolbox — monograph-2 (PDF2).
+"""Probabilistic post-processing toolbox.
 
 Contents:
-  Verification (Pogl. 8):   dm_test_hln, moving_block_bootstrap_ci
-  Diagnostics (Pogl. 3.4):  corp_reliability (PAV / MCB-DSC-UNC), coverage_width
-  EMOS baseline (Pogl. 1):  gaussian_crps, fit_emos, emos_predict
-  Thresholds (Pogl. 4.4):   threshold_for_max_sedi, threshold_for_max_csi
-  Quantiles+CQR (Pogl. 3):  train_quantile_models, cqr_calibrate, predict_quantiles,
-                            pinball_loss, crps_from_quantiles, exceedance_from_quantiles
-  ECC (Pogl. 5.2):          ecc_scenarios, rain_episode_stats
-  CSG (Pogl. 4.1, gated):   fit_csg, csg_sample_crps
+  Verification:   dm_test_hln, moving_block_bootstrap_ci
+  Diagnostics:    corp_reliability (PAV / MCB-DSC-UNC), coverage_width
+  EMOS baseline:  gaussian_crps, fit_emos, emos_predict
+  Thresholds:     threshold_for_max_sedi, threshold_for_max_csi
+  Quantiles+CQR:  train_quantile_models, cqr_calibrate, predict_quantiles,
+                  pinball_loss, crps_from_quantiles, exceedance_from_quantiles
+  ECC:            ecc_scenarios, rain_episode_stats
+  CSG (gated):    fit_csg, csg_sample_crps
 
-Standalone module: no import of forecast_48h_v3 (so fetch/eval scripts can use
-it without dragging in the whole pipeline).
+Standalone: no import of forecast_48h_v3, so fetch/eval scripts can use it
+without dragging in the whole pipeline.
 """
 import json
 
@@ -23,9 +23,7 @@ from sklearn.isotonic import IsotonicRegression
 DEFAULT_ALPHAS = (0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95)
 
 
-# ============================================================================
-# Verification statistics (PDF2 §8.1–8.2)
-# ============================================================================
+# Verification statistics.
 
 def dm_test_hln(loss_a, loss_b, h=24):
     """Diebold–Mariano test with HAC (uniform-kernel) variance over h-1 lags and
@@ -56,8 +54,7 @@ def dm_test_hln(loss_a, loss_b, h=24):
 
 
 def moving_block_bootstrap_ci(x, block_len=48, n_boot=1000, alpha=0.10, seed=0):
-    """CI for the mean of an autocorrelated series via moving-block bootstrap
-    (PDF2 §8.1: without block structure hourly CIs are falsely tight)."""
+    """CI for the mean of an autocorrelated series via moving-block bootstrap."""
     x = np.asarray(x, dtype=float)
     x = x[~np.isnan(x)]
     n = len(x)
@@ -75,9 +72,7 @@ def moving_block_bootstrap_ci(x, block_len=48, n_boot=1000, alpha=0.10, seed=0):
     return float(lo), float(hi)
 
 
-# ============================================================================
-# Diagnostics (PDF2 §3.4)
-# ============================================================================
+# Diagnostics.
 
 def corp_reliability(y, p):
     """CORP (Dimitriadis–Gneiting–Jordan 2021): PAV-recalibrated reliability with
@@ -110,9 +105,7 @@ def coverage_width(y, q_lo, q_hi):
     return cov, width
 
 
-# ============================================================================
-# EMOS / NGR baseline (PDF2 Pogl. 1 hierarchy)
-# ============================================================================
+# EMOS / NGR baseline.
 
 def gaussian_crps(y, mu, sigma):
     """Closed-form CRPS of N(mu, sigma) at y (Gneiting et al. 2005)."""
@@ -154,9 +147,7 @@ def emos_predict(params, ens_mean, ens_std):
     return mu, sig
 
 
-# ============================================================================
-# Decision thresholds (PDF2 §4.4)
-# ============================================================================
+# Decision thresholds.
 
 def _contingency(y, pred):
     hits = int(np.sum((pred == 1) & (y == 1)))
@@ -224,9 +215,7 @@ def threshold_for_max_csi(y, p, grid=None):
     return best_t, best_s
 
 
-# ============================================================================
-# Multi-quantile models + CQR (PDF2 §3.1–3.3)
-# ============================================================================
+# Multi-quantile models + CQR.
 
 def pinball_loss(y, q, alpha):
     y = np.asarray(y, dtype=float)
@@ -369,9 +358,7 @@ def load_quantile_bundle(path_prefix):
     return models, offsets
 
 
-# ============================================================================
-# ECC — Ensemble Copula Coupling (PDF2 §5.2)
-# ============================================================================
+# ECC — Ensemble Copula Coupling.
 
 def ecc_scenarios(qdf, alphas, raw_members):
     """Reorder samples from the calibrated marginals by the rank structure of
@@ -430,9 +417,7 @@ def rain_episode_stats(scenarios, wet_thresh=0.1, windows=((0, 12), (12, 24), (2
     return stats_out
 
 
-# ============================================================================
-# CSG — censored shifted Gamma (PDF2 §4.1; gated experiment)
-# ============================================================================
+# CSG — censored shifted Gamma.
 
 def fit_csg(ens_mean, ens_stat, y, n_starts=2):
     """Censored-shifted-Gamma (Scheuerer & Hamill 2015, simplified): the

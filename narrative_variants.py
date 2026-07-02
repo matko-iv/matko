@@ -1,17 +1,16 @@
 """Phrasing pools for the rule-based daily narrative (forecast_48h_v3._daily_narrative).
 
-Variable-weather days previously had a single fixed phrasing each; this gives
-each weather pattern a small POOL of equivalent Montenegrin phrasings. The picker
-is DETERMINISTIC per day (keyed on the day's weather signature) so a given day's
-wording is stable across runs (no forecast-JSON churn / Gemini-cache thrash) while
-DIFFERENT days get different wording.
+Each weather pattern gets a small pool of equivalent Montenegrin phrasings.
+The picker is deterministic per day (keyed on the day's weather signature),
+so a given day's wording is stable across runs — no forecast-JSON churn or
+Gemini-cache thrash — while different days vary.
 
-Every variant is faithful to the SAME classified weather, so the output still
-passes the gemini_narrative.validate() guardrail. Entry 0 of each pool is the
-original canonical phrasing, so nothing is lost. EDIT/EXTEND freely — add more
-phrasings to any pool (a native-speaker pass is welcome).
+Every variant is faithful to the same classified weather, so the output
+still passes the gemini_narrative.validate() guardrail. Entry 0 of each pool
+is the original canonical phrasing. Add more phrasings to any pool; a
+native-speaker pass is welcome.
 
-Stdlib only, so it is importable + unit-testable without the heavy forecast deps.
+Stdlib only, so it imports and tests without the heavy forecast deps.
 """
 
 VARIANTS = {

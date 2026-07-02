@@ -70,7 +70,7 @@ def scrape_day(date_str, session):
     try:
         response = session.get(url, headers=HEADERS, timeout=30)
         if response.status_code != 200:
-            print(f"   ❌ HTTP {response.status_code}")
+            print(f"   HTTP {response.status_code}")
             return None
             
         soup = BeautifulSoup(response.text, 'html.parser')
@@ -141,14 +141,14 @@ def scrape_day(date_str, session):
                     except:
                         pass
             
-            print(f"   ⚠️ Nema podataka u tabeli")
+            print(f"   Nema podataka u tabeli")
             return None
             
     except requests.exceptions.Timeout:
-        print(f"   ⏱️ Timeout")
+        print(f"   ⏱Timeout")
         return None
     except Exception as e:
-        print(f"   ❌ Error: {str(e)[:50]}")
+        print(f"   Error: {str(e)[:50]}")
         return None
 
 # resample_to_hourly is now imported from wu_aggregation.py
@@ -163,7 +163,7 @@ def scrape_day(date_str, session):
 def main():
     """Glavna funkcija"""
     print("=" * 70)
-    print("🌤️  WEATHER UNDERGROUND SCRAPER")
+    print("🌤 WEATHER UNDERGROUND SCRAPER")
     print(f"📍 Stanica: {STATION_ID}")
     print(f"📅 Period: {YEARS_BACK} godine unazad")
     print("=" * 70)
@@ -183,7 +183,7 @@ def main():
         current += timedelta(days=1)
     
     total_days = len(dates)
-    print(f"📊 Ukupno dana: {total_days}")
+    print(f"Ukupno dana: {total_days}")
     print("-" * 70)
     
     progress_file = os.path.join(OUTPUT_DIR, "progress.json")
@@ -195,19 +195,19 @@ def main():
         with open(progress_file, 'r') as f:
             progress = json.load(f)
             completed_dates = set(progress.get('completed', []))
-        print(f"✅ Pronađen progress: {len(completed_dates)} dana već završeno")
+        print(f"Pronađen progress: {len(completed_dates)} dana već završeno")
 
     all_data = []
     if os.path.exists(all_data_file):
         existing_df = pd.read_csv(all_data_file)
         all_data = [existing_df]
-        print(f"✅ Postojeći hourly podaci: {len(existing_df)} redova")
+        print(f"Postojeći hourly podaci: {len(existing_df)} redova")
 
     raw_chunks = []
     if os.path.exists(raw_5min_file):
         existing_raw = pd.read_csv(raw_5min_file)
         raw_chunks = [existing_raw]
-        print(f"✅ Postojeći raw 5-min podaci: {len(existing_raw)} redova")
+        print(f"Postojeći raw 5-min podaci: {len(existing_raw)} redova")
 
     session = requests.Session()
 
@@ -229,14 +229,14 @@ def main():
             hourly_df = resample_to_hourly(df)
             if hourly_df is not None:
                 all_data.append(hourly_df)
-                print(f"✅ {len(df)} raw → {len(hourly_df)} hourly")
+                print(f"{len(df)} raw → {len(hourly_df)} hourly")
                 completed_dates.add(date_str)
                 new_completed += 1
             else:
-                print(f"⚠️ Resample failed")
+                print(f"Resample failed")
                 failed_dates.append(date_str)
         else:
-            print(f"❌ No data")
+            print(f"No data")
             failed_dates.append(date_str)
 
         if new_completed > 0 and new_completed % 10 == 0:
@@ -259,7 +259,7 @@ def main():
         final_df = final_df.sort_values('datetime')
 
         final_df.to_csv(all_data_file, index=False)
-        print(f"✅ Sačuvano hourly: {all_data_file}")
+        print(f"Sačuvano hourly: {all_data_file}")
         print(f"   Redova: {len(final_df)}")
         print(f"   Period: {final_df['datetime'].min()} - {final_df['datetime'].max()}")
 
@@ -267,7 +267,7 @@ def main():
         raw_df = pd.concat(raw_chunks, ignore_index=True)
         raw_df = raw_df.drop_duplicates(subset=['datetime']).sort_values('datetime')
         raw_df.to_csv(raw_5min_file, index=False)
-        print(f"✅ Sačuvano raw 5-min: {raw_5min_file}")
+        print(f"Sačuvano raw 5-min: {raw_5min_file}")
         print(f"   Redova: {len(raw_df)}")
     
     with open(progress_file, 'w') as f:
@@ -276,15 +276,15 @@ def main():
             'failed': failed_dates
         }, f, indent=2)
     
-    print(f"\n📊 STATISTIKA:")
-    print(f"   ✅ Uspješno: {len(completed_dates)} dana")
-    print(f"   ❌ Neuspješno: {len(failed_dates)} dana")
+    print(f"\nSTATISTIKA:")
+    print(f"   Uspješno: {len(completed_dates)} dana")
+    print(f"   Neuspješno: {len(failed_dates)} dana")
     
     if failed_dates:
-        print(f"\n⚠️ Neuspješni datumi sačuvani u: {progress_file}")
+        print(f"\nNeuspješni datumi sačuvani u: {progress_file}")
     
     print("\n" + "=" * 70)
-    print("✅ GOTOVO!")
+    print("GOTOVO!")
     print("=" * 70)
 
 if __name__ == "__main__":
