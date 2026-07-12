@@ -69,6 +69,8 @@ python forecast_48h_v3.py --skip-training  # samo prognoza, postojeći modeli
 
 python test_gemini_narrative.py            # testovi guardrail-a
 python test_narrative_variants.py
+
+node test_nowcast_hourly.js                # SKALA NOWCAST gating u docs/forecast.html
 ```
 
 Output ide u `forecast_output/forecast_48h.json`; GitHub Actions ga kopira u

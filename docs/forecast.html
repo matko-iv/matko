@@ -1033,29 +1033,29 @@ function nowcastFresh(ns) {
     if (!ns || !ns.ok || !ns.base_epoch_ms) return false;
     return (Date.now() - ns.base_epoch_ms) / 60000 <= 90;
 }
-// Rain over the hour window [offset*60, (offset+1)*60) min from the nowcast base,
-// capped at the DGMR horizon. Returns {rain, mmh}, or null = no opinion (beyond horizon).
-// Rain over the hour window [offset*60,(offset+1)*60) for field `key`: 'point_mmh'
-// = AT Budva (the verdict), 'disc_max_mmh' = the ~8 km region (for the icon's
-// nearby-cell nudge). Capped at the DGMR horizon. Returns {rain,mmh} or null.
-function nowcastWindow(ns, offset, key) {
-    key = key || 'point_mmh';
-    const lo = offset * 60, hi = (offset + 1) * 60;
-    const nowVal = (ns.now && ns.now[key] != null) ? ns.now[key] : 0;
-    if (lo >= ns.horizon_min && !(offset === 0 && nowVal >= 0.2)) return null;
-    let peak = (offset === 0) ? nowVal : 0;
-    for (const s of (ns.series || [])) {
-        if (s.lead_min > lo && s.lead_min <= hi) peak = Math.max(peak, s[key] || 0);
+// A bucket must cover at least this much of a clock hour before the nowcast is
+// allowed to contradict the model (strip its rain) or to restate a full-hour mm.
+const HOUR_COVER_MIN = 30;
+// The nowcast's clock-hour bucket for a cell: hourly_mm[].hour is UTC, the cell's
+// datetime is local, so join on the epoch (DST-safe). Each bucket carries mm,
+// covered_min, peak_point_mmh (AT Budva) and peak_disc_mmh (the ~8 km region).
+// null = the DGMR horizon doesn't reach this hour -> no opinion.
+function nowcastHour(ns, datetime) {
+    if (!ns || !datetime) return null;
+    const t = new Date(datetime).getTime();
+    if (isNaN(t)) return null;
+    for (const b of (ns.hourly_mm || [])) {
+        if (Date.parse(b.hour) === t) return b;
     }
-    return { rain: peak >= 0.2, mmh: peak };
+    return null;
 }
-// Integrated mm over a lead window (point rate × dt), for the hourly-cell mm override.
-function nowcastMm(ns, loMin, hiMin) {
-    const dt = ns.timestep_min || 5; let mm = 0;
-    for (const s of (ns.series || [])) {
-        if (s.lead_min > loMin && s.lead_min <= hiMin) mm += (s.point_mmh || 0) * dt / 60;
-    }
-    return mm;
+// The mm to show for a cell, or null = keep the model's. A partly covered hour is
+// still the honest number for the CURRENT hour (its earlier minutes have already
+// happened), but for a future hour it would understate the full-hour total.
+function nowcastCellMm(bucket, isCurrentHour) {
+    if (!nowcastFresh(nowcastState) || !bucket) return null;
+    if ((bucket.covered_min || 0) >= HOUR_COVER_MIN || isCurrentHour) return bucket.mm || 0;
+    return null;
 }
 function nowcastIntensityCode(mmh) {
     if (mmh >= 20) return 95;     // grmljavina / vrlo jako
@@ -1081,8 +1081,12 @@ function nowcastImminent() {
     return soon && !(radarState && radarState.rainAtLocation);
 }
 function nowcastImminentCode() {
-    const w = nowcastWindow(nowcastState, 0);
-    return nowcastIntensityCode(w ? w.mmh : 0.5);
+    const ns = nowcastState;
+    let peak = (ns && ns.now && ns.now.point_mmh) || 0;
+    for (const s of ((ns && ns.series) || [])) {
+        if (s.lead_min <= 60) peak = Math.max(peak, s.point_mmh || 0);
+    }
+    return nowcastIntensityCode(peak);
 }
 
 function isRainCode(c) { return c >= 51 && c <= 82; }  // drizzle/rain/showers; thunder 95-99 excluded
@@ -1124,30 +1128,32 @@ function radarIntensityCode(rs) {
     return 61;                        // Slaba kiša
 }
 
-// Reconcile a model weather code with SKALA for hour offset 0 (current) or 1 (next).
-// SKALA NOWCAST (the DGMR forecast) drives this; SKALA RAIN is the fallback and,
-// being current-state ONLY now, gates just offset 0 ("is it raining right now").
-function gateWeatherCode(code, cloud, offset, rs) {
-    if (offset !== 0 && offset !== 1) return code;
+// Reconcile a model weather code with SKALA for one clock hour, given that hour's
+// nowcast bucket (null = beyond the horizon). SKALA NOWCAST (the DGMR forecast)
+// drives this; SKALA RAIN is the fallback and, being current-state ONLY now, gates
+// just the current clock hour ("is it raining right now").
+function gateWeatherCode(code, cloud, bucket, isCurrentHour, rs) {
     // 1) SKALA NOWCAST — the forecast source.
-    if (nowcastFresh(nowcastState)) {
-        const pt = nowcastWindow(nowcastState, offset, 'point_mmh');     // rain AT Budva
-        const dc = nowcastWindow(nowcastState, offset, 'disc_max_mmh');  // rain in the ~8 km region
-        if (pt) {                                            // nowcast has an opinion (within horizon)
-            if (pt.rain) {                                   // raining AT Budva -> rain icon (point intensity)
-                const rc = nowcastIntensityCode(pt.mmh);
-                return wcSeverity(code) >= wcSeverity(rc) ? code : rc;
-            }
-            if (dc && dc.rain) {                             // dry at Budva, but a cell is NEARBY:
-                if (dc.mmh >= STRONG_NEARBY_MMH)             //   strong cell -> thunderstorm
-                    return wcSeverity(code) >= 5 ? code : 95;
-                return escalateCloud(code);                  //   weaker -> just nudge cloudiness one step
-            }
-            return isRainCode(code) ? cloudToCode(cloud) : code;   // nothing near Budva -> strip model rain
+    if (bucket && nowcastFresh(nowcastState)) {
+        const pt = bucket.peak_point_mmh || 0;               // rain AT Budva
+        const dc = bucket.peak_disc_mmh || 0;                // rain in the ~8 km region
+        if (pt >= 0.2) {                                     // raining AT Budva -> rain icon (point intensity)
+            const rc = nowcastIntensityCode(pt);
+            return wcSeverity(code) >= wcSeverity(rc) ? code : rc;
         }
+        if (dc >= 0.2) {                                     // dry at Budva, but a cell is NEARBY:
+            if (dc >= STRONG_NEARBY_MMH)                     //   strong cell -> thunderstorm
+                return wcSeverity(code) >= 5 ? code : 95;
+            return escalateCloud(code);                      //   weaker -> just nudge cloudiness one step
+        }
+        // Nothing near Budva. The nowcast may always UPGRADE (it sees rain the model
+        // missed), but it may only CONTRADICT the model over an hour it really covers.
+        if ((bucket.covered_min || 0) >= HOUR_COVER_MIN)
+            return isRainCode(code) ? cloudToCode(cloud) : code;
+        return code;
     }
-    // 2) Fallback: SKALA RAIN, current state ONLY (offset 0).
-    if (offset === 0 && radarFresh(rs)) {
+    // 2) Fallback: SKALA RAIN, current state ONLY.
+    if (isCurrentHour && radarFresh(rs)) {
         if (rs.rainAtLocation) {
             const rc = radarIntensityCode(rs);
             return wcSeverity(code) >= wcSeverity(rc) ? code : rc;
@@ -1160,11 +1166,11 @@ function gateWeatherCode(code, cloud, offset, rs) {
 // Near-term gate: SKALA NOWCAST (DGMR) primary, SKALA RAIN fallback. (SKALA CLOUD
 // was removed from forecast.html earlier — its frames ran stale/misleading; the
 // SKALA CLOUD page itself still lives in the budva-radar repo.)
-function gatedCode(code, cloud, offset) {
-    return gateWeatherCode(code, cloud, offset, radarState);
+function gatedCode(code, cloud, datetime, isCurrentHour) {
+    return gateWeatherCode(code, cloud, nowcastHour(nowcastState, datetime), isCurrentHour, radarState);
 }
 
-// Re-skin the current-weather icon + the current/next hourly cells after a refresh.
+// Re-skin the current-weather icon + every hourly cell the nowcast horizon covers.
 function applyRadarGating() {
     const imminent = nowcastImminent();
     const imminentCode = imminent ? nowcastImminentCode() : null;
@@ -1173,30 +1179,29 @@ function applyRadarGating() {
         const code = +box.dataset.code;
         const cloud = box.dataset.cloud === '' ? null : +box.dataset.cloud;
         const hour = +box.dataset.hour;
-        let code0 = gatedCode(code, cloud, 0);
+        let code0 = gatedCode(code, cloud, box.dataset.datetime, true);
         if (imminent && wcSeverity(code0) === 0) code0 = imminentCode;  // DGMR rain ≤10 min -> force rain
         box.innerHTML = weatherIcon(getWeatherIcon(code0, hour), 96);
     }
-    document.querySelectorAll('.hourly-cell[data-gate]').forEach(cell => {
-        const offset = +cell.dataset.gate;
+    document.querySelectorAll('.hourly-cell[data-code]').forEach(cell => {
+        const isNow = cell.dataset.now === '1';
         const hour = +cell.dataset.hour;
         const code = +cell.dataset.code;
         const cloud = cell.dataset.cloud === '' ? null : +cell.dataset.cloud;
+        const bucket = nowcastHour(nowcastState, cell.dataset.datetime);
         const iconEl = cell.querySelector('.h-icon');
-        let cellCode = gatedCode(code, cloud, offset);
-        if (imminent && offset === 0 && wcSeverity(cellCode) === 0) cellCode = imminentCode;  // current hour -> force rain
+        let cellCode = gateWeatherCode(code, cloud, bucket, isNow, radarState);
+        if (imminent && isNow && wcSeverity(cellCode) === 0) cellCode = imminentCode;  // current hour -> force rain
         if (iconEl) iconEl.innerHTML = weatherIcon(getWeatherIcon(cellCode, hour), 48);
-        // SKALA NOWCAST mm override for the near-term cells: for the next ~80 min the
-        // DGMR forecast is more accurate than the NWP precipitation, so replace the mm.
+        // SKALA NOWCAST mm override: over its ~80 min horizon the DGMR forecast is more
+        // accurate than the NWP precipitation, so replace the mm of the hours it covers.
         const rainEl = cell.querySelector('.h-rain');
-        if (rainEl && nowcastFresh(nowcastState) && (offset === 0 || offset === 1)
-            && offset * 60 < nowcastState.horizon_min) {
-            const mm = nowcastMm(nowcastState, offset * 60,
-                                 Math.min((offset + 1) * 60, nowcastState.horizon_min));
+        const mm = nowcastCellMm(bucket, isNow);
+        if (rainEl && mm != null) {
             rainEl.textContent = mm > 0.05 ? mm.toFixed(1) + 'mm' : '';
             rainEl.style.color = '#0366d6';
-            rainEl.title = 'SKALA NOWCAST (DGMR) — mm u narednih ' +
-                           (offset === 0 ? '~sat' : '~sat (60–80 min)');
+            rainEl.title = 'SKALA NOWCAST (DGMR) — kiša u ovom satu (pokriveno ' +
+                           (bucket.covered_min || 0) + ' od 60 min)';
         }
     });
 }
@@ -2523,7 +2528,7 @@ function render(data) {
         const wmoDescs = {0:'Vedro',1:'Pretežno vedro',2:'Djelimično oblačno',3:'Oblačno',45:'Magla',48:'Magla',51:'Sitna kiša',53:'Sitna kiša, umjerena',55:'Sitna kiša, jaka',61:'Slaba kiša',63:'Kiša',65:'Jaka kiša',71:'Snijeg',73:'Snijeg',75:'Jak snijeg',80:'Pljuskovi',81:'Pljuskovi',82:'Jaki pljuskovi',95:'Grmljavina',96:'Grmljavina',99:'Grmljavina'};
         // SKALA gate: the near-term icon must agree with the radar (rain) and the
         // satellite (sky) — see gatedCode().
-        const cwCode = gatedCode(currentData.weather_code, currentData.cloud_cover, 0);
+        const cwCode = gatedCode(currentData.weather_code, currentData.cloud_cover, currentData.datetime, true);
         const cwIcon = getWeatherIcon(cwCode, currentData.hour);
         const cwDesc = wmoDescs[cwCode] || 'Vedro';
         const gatedDryNow = isRainCode(currentData.weather_code) && !isRainCode(cwCode);
@@ -2555,7 +2560,7 @@ function render(data) {
 
         html += `
         <div class="${cwClass}">
-            <div class="cw-icon" id="cwIconBox" data-code="${currentData.weather_code}" data-cloud="${currentData.cloud_cover != null ? currentData.cloud_cover : ''}" data-hour="${currentData.hour}">${weatherIcon(cwIcon, 96)}</div>
+            <div class="cw-icon" id="cwIconBox" data-code="${currentData.weather_code}" data-cloud="${currentData.cloud_cover != null ? currentData.cloud_cover : ''}" data-hour="${currentData.hour}" data-datetime="${currentData.datetime || ''}">${weatherIcon(cwIcon, 96)}</div>
             <div class="cw-main">
                 <div class="cw-label">Trenutno stanje · ${String(currentHour).padStart(2,'0')}:00h</div>
                 <div class="cw-temp">${currentData.temperature_2m.toFixed(1)}°C</div>
@@ -2590,11 +2595,13 @@ function render(data) {
         const pop = (h.precipitation_pop != null && h.precipitation_pop >= 0.15)
             ? Math.round(h.precipitation_pop * 100) + '%' : '';
         const gustWarn = h.p_gust_gt17 != null && h.p_gust_gt17 >= 0.3;
-        const gateOffset = (i === currentIdx) ? 0 : (i === currentIdx + 1 ? 1 : -1);
-        const cellCode = gateOffset >= 0 ? gatedCode(h.weather_code, h.cloud_cover, gateOffset) : h.weather_code;
+        // The nowcast gates by clock hour, so every cell carries what the lookup needs;
+        // cells outside the DGMR horizon simply find no bucket and keep the model's code.
+        const isCurrentHour = i === currentIdx;
+        const cellCode = gatedCode(h.weather_code, h.cloud_cover, h.datetime, isCurrentHour);
         const iconKey = getWeatherIcon(cellCode, h.hour);
         const isNow = h.hour === currentHour;
-        const gateAttr = gateOffset >= 0 ? ` data-gate="${gateOffset}" data-hour="${h.hour}" data-code="${h.weather_code}" data-cloud="${h.cloud_cover != null ? h.cloud_cover : ''}"` : '';
+        const gateAttr = ` data-hour="${h.hour}" data-code="${h.weather_code}" data-cloud="${h.cloud_cover != null ? h.cloud_cover : ''}" data-datetime="${h.datetime || ''}" data-now="${isCurrentHour ? '1' : '0'}"`;
         html += `
         <div class="hourly-cell"${gateAttr} data-uvkey="${(h.datetime || '').slice(0, 13)}" ${isNow ? 'style="background:#f1f8ff;border-top:2px solid #0366d6"' : ''}>
             <span class="h-time">${String(h.hour).padStart(2,'0')}h</span>
