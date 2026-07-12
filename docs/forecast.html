@@ -1049,11 +1049,18 @@ function nowcastHour(ns, datetime) {
     }
     return null;
 }
+// peak_point_mmh / peak_disc_mmh are newer generator fields. A fresh nowcast_status.json
+// written before the generator was redeployed carries mm/covered_min but no peaks — that
+// bucket has NO opinion on rain vs no rain, so it may drive neither the icon nor the mm.
+// Absent is not 0: an explicit 0 means "measured dry at Budva" and still gates.
+function nowcastHasPeaks(bucket) {
+    return !!bucket && bucket.peak_point_mmh != null && bucket.peak_disc_mmh != null;
+}
 // The mm to show for a cell, or null = keep the model's. A partly covered hour is
 // still the honest number for the CURRENT hour (its earlier minutes have already
 // happened), but for a future hour it would understate the full-hour total.
 function nowcastCellMm(bucket, isCurrentHour) {
-    if (!nowcastFresh(nowcastState) || !bucket) return null;
+    if (!nowcastFresh(nowcastState) || !nowcastHasPeaks(bucket)) return null;
     if ((bucket.covered_min || 0) >= HOUR_COVER_MIN || isCurrentHour) return bucket.mm || 0;
     return null;
 }
@@ -1084,7 +1091,7 @@ function nowcastImminentCode() {
     const ns = nowcastState;
     let peak = (ns && ns.now && ns.now.point_mmh) || 0;
     for (const s of ((ns && ns.series) || [])) {
-        if (s.lead_min <= 60) peak = Math.max(peak, s.point_mmh || 0);
+        if (s.lead_min > 0 && s.lead_min <= 60) peak = Math.max(peak, s.point_mmh || 0);
     }
     return nowcastIntensityCode(peak);
 }
@@ -1133,10 +1140,11 @@ function radarIntensityCode(rs) {
 // drives this; SKALA RAIN is the fallback and, being current-state ONLY now, gates
 // just the current clock hour ("is it raining right now").
 function gateWeatherCode(code, cloud, bucket, isCurrentHour, rs) {
-    // 1) SKALA NOWCAST — the forecast source.
-    if (bucket && nowcastFresh(nowcastState)) {
-        const pt = bucket.peak_point_mmh || 0;               // rain AT Budva
-        const dc = bucket.peak_disc_mmh || 0;                // rain in the ~8 km region
+    // 1) SKALA NOWCAST — the forecast source. A bucket without peaks says nothing about
+    // rain, so it is skipped entirely (and nowcastCellMm leaves its mm alone to match).
+    if (nowcastHasPeaks(bucket) && nowcastFresh(nowcastState)) {
+        const pt = bucket.peak_point_mmh;                    // rain AT Budva
+        const dc = bucket.peak_disc_mmh;                     // rain in the ~8 km region
         if (pt >= 0.2) {                                     // raining AT Budva -> rain icon (point intensity)
             const rc = nowcastIntensityCode(pt);
             return wcSeverity(code) >= wcSeverity(rc) ? code : rc;
@@ -1202,6 +1210,14 @@ function applyRadarGating() {
             rainEl.style.color = '#0366d6';
             rainEl.title = 'SKALA NOWCAST (DGMR) — kiša u ovom satu (pokriveno ' +
                            (bucket.covered_min || 0) + ' od 60 min)';
+        } else if (rainEl) {
+            // render() runs once, this every 120 s: a cell overridden earlier can fall out
+            // of the horizon as the base advances, so put the NWP mm back instead of
+            // leaving a stale nowcast number (and its "pokriveno N od 60 min" tooltip).
+            const nwp = parseFloat(cell.dataset.mm);
+            rainEl.textContent = nwp > 0.05 ? nwp.toFixed(1) + 'mm' : '';
+            rainEl.style.color = '';
+            rainEl.removeAttribute('title');
         }
     });
 }
@@ -2601,7 +2617,8 @@ function render(data) {
         const cellCode = gatedCode(h.weather_code, h.cloud_cover, h.datetime, isCurrentHour);
         const iconKey = getWeatherIcon(cellCode, h.hour);
         const isNow = h.hour === currentHour;
-        const gateAttr = ` data-hour="${h.hour}" data-code="${h.weather_code}" data-cloud="${h.cloud_cover != null ? h.cloud_cover : ''}" data-datetime="${h.datetime || ''}" data-now="${isCurrentHour ? '1' : '0'}"`;
+        // data-mm keeps the NWP number so applyRadarGating() can restore it after an override.
+        const gateAttr = ` data-hour="${h.hour}" data-code="${h.weather_code}" data-cloud="${h.cloud_cover != null ? h.cloud_cover : ''}" data-datetime="${h.datetime || ''}" data-now="${isCurrentHour ? '1' : '0'}" data-mm="${h.precipitation != null ? h.precipitation : ''}"`;
         html += `
         <div class="hourly-cell"${gateAttr} data-uvkey="${(h.datetime || '').slice(0, 13)}" ${isNow ? 'style="background:#f1f8ff;border-top:2px solid #0366d6"' : ''}>
             <span class="h-time">${String(h.hour).padStart(2,'0')}h</span>
