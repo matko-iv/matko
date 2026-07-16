@@ -1071,29 +1071,33 @@ function nowcastIntensityCode(mmh) {
     return 61;                    // slaba kiša
 }
 const STRONG_NEARBY_MMH = 25;     // a nearby cell (disc-max) at/above this -> thunderstorm icon
-// IMMINENT rain: DGMR says onset in <= 10 min (or it is already raining in its
-// 'now' frame) while SKALA RAIN hasn't caught it yet -> rain is essentially here,
-// so force the rain icon for the CURRENT hour (both the hourly cell and the big
-// 'now' icon). This is the explicit guarantee on top of the 0-60 min gate.
-function nowcastImminent() {
-    const ns = nowcastState;
-    if (!nowcastFresh(ns)) return false;
-    // EXACT-Budva (point) onset <= 10 min, or already raining at the point — the
-    // icon represents Budva itself (the verdict LINE is the wider region/disc-max).
-    var pOnset = null;
-    for (var i = 0; i < (ns.series || []).length; i++) {
-        if ((ns.series[i].point_mmh || 0) >= 0.2) { pOnset = ns.series[i].lead_min; break; }
+// What DGMR says is falling AT THIS MOMENT: the series sample at the forecast's
+// current age (base -> wall clock), i.e. the last lead already reached, falling
+// back to the base ('now') frame while the age is below the first lead. This is
+// the CURRENT hour's icon signal — NOT the hour's peak, which may still be 40
+// minutes away while it is sunny outside. null = nowcast missing/stale.
+function nowcastNowRate(ns) {
+    if (!nowcastFresh(ns)) return null;
+    const age = (Date.now() - ns.base_epoch_ms) / 60000;
+    let pt = (ns.now && ns.now.point_mmh) || 0;
+    let dc = (ns.now && ns.now.disc_max_mmh) || 0;
+    for (const s of (ns.series || [])) {
+        if (s.lead_min > age) break;               // series ascends in lead
+        pt = s.point_mmh || 0; dc = s.disc_max_mmh || 0;
     }
-    const soon = (pOnset != null && pOnset <= 10) || !!(ns.now && (ns.now.point_mmh || 0) >= 0.2);
-    return soon && !(radarState && radarState.rainAtLocation);
+    return { pt, dc };
+}
+// IMMINENT rain: DGMR says rain is falling at Budva RIGHT NOW while SKALA RAIN
+// hasn't caught it yet -> force the rain icon for the CURRENT hour (both the
+// hourly cell and the big 'now' icon). Never fires before the onset actually
+// arrives — the icon must not turn to rain while it is still dry outside.
+function nowcastImminent() {
+    const r = nowcastNowRate(nowcastState);
+    return !!r && r.pt >= 0.2 && !(radarState && radarState.rainAtLocation);
 }
 function nowcastImminentCode() {
-    const ns = nowcastState;
-    let peak = (ns && ns.now && ns.now.point_mmh) || 0;
-    for (const s of ((ns && ns.series) || [])) {
-        if (s.lead_min > 0 && s.lead_min <= 60) peak = Math.max(peak, s.point_mmh || 0);
-    }
-    return nowcastIntensityCode(peak);
+    const r = nowcastNowRate(nowcastState);
+    return nowcastIntensityCode(r ? r.pt : 0);
 }
 
 function isRainCode(c) { return c >= 51 && c <= 82; }  // drizzle/rain/showers; thunder 95-99 excluded
@@ -1143,8 +1147,12 @@ function gateWeatherCode(code, cloud, bucket, isCurrentHour, rs) {
     // 1) SKALA NOWCAST — the forecast source. A bucket without peaks says nothing about
     // rain, so it is skipped entirely (and nowcastCellMm leaves its mm alone to match).
     if (nowcastHasPeaks(bucket) && nowcastFresh(nowcastState)) {
-        const pt = bucket.peak_point_mmh;                    // rain AT Budva
-        const dc = bucket.peak_disc_mmh;                     // rain in the ~8 km region
+        // The CURRENT hour's icon means "now", so it reads the rate at this moment —
+        // rain due later in the same clock hour must not paint it while it is still
+        // dry/sunny. Future hours describe their whole hour, so they read the peaks.
+        const nowr = isCurrentHour ? nowcastNowRate(nowcastState) : null;
+        const pt = nowr ? nowr.pt : bucket.peak_point_mmh;   // rain AT Budva
+        const dc = nowr ? nowr.dc : bucket.peak_disc_mmh;    // rain in the ~8 km region
         if (pt >= 0.2) {                                     // raining AT Budva -> rain icon (point intensity)
             const rc = nowcastIntensityCode(pt);
             return wcSeverity(code) >= wcSeverity(rc) ? code : rc;
@@ -1155,8 +1163,9 @@ function gateWeatherCode(code, cloud, bucket, isCurrentHour, rs) {
             return escalateCloud(code);                      //   weaker -> just nudge cloudiness one step
         }
         // Nothing near Budva. The nowcast may always UPGRADE (it sees rain the model
-        // missed), but it may only CONTRADICT the model over an hour it really covers.
-        if ((bucket.covered_min || 0) >= HOUR_COVER_MIN)
+        // missed), but it may only CONTRADICT the model over an hour it really covers;
+        // for the current hour "dry at this very moment" is already the full statement.
+        if (isCurrentHour || (bucket.covered_min || 0) >= HOUR_COVER_MIN)
             return isRainCode(code) ? cloudToCode(cloud) : code;
         return code;
     }
@@ -1188,7 +1197,7 @@ function applyRadarGating() {
         const cloud = box.dataset.cloud === '' ? null : +box.dataset.cloud;
         const hour = +box.dataset.hour;
         let code0 = gatedCode(code, cloud, box.dataset.datetime, true);
-        if (imminent && wcSeverity(code0) === 0) code0 = imminentCode;  // DGMR rain ≤10 min -> force rain
+        if (imminent && wcSeverity(code0) === 0) code0 = imminentCode;  // DGMR: raining NOW -> force rain
         box.innerHTML = weatherIcon(getWeatherIcon(code0, hour), 96);
     }
     document.querySelectorAll('.hourly-cell[data-code]').forEach(cell => {
@@ -1199,7 +1208,7 @@ function applyRadarGating() {
         const bucket = nowcastHour(nowcastState, cell.dataset.datetime);
         const iconEl = cell.querySelector('.h-icon');
         let cellCode = gateWeatherCode(code, cloud, bucket, isNow, radarState);
-        if (imminent && isNow && wcSeverity(cellCode) === 0) cellCode = imminentCode;  // current hour -> force rain
+        if (imminent && isNow && wcSeverity(cellCode) === 0) cellCode = imminentCode;  // raining NOW -> force rain
         if (iconEl) iconEl.innerHTML = weatherIcon(getWeatherIcon(cellCode, hour), 48);
         // SKALA NOWCAST mm override: over its ~80 min horizon the DGMR forecast is more
         // accurate than the NWP precipitation, so replace the mm of the hours it covers.

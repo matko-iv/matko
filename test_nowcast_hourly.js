@@ -32,7 +32,8 @@ const src = html.slice(start, end);
 
 const api = new Function(src + `
     return { nowcastHour, nowcastCellMm, gateWeatherCode, nowcastFresh, nowcastIntensityCode,
-             nowcastImminentCode, escalateCloud, cloudToCode, HOUR_COVER_MIN,
+             nowcastImminent, nowcastImminentCode, nowcastNowRate, escalateCloud, cloudToCode,
+             HOUR_COVER_MIN,
              setState: (ns, rs) => { nowcastState = ns; radarState = rs; } };
 `)();
 
@@ -144,21 +145,39 @@ at(BASE + 5 * 60000, () => {
        'missing hourly_mm -> clean fall-through, code unchanged');
     api.setState(ns, null);
 
-    // 7. nowcastImminentCode peaks over the 0-60 min window, exclusive of lead 0.
-    // (Lead 0 is the base frame; ns.now is the current-state channel for that.)
+    // 7. Imminent = DGMR says rain is falling at Budva RIGHT NOW (the series sample at
+    // the forecast's current age) — NEVER before the onset actually arrives.
     const nsImm = {
-        ok: true, base_epoch_ms: BASE,
-        now: { point_mmh: 0.0 },
+        ok: true, base_epoch_ms: BASE, timestep_min: 5,
+        now: { point_mmh: 0.0, disc_max_mmh: 0.0 },
         series: [
-            { lead_min: 0, point_mmh: 30.0 },   // would be 95 if lead 0 leaked in
-            { lead_min: 30, point_mmh: 6.0 },   // -> 63
-            { lead_min: 80, point_mmh: 40.0 },  // beyond 60 min, ignored
+            { lead_min: 5, point_mmh: 6.0, disc_max_mmh: 6.0 },    // current lead (age 5) -> 63
+            { lead_min: 30, point_mmh: 40.0, disc_max_mmh: 40.0 }, // later peak must NOT leak in
         ],
     };
     api.setState(nsImm, null);
-    eq(api.nowcastImminentCode(), 63, 'imminent code peaks leads 1-60 only (6 mm/h -> 63)');
-    nsImm.now = { point_mmh: 25.0 };
-    eq(api.nowcastImminentCode(), 95, 'imminent code still takes the now frame into account');
+    eq(api.nowcastImminent(), true, 'raining at the current lead -> imminent');
+    eq(api.nowcastImminentCode(), 63, 'imminent intensity is the CURRENT rate, not a later peak (6 mm/h -> 63)');
+    api.setState(nsImm, { ok: true, ageMin: 5, rainAtLocation: true });
+    eq(api.nowcastImminent(), false, 'SKALA RAIN already shows the rain -> no force needed');
+    const nsPre = {
+        ok: true, base_epoch_ms: BASE, timestep_min: 5,
+        now: { point_mmh: 0.0, disc_max_mmh: 0.0 },
+        series: [
+            { lead_min: 5, point_mmh: 0.0, disc_max_mmh: 0.0 },
+            { lead_min: 10, point_mmh: 8.0, disc_max_mmh: 8.0 },   // onset 5 min from now
+        ],
+    };
+    api.setState(nsPre, null);
+    eq(api.nowcastImminent(), false, 'onset 5 min away is NOT imminent — the icon waits for the rain');
+    const nsBaseFrame = {
+        ok: true, base_epoch_ms: BASE, timestep_min: 5,
+        now: { point_mmh: 2.5, disc_max_mmh: 3.0 },
+        series: [{ lead_min: 10, point_mmh: 0.0, disc_max_mmh: 0.0 }],  // first lead still ahead
+    };
+    api.setState(nsBaseFrame, null);
+    eq(api.nowcastImminent(), true, 'age below the first lead reads the base (now) frame');
+    eq(api.nowcastImminentCode(), 63, 'now-frame 2.5 mm/h -> 63');
     api.setState(ns, null);
 
     // SKALA RAIN fallback stays current-hour only, and only when the nowcast is absent.
@@ -166,6 +185,47 @@ at(BASE + 5 * 60000, () => {
     const rs = { ok: true, ageMin: 5, rainAtLocation: true, bestRain: { dbz: 40 } };
     eq(api.gateWeatherCode(0, 10, null, true, rs), 63, 'no nowcast: SKALA RAIN gates the current hour');
     eq(api.gateWeatherCode(0, 10, null, false, rs), 0, 'no nowcast: SKALA RAIN does not gate later hours');
+});
+
+// 7b. CURRENT hour: the icon means NOW. Rain later in the same clock hour must not
+// paint the cell (nor the big 'now' icon) before the onset actually arrives — it may
+// still be sunny outside. Onset is 14:05Z (lead 25); the 14:00Z bucket peaks 6 mm/h.
+at(BASE + 22 * 60000, () => {   // 14:02Z = 16:02 local — 3 min BEFORE onset, still dry
+    api.setState(ns, null);
+    const b = api.nowcastHour(ns, '2026-07-09T16:00:00');
+    eq(b && b.peak_point_mmh, 6.0, 'sanity: the current-hour bucket does peak 6 mm/h');
+    eq(api.gateWeatherCode(0, 5, b, true, null), 0, 'current hour stays clear until rain actually starts');
+    eq(api.gateWeatherCode(61, 80, b, true, null), 3, 'current hour: DGMR dry at this moment strips the model rain code');
+    eq(api.nowcastCellMm(b, true), 6.0, 'current hour mm still shows the DGMR hour total');
+});
+at(BASE + 30 * 60000, () => {   // 14:10Z — rain started at 14:05Z
+    api.setState(ns, null);
+    const b = api.nowcastHour(ns, '2026-07-09T16:00:00');
+    eq(api.gateWeatherCode(0, 5, b, true, null), 63, 'current hour flips to rain once it is falling (6 mm/h -> 63)');
+});
+// Same rule for the nearby-cell (disc) escalation: a strong cell due later in the
+// hour must not raise the thunderstorm icon while the sky is still quiet.
+const seriesD = [];
+for (let lead = 5; lead <= 80; lead += 5) {
+    seriesD.push({ lead_min: lead, point_mmh: 0.0, disc_max_mmh: lead >= 25 ? 30.0 : 0.0 });
+}
+const nsD = {
+    ok: true, base_epoch_ms: BASE, horizon_min: 80, timestep_min: 5,
+    now: { point_mmh: 0.0, disc_max_mmh: 0.0 }, series: seriesD,
+    hourly_mm: [
+        { hour: '2026-07-09T13:00:00Z', mm: 0.0, covered_min: 20, peak_point_mmh: 0.0, peak_disc_mmh: 0.0 },
+        { hour: '2026-07-09T14:00:00Z', mm: 0.0, covered_min: 60, peak_point_mmh: 0.0, peak_disc_mmh: 30.0 },
+    ],
+};
+at(BASE + 22 * 60000, () => {
+    api.setState(nsD, null);
+    const b = api.nowcastHour(nsD, '2026-07-09T16:00:00');
+    eq(api.gateWeatherCode(0, 5, b, true, null), 0, 'strong cell due later this hour does not paint 95 early');
+});
+at(BASE + 30 * 60000, () => {
+    api.setState(nsD, null);
+    const b = api.nowcastHour(nsD, '2026-07-09T16:00:00');
+    eq(api.gateWeatherCode(0, 5, b, true, null), 95, 'strong cell NEARBY RIGHT NOW -> thunderstorm icon');
 });
 
 // 8. Stale nowcast (base older than 90 min) -> no nowcast gating at all.
