@@ -215,6 +215,9 @@ class ForecastCoreTests(unittest.TestCase):
             'datetime': pd.date_range('2026-01-01', periods=3, freq='h'),
             'humidity': [60.0, 70.0, 80.0],
             'agreement': [0.0, 0.5, 1.0],
+            # Live previous-run features can arrive as integer columns.  The
+            # shift adds a trailing NaN, which must widen rather than fail.
+            'previous_run_humidity': [51, 48, 45],
         })
         aligned = fc._align_onset_features_to_display(raw_features)
         pd.testing.assert_series_equal(
@@ -225,6 +228,9 @@ class ForecastCoreTests(unittest.TestCase):
         )
         np.testing.assert_allclose(
             aligned['agreement'], [0.5, 1.0, np.nan], equal_nan=True
+        )
+        np.testing.assert_allclose(
+            aligned['previous_run_humidity'], [48.0, 45.0, np.nan], equal_nan=True
         )
 
     def test_shared_stack_and_blend_dispatcher(self):
@@ -284,6 +290,22 @@ class ForecastCoreTests(unittest.TestCase):
         farther = pf.exceedance_from_quantiles(tied, pf.DEFAULT_ALPHAS, 10.0)[0]
         self.assertAlmostEqual(just_above, 0.05, places=5)
         self.assertGreater(just_above, farther)
+
+    def test_ecc_uses_integer_rank_indices(self):
+        alphas = pf.DEFAULT_ALPHAS
+        qdf = pd.DataFrame({
+            f'q{int(round(a * 100)):02d}': [a * 10.0, a * 20.0]
+            for a in alphas
+        })
+        raw = np.array([
+            [1.0, 2.0, 3.0, 4.0],
+            [4.0, 3.0, np.nan, 1.0],
+        ])
+        scenarios = pf.ecc_scenarios(qdf, alphas, raw)
+        self.assertEqual(scenarios.shape, raw.shape)
+        self.assertTrue(np.isfinite(scenarios).all())
+        self.assertTrue(np.all(np.diff(scenarios[0]) > 0))
+        self.assertGreater(scenarios[1, 0], scenarios[1, -1])
 
     def test_cqr_uses_conservative_order_statistic_and_crps_integral(self):
         X = pd.DataFrame({'x': np.arange(100, dtype=float)})

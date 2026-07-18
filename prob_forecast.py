@@ -455,7 +455,9 @@ def ecc_scenarios(qdf, alphas, raw_members):
         row = raw[i].copy()
         med = np.nanmedian(row)
         row[np.isnan(row)] = med if not np.isnan(med) else 0.0
-        ranks = stats.rankdata(row, method='ordinal') - 1  # 0..m-1
+        # scipy.stats.rankdata returns floating-point ranks even for the
+        # ordinal method; NumPy requires integers for positional indexing.
+        ranks = (stats.rankdata(row, method='ordinal') - 1).astype(np.intp)
         out[i] = samples[ranks]
     return out
 

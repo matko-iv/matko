@@ -4111,7 +4111,13 @@ def _align_onset_features_to_display(fc_features):
     """
     aligned = fc_features.copy()
     feature_cols = [c for c in aligned.columns if c != 'datetime']
-    aligned.loc[:, feature_cols] = aligned[feature_cols].shift(-1)
+    # Assign each shifted Series through ``frame[col]`` so pandas is allowed to
+    # widen integer/bool columns when the final shifted row becomes NaN.
+    # ``.loc[:, cols] = ...`` attempts an in-place dtype-preserving update in
+    # pandas 3 and raises LossySetitemError for live integer-valued features.
+    shifted = aligned[feature_cols].shift(-1)
+    for col in feature_cols:
+        aligned[col] = shifted[col]
     return aligned
 
 
