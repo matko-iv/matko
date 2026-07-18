@@ -1,4 +1,4 @@
-# Budva Weather Forecast — ML korekcija prognoze
+# Budva ML Weather Forecast pipeline
 
 Korigovana 48-satna i 7-dnevna prognoza za Budvu. Pipeline preuzima sirove
 prognoze sa 11 globalnih NWP modela, uči njihov bias na 6 godina lokalnih
