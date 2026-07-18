@@ -5,13 +5,18 @@ Run: .venv/Scripts/python.exe forecast_48h_v3.py [--skip-training]
 Author: Matija Ivanović (@matko-iv)
 """
 
-import sys, io, os, json, time, warnings, re
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
-warnings.filterwarnings('ignore')
+import sys, io, os, json, time, warnings, subprocess
+if hasattr(sys.stdout, 'buffer'):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'buffer'):
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+# Do not globally suppress warnings: CUDA/OpenCL fallback and artifact-version
+# warnings are operationally important. Individual noisy call sites can filter a
+# specific warning locally if one proves harmless.
 
 import pandas as pd
 import numpy as np
+warnings.filterwarnings('ignore', category=pd.errors.PerformanceWarning)
 import xgboost as xgb
 from sklearn.metrics import mean_absolute_error, mean_squared_error, f1_score, precision_recall_curve
 from sklearn.isotonic import IsotonicRegression
@@ -32,7 +37,8 @@ def meteorological_metrics(y_true, y_pred_binary, p_proba=None):
     d = int(((y_true == 0) & (y_pred == 0)).sum())  # correct rejections
     n = a + b + c + d
     pod = a / (a + c) if (a + c) > 0 else 0.0  # = recall
-    far = b / (a + b) if (a + b) > 0 else 0.0  # = 1 - precision
+    far = b / (a + b) if (a + b) > 0 else 0.0  # false-alarm ratio
+    precision = a / (a + b) if (a + b) > 0 else 0.0
     csi = a / (a + b + c) if (a + b + c) > 0 else 0.0
     if (a + c) > 0 and (c + d) > 0 and (a + b) > 0 and (b + d) > 0:
         hss_num = 2.0 * (a * d - b * c)
@@ -41,15 +47,20 @@ def meteorological_metrics(y_true, y_pred_binary, p_proba=None):
     else:
         hss = 0.0
     # SEDI: stable for rare events (Ferro & Stephenson 2011)
-    H = pod
-    F = b / (b + d) if (b + d) > 0 else 0.0
-    if 0 < H < 1 and 0 < F < 1:
+    H_raw = pod
+    F_raw = b / (b + d) if (b + d) > 0 else 0.0
+    if (a + c) > 0 and (b + d) > 0:
+        # SEDI's logarithms are undefined at exact 0/1. Clipping preserves
+        # the correct limiting behavior (perfect -> +1, inverse -> -1).
+        eps = 1e-6
+        H = float(np.clip(H_raw, eps, 1 - eps))
+        F = float(np.clip(F_raw, eps, 1 - eps))
         sedi = (np.log(F) - np.log(H) - np.log(1 - F) + np.log(1 - H)) / \
                (np.log(F) + np.log(H) + np.log(1 - F) + np.log(1 - H))
     else:
         sedi = 0.0
     out = {"hits": a, "false_alarms": b, "misses": c, "correct_rejections": d,
-           "pod": float(pod), "far": float(far), "precision": float(1 - far),
+           "pod": float(pod), "far": float(far), "precision": float(precision),
            "csi": float(csi), "hss": float(hss), "sedi": float(sedi), "n": n}
     if p_proba is not None:
         p = np.clip(np.asarray(p_proba, dtype=float), 0.0, 1.0)
@@ -125,7 +136,11 @@ def pit_values(y_true, members):
         row = M[k][np.isfinite(M[k])]
         if row.size == 0 or not np.isfinite(y[k]):
             continue
-        out[k] = np.sum(row <= y[k]) / (row.size + 1.0)
+        # Deterministic mid-rank PIT. The +0.5 continuity correction avoids
+        # impossible zero/one boundary values for finite ensembles.
+        less = np.sum(row < y[k])
+        equal = np.sum(row == y[k])
+        out[k] = (less + 0.5 * equal + 0.5) / (row.size + 1.0)
     return out
 
 
@@ -242,14 +257,24 @@ def focal_loss_xgb_objective(gamma: float = 2.0, alpha: float = 0.25):
         # the simplified textbook formula, which can go negative for small pt and
         # destabilizes XGBoost's Newton step).
         # d^2L/dz^2 = at * pt * (1-pt)^gamma * [ gamma*log(pt)*(1 - pt*(gamma+1))
-        #                                       - pt*(3*gamma + 1) + 2*gamma + 1 ]
-        bracket = gamma * log_pt * (1 - pt * (gamma + 1)) - pt * (3 * gamma + 1) + 2 * gamma + 1
+        #                                       - pt*(2*gamma + 1) + 2*gamma + 1 ]
+        bracket = gamma * log_pt * (1 - pt * (gamma + 1)) - pt * (2 * gamma + 1) + 2 * gamma + 1
         hess = at * pt * one_minus_pt_g * bracket
         # Focal loss is non-convex in margin space; hessian can be negative for
         # very hard misclassified examples (e.g. y=1 with p << 0.5). XGBoost's
-        # Newton step -grad/hess would blow up. Standard fix: take absolute
-        # value and apply a sane floor so per-sample updates stay bounded.
-        hess = np.maximum(np.abs(hess), 1e-3)
+        # Newton step -grad/hess would blow up. Clip negative curvature to a
+        # small positive floor; taking abs() would invent strong curvature and
+        # produce a different optimization problem.
+        hess = np.maximum(hess, 1e-3)
+        # xgb.train does not apply DMatrix weights to a custom objective. Honor
+        # the seasonal rain weights explicitly in both first and second order.
+        try:
+            sample_weight = np.asarray(dtrain.get_weight(), dtype=float)
+        except Exception:
+            sample_weight = np.array([], dtype=float)
+        if sample_weight.size == y.size:
+            grad *= sample_weight
+            hess *= sample_weight
         return grad, hess
     return fobj
 
@@ -269,7 +294,14 @@ def focal_loss_xgb_feval(gamma: float = 2.0, alpha: float = 0.25):
         pt = np.where(y == 1, p, 1 - p)
         at = np.where(y == 1, alpha, 1 - alpha)
         loss = -at * np.power(1 - pt, gamma) * np.log(pt)
-        return 'focal_loss', float(np.mean(loss))
+        try:
+            sample_weight = np.asarray(dmatrix.get_weight(), dtype=float)
+        except Exception:
+            sample_weight = np.array([], dtype=float)
+        value = (np.average(loss, weights=sample_weight)
+                 if sample_weight.size == y.size and sample_weight.sum() > 0
+                 else np.mean(loss))
+        return 'focal_loss', float(value)
     return feval
 
 
@@ -299,12 +331,372 @@ import optuna
 import prob_forecast as pf
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
+
+RUN_AUX_DIAGNOSTICS = (
+    '--aux-diagnostics' in sys.argv or
+    os.environ.get('FC_AUX_DIAGNOSTICS', '').strip().lower()
+    in {'1', 'true', 'yes', 'on'}
+)
+
+
+class _AuxDiagnosticsDisabled(Exception):
+    """Internal control flow for optional non-production base learners."""
+
+
+# ---------------------------------------------------------------------------
+# ML compute device
+# ---------------------------------------------------------------------------
+# XGBoost >= 2 uses ``device='cuda'`` together with ``tree_method='hist'``.
+# Keep device selection in one place: this file creates models in many separate
+# training paths, and a missed constructor would otherwise silently run on CPU.
+#
+# Selection (highest precedence first):
+#   --gpu / --cpu
+#   FC_DEVICE=cuda|cpu|auto (default: auto)
+#   FC_GPU_ID=0             (default: first GPU)
+if '--gpu' in sys.argv and '--cpu' in sys.argv:
+    raise ValueError("--gpu i --cpu se ne mogu koristiti istovremeno.")
+
+_DEVICE_REQUEST = (
+    'cuda' if '--gpu' in sys.argv else
+    'cpu' if '--cpu' in sys.argv else
+    os.environ.get('FC_DEVICE', 'auto').strip().lower()
+)
+if _DEVICE_REQUEST not in {'auto', 'cuda', 'cpu'}:
+    raise ValueError("FC_DEVICE mora biti 'auto', 'cuda' ili 'cpu'.")
+
+_GPU_ID = 0
+if _DEVICE_REQUEST != 'cpu':
+    try:
+        _GPU_ID = int(os.environ.get('FC_GPU_ID', '0'))
+        if _GPU_ID < 0:
+            raise ValueError
+    except ValueError as exc:
+        raise ValueError('FC_GPU_ID mora biti cijeli broj >= 0.') from exc
+
+
+def _probe_xgboost_cuda(gpu_id=0):
+    """Return (available, detail) after a real one-tree CUDA training probe.
+
+    Looking only for ``nvidia-smi`` is insufficient: the Python XGBoost wheel
+    itself must include CUDA support. Reading build flags is also insufficient
+    on machines where CUDA was compiled in but no usable GPU is visible.
+    """
+    try:
+        major = int(str(xgb.__version__).split('.', 1)[0])
+    except (TypeError, ValueError):
+        major = 0
+    if major < 2:
+        return False, f'XGBoost {xgb.__version__} je prestar; potreban je >= 2.0'
+
+    requested = f'cuda:{gpu_id}'
+    try:
+        probe_X = np.array([[0.0], [1.0], [2.0], [3.0]], dtype=np.float32)
+        probe_y = np.array([0.0, 0.0, 1.0, 1.0], dtype=np.float32)
+        booster = xgb.train(
+            {'device': requested, 'tree_method': 'hist',
+             'objective': 'reg:squarederror', 'verbosity': 0},
+            xgb.DMatrix(probe_X, label=probe_y),
+            num_boost_round=1,
+        )
+        config = json.loads(booster.save_config())
+        actual = str(config['learner']['generic_param']['device'])
+        if not actual.startswith('cuda'):
+            return False, f'XGBoost je izabrao {actual} umjesto {requested}'
+        return True, actual
+    except Exception as exc:
+        return False, f'{type(exc).__name__}: {exc}'
+
+
+_DEVICE_DETAIL = 'forced CPU'
+if _DEVICE_REQUEST == 'cpu':
+    ML_DEVICE = 'cpu'
+else:
+    _CUDA_OK, _DEVICE_DETAIL = _probe_xgboost_cuda(_GPU_ID)
+    if _CUDA_OK:
+        ML_DEVICE = f'cuda:{_GPU_ID}'
+    elif _DEVICE_REQUEST == 'cuda':
+        raise RuntimeError(
+            'GPU je izricito zatrazen, ali XGBoost CUDA provjera nije uspjela: '
+            f'{_DEVICE_DETAIL}'
+        )
+    else:
+        ML_DEVICE = 'cpu'
+
+USING_GPU = ML_DEVICE.startswith('cuda')
+XGB_DEVICE_PARAMS = {'tree_method': 'hist', 'device': ML_DEVICE}
+CATBOOST_DEVICE_PARAMS = (
+    {'task_type': 'GPU', 'devices': str(_GPU_ID), 'allow_writing_files': False}
+    if USING_GPU else
+    {'task_type': 'CPU', 'allow_writing_files': False}
+)
+# LightGBM's Windows GPU backend is OpenCL (``device_type='gpu'``), not its
+# Linux-only CUDA backend. Official Windows wheels include this GPU learner.
+_LGB_GPU_DEVICE_ID = _GPU_ID
+_LGB_GPU_PLATFORM_ID = None
+if USING_GPU:
+    try:
+        _LGB_GPU_DEVICE_ID = int(os.environ.get('FC_LGB_GPU_DEVICE_ID', str(_GPU_ID)))
+        if _LGB_GPU_DEVICE_ID < 0:
+            raise ValueError
+        if os.environ.get('FC_LGB_GPU_PLATFORM_ID', '').strip():
+            _LGB_GPU_PLATFORM_ID = int(os.environ['FC_LGB_GPU_PLATFORM_ID'])
+            if _LGB_GPU_PLATFORM_ID < 0:
+                raise ValueError
+    except ValueError as exc:
+        raise ValueError(
+            'FC_LGB_GPU_DEVICE_ID/FC_LGB_GPU_PLATFORM_ID moraju biti cijeli brojevi >= 0.'
+        ) from exc
+
+LIGHTGBM_DEVICE_PARAMS = (
+    {'device_type': 'gpu', 'gpu_device_id': _LGB_GPU_DEVICE_ID,
+     **({'gpu_platform_id': _LGB_GPU_PLATFORM_ID}
+        if _LGB_GPU_PLATFORM_ID is not None else {})}
+    if USING_GPU else
+    {'device_type': 'cpu'}
+)
+
+
+def _new_xgb_regressor(**params):
+    """Create an XGBoost regressor on the selected device."""
+    return xgb.XGBRegressor(**{**params, **XGB_DEVICE_PARAMS})
+
+
+def _new_xgb_classifier(**params):
+    """Create an XGBoost classifier on the selected device."""
+    return xgb.XGBClassifier(**{**params, **XGB_DEVICE_PARAMS})
+
+
+def _new_xgb_booster():
+    """Create a raw Booster on the selected device (used when reloading)."""
+    return xgb.Booster(params=XGB_DEVICE_PARAMS)
+
+
+def _train_xgb_booster(params, dtrain, *args, **kwargs):
+    """Run raw ``xgb.train`` without allowing a call site to miss the GPU."""
+    return xgb.train({**params, **XGB_DEVICE_PARAMS}, dtrain, *args, **kwargs)
+
+
+def _restore_xgb_device(model):
+    """Re-apply runtime device after load_model (saved config may differ)."""
+    if isinstance(model, xgb.Booster):
+        model.set_param(XGB_DEVICE_PARAMS)
+    else:
+        model.set_params(**XGB_DEVICE_PARAMS)
+    return model
+
+
+def _new_catboost_regressor(**params):
+    """Create a CatBoost regressor on the selected training device."""
+    return cb.CatBoostRegressor(**{**params, **CATBOOST_DEVICE_PARAMS})
+
+
+def _new_catboost_cpu_regressor(**params):
+    """CPU fallback used only by auto mode after a backend-specific failure."""
+    return cb.CatBoostRegressor(
+        **{**params, 'task_type': 'CPU', 'allow_writing_files': False}
+    )
+
+
+def _catboost_predict(model, X):
+    """Use GPU inference for the numerical CatBoost models when requested."""
+    return model.predict(X, task_type='GPU' if USING_GPU else 'CPU')
+
+
+def _new_lgbm_regressor(**params):
+    """Create a LightGBM regressor on CPU or the Windows OpenCL GPU backend."""
+    return lgb.LGBMRegressor(**{**params, **LIGHTGBM_DEVICE_PARAMS})
+
+
+def _new_lgbm_cpu_regressor(**params):
+    """CPU fallback used only by auto mode after an OpenCL-specific failure."""
+    return lgb.LGBMRegressor(**{**params, 'device_type': 'cpu'})
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(BASE_DIR, "forecast_output")
 MODEL_DIR = os.path.join(BASE_DIR, "trained_models_v2")
 PREV_RUNS_DIR = os.path.join(BASE_DIR, "previous_runs_data")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
+
+
+def _remove_if_exists(*paths):
+    """Invalidate optional artifacts that were absent from the newest fit."""
+    for path in paths:
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except OSError as exc:
+            print(f"  WARN: ne mogu ukloniti zastarjeli artifact {path}: {exc}")
+
+
+def _write_json_atomic(path, payload, *, indent=None, ensure_ascii=True,
+                       allow_nan=True):
+    """Write JSON without exposing readers to a truncated partial file."""
+    temporary = f'{path}.{os.getpid()}.tmp'
+    try:
+        with open(temporary, 'w', encoding='utf-8') as handle:
+            json.dump(payload, handle, indent=indent, ensure_ascii=ensure_ascii,
+                      allow_nan=allow_nan)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            try:
+                os.remove(temporary)
+            except OSError:
+                pass
+
+
+_QUANTILE_ARTIFACT_VERSION = 1
+
+
+def _quantile_legacy_prefix(param):
+    return os.path.join(MODEL_DIR, f'qmod_{param}')
+
+
+def _quantile_manifest_path(param):
+    return f'{_quantile_legacy_prefix(param)}_active.json'
+
+
+def _quantile_bundle_paths(prefix):
+    """Return every file that makes up one quantile bundle generation."""
+    alphas = set(float(a) for a in pf.DEFAULT_ALPHAS)
+    meta_path = f'{prefix}_cqr.json'
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, encoding='utf-8') as handle:
+                alphas.update(float(a) for a in json.load(handle).get('alphas', []))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+    model_paths = [
+        f'{prefix}_q{int(round(alpha * 100)):02d}.txt'
+        for alpha in sorted(alphas)
+    ]
+    return model_paths + [meta_path, f'{prefix}_features.json']
+
+
+def _remove_quantile_bundle(prefix):
+    if prefix:
+        _remove_if_exists(*_quantile_bundle_paths(prefix))
+
+
+def _active_quantile_prefix(param):
+    """Resolve the committed generation, retaining legacy-bundle support.
+
+    Once a manifest exists, it is authoritative: an invalid or corrupt
+    manifest must never fall back to possibly stale legacy qmod files.
+    """
+    legacy_prefix = _quantile_legacy_prefix(param)
+    manifest_path = _quantile_manifest_path(param)
+    if not os.path.exists(manifest_path):
+        return legacy_prefix
+    try:
+        with open(manifest_path, encoding='utf-8') as handle:
+            manifest = json.load(handle)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        print(f"  Kvantili {param}: neispravan active manifest ({exc})")
+        return None
+    if (manifest.get('version') != _QUANTILE_ARTIFACT_VERSION
+            or manifest.get('state') != 'active'):
+        return None
+    generation = manifest.get('generation')
+    expected_prefix = f'qmod_{param}.__gen__.'
+    if (not isinstance(generation, str)
+            or os.path.basename(generation) != generation
+            or not generation.startswith(expected_prefix)):
+        print(f"  Kvantili {param}: odbijen neispravan generation manifest")
+        return None
+    return os.path.join(MODEL_DIR, generation)
+
+
+def _invalidate_quantile_artifacts(param, reason):
+    """Atomically prevent any older quantile generation from being reloaded."""
+    legacy_prefix = _quantile_legacy_prefix(param)
+    manifest_path = _quantile_manifest_path(param)
+    previous_prefix = _active_quantile_prefix(param)
+    invalid_manifest = {
+        'version': _QUANTILE_ARTIFACT_VERSION,
+        'state': 'invalid',
+        'reason': str(reason)[:500],
+        'updated_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+    }
+    try:
+        # Commit invalidation first. Readers then stop before old files are
+        # cleaned, so they can never mistake a partial cleanup for a bundle.
+        _write_json_atomic(manifest_path, invalid_manifest, ensure_ascii=False)
+    except Exception as exc:
+        # If even the marker cannot be committed, remove every prefix that a
+        # loader could currently resolve before removing the broken manifest.
+        print(f"  WARN: quantile invalidation manifest nije upisan ({exc})")
+        if previous_prefix and previous_prefix != legacy_prefix:
+            _remove_quantile_bundle(previous_prefix)
+        _remove_quantile_bundle(legacy_prefix)
+        _remove_if_exists(manifest_path)
+        return
+    if previous_prefix and previous_prefix != legacy_prefix:
+        _remove_quantile_bundle(previous_prefix)
+    _remove_quantile_bundle(legacy_prefix)
+
+
+def _promote_quantile_artifacts(param, models, offsets, features):
+    """Save, verify, then atomically activate a complete bundle generation.
+
+    The old manifest is left untouched while LightGBM writes seven model files,
+    CQR metadata, and the feature schema. The single manifest replacement is
+    the commit point, so an interrupted save cannot expose a mixed generation.
+    """
+    legacy_prefix = _quantile_legacy_prefix(param)
+    manifest_path = _quantile_manifest_path(param)
+    previous_prefix = _active_quantile_prefix(param)
+    token = f'{time.time_ns()}-{os.getpid()}'
+    generation = f'qmod_{param}.__gen__.{token}'
+    candidate_prefix = os.path.join(MODEL_DIR, generation)
+    try:
+        pf.save_quantile_bundle(models, offsets, candidate_prefix)
+        _write_json_atomic(f'{candidate_prefix}_features.json', list(features))
+
+        # Reload every staged model before publishing the manifest. Existence
+        # checks alone do not detect a truncated LightGBM text model or JSON.
+        check_models, check_offsets = pf.load_quantile_bundle(candidate_prefix)
+        if check_models is None or check_offsets is None:
+            raise RuntimeError('staged quantile bundle se ne moze ponovo ucitati')
+        expected_alphas = {float(a) for a in models}
+        if {float(a) for a in check_models} != expected_alphas:
+            raise RuntimeError('staged quantile bundle nema ocekivane alfa modele')
+        with open(f'{candidate_prefix}_features.json', encoding='utf-8') as handle:
+            if json.load(handle) != list(features):
+                raise RuntimeError('staged quantile feature schema nije vjerodostojna')
+
+        _write_json_atomic(
+            manifest_path,
+            {
+                'version': _QUANTILE_ARTIFACT_VERSION,
+                'state': 'active',
+                'generation': generation,
+                'alphas': sorted(expected_alphas),
+                'updated_utc': pd.Timestamp.now(tz='UTC').isoformat(),
+            },
+            ensure_ascii=False,
+        )
+    except Exception:
+        _remove_quantile_bundle(candidate_prefix)
+        raise
+
+    # Promotion is complete. Old/legacy files are now unreachable and can be
+    # cleaned without risking the active bundle during an interrupted retrain.
+    if previous_prefix and previous_prefix not in (legacy_prefix, candidate_prefix):
+        _remove_quantile_bundle(previous_prefix)
+    _remove_quantile_bundle(legacy_prefix)
+    return candidate_prefix
+
+
+def _invalidate_onset_artifacts():
+    """Prevent a failed/disabled retrain from reloading an older onset bundle."""
+    _remove_if_exists(
+        os.path.join(MODEL_DIR, 'onset_hazard.json'),
+        os.path.join(MODEL_DIR, 'onset_meta.json'),
+        os.path.join(MODEL_DIR, 'onset_iso.joblib'),
+    )
 
 LAT, LON = 42.2864, 18.84  # E viva!!
 # Open-Meteo defaults to GMT when timezone is omitted. Keep every live API
@@ -670,6 +1062,9 @@ print("=" * 72)
 print("  XGBoost +48h v3 --- Bias Correction Pipeline --- Budva")
 print("  Models:", len(MODELS), "| Obs: merged (2020-2026) | Split:", SPLIT_DATE.date())
 print("  Previous Runs: +Day1/Day2 forecasts for", len(PREV_RUNS_MODELS), "models")
+print(f"  ML device: {ML_DEVICE} (requested={_DEVICE_REQUEST}, XGBoost={xgb.__version__})")
+if _DEVICE_REQUEST == 'auto' and not USING_GPU:
+    print(f"  GPU auto-detect fallback -> CPU: {_DEVICE_DETAIL}")
 print("=" * 72)
 
 
@@ -829,6 +1224,71 @@ def read_radar_nowcast(max_age_min=25):
     return None
 
 
+def _validate_precip_observations(frame, precipitation, source,
+                                  min_year_rows=500):
+    """Fail closed when hourly rain labels look like wet-only missing data.
+
+    Weather Underground historically rendered some dry values as ``--``.
+    A stale detailed archive consequently contains recent years where almost
+    every dry hour is NaN while temperature/RH/pressure are present. Training
+    after dropping those NaNs produces a severely rain-biased classifier.
+    """
+    dt = pd.to_datetime(frame['datetime'], errors='coerce')
+    values = pd.to_numeric(precipitation, errors='coerce')
+    core_cols = [c for c in ('temperature_2m_obs',
+                             'relative_humidity_2m_obs',
+                             'pressure_msl_obs') if c in frame.columns]
+    if core_cols:
+        required = min(2, len(core_cols))
+        station_present = frame[core_cols].notna().sum(axis=1) >= required
+    else:
+        station_present = pd.Series(True, index=frame.index)
+
+    qa = pd.DataFrame({
+        'year': dt.dt.year,
+        'station_present': station_present.values,
+        'precip': values.values,
+    }).dropna(subset=['year'])
+    rows = []
+    suspicious = []
+    for year, group in qa.groupby('year', sort=True):
+        valid = group['precip'].replace([np.inf, -np.inf], np.nan).dropna()
+        completeness = len(valid) / len(group)
+        wet_fraction = (
+            float((valid >= CORRECTED_RAIN_THRESHOLD_MM).mean())
+            if len(valid) else np.nan
+        )
+        missing_with_station = int(
+            (group['station_present'] & group['precip'].isna()).sum()
+        )
+        row = {
+            'year': int(year), 'rows': int(len(group)),
+            'completeness': float(completeness),
+            'wet_fraction': wet_fraction,
+            'missing_with_station': missing_with_station,
+        }
+        rows.append(row)
+        print(f"    rain-label QA {int(year)}: valid={completeness:.1%}, "
+              f"wet>={CORRECTED_RAIN_THRESHOLD_MM:.1f}mm={wet_fraction:.1%} "
+              f"({len(valid)}/{len(group)})")
+        if len(group) >= min_year_rows and (
+                completeness < 0.95 or missing_with_station > 0 or
+                not np.isfinite(wet_fraction) or
+                wet_fraction < 0.005 or wet_fraction > 0.30):
+            suspicious.append(row)
+
+    if suspicious:
+        details = '; '.join(
+            f"{r['year']}: valid={r['completeness']:.1%}, "
+            f"wet={r['wet_fraction']:.1%}" for r in suspicious
+        )
+        raise RuntimeError(
+            f"Precipitation observations from {source!r} failed QA ({details}). "
+            "Refusing to train on likely wet-only/missing-dry labels."
+        )
+    return rows
+
+
 def load_historical_data():
     print("\n[1/6] Ucitavanje istorijskih podataka...")
     all_dfs = {}
@@ -838,7 +1298,7 @@ def load_historical_data():
         if not os.path.exists(path):
             print(f"  {m}: NEMA FAJLA - preskačem (pokreni fetch_new_models.py)")
             continue
-        all_dfs[m] = pd.read_csv(path, parse_dates=['datetime'])
+        all_dfs[m] = pd.read_csv(path, parse_dates=['datetime'], low_memory=False)
         available_models.append(m)
         print(f"  {m}: {all_dfs[m].shape[0]} redova")
 
@@ -855,6 +1315,72 @@ def load_historical_data():
         base = base.merge(other, on='datetime', how='left')
     base.sort_values('datetime', inplace=True)
     base.reset_index(drop=True, inplace=True)
+
+    # Detailed model CSVs are a stale denormalized observation snapshot. In
+    # addition to missing recent dry-rain labels, they retain the old hourly-
+    # mean gust bug and even a 9934 W/m2 solar outlier that corrupts cloud
+    # derivation. Replace every observation target from the canonical hourly WU
+    # table; never combine_first with stale values for a missing station hour.
+    canonical_obs_path = os.path.join(
+        BASE_DIR, 'wu_data', 'merged_observations.csv'
+    )
+    if not os.path.exists(canonical_obs_path):
+        raise FileNotFoundError(
+            f"Canonical WU observations are required for safe retraining: "
+            f"{canonical_obs_path}"
+        )
+    try:
+        canonical_obs = pd.read_csv(
+            canonical_obs_path, parse_dates=['datetime'], low_memory=False
+        )
+        required_obs = {'datetime', 'temp_c', 'dewpoint_c', 'humidity_pct',
+                        'wind_ms', 'gust_ms', 'pressure_hpa',
+                        'precip_rate_mm', 'solar_wm2'}
+        missing_obs = sorted(required_obs - set(canonical_obs.columns))
+        if missing_obs:
+            raise ValueError(f"nedostaju kolone: {missing_obs}")
+        if canonical_obs['datetime'].isna().any():
+            raise ValueError('canonical observations sadrze neispravan datetime')
+        if canonical_obs['datetime'].duplicated().any():
+            duplicates = int(canonical_obs['datetime'].duplicated(keep=False).sum())
+            raise ValueError(f'canonical observations imaju {duplicates} duplicate timestampa')
+        if (canonical_obs['datetime'].min() > base['datetime'].min()
+                or canonical_obs['datetime'].max() < base['datetime'].max()):
+            raise ValueError(
+                'canonical observations ne pokrivaju puni model archive raspon '
+                f"({canonical_obs['datetime'].min()}..{canonical_obs['datetime'].max()} "
+                f"vs {base['datetime'].min()}..{base['datetime'].max()})"
+            )
+
+        canonical_map = {
+            'temp_c': 'temperature_2m_obs',
+            'dewpoint_c': 'dew_point_2m_obs',
+            'humidity_pct': 'relative_humidity_2m_obs',
+            'wind_ms': 'wind_speed_10m_obs',
+            'gust_ms': 'wind_gusts_10m_obs',
+            'pressure_hpa': 'pressure_msl_obs',
+            'precip_rate_mm': '_canonical_precip_rate_mm',
+            'solar_wm2': 'shortwave_radiation_obs',
+        }
+        optional_map = {
+            'precip_accum_mm': 'precipitation_obs',
+            'uv': 'uv_index_obs',
+            'wind_dir_deg': 'wind_direction_10m_obs',
+        }
+        canonical_map.update({k: v for k, v in optional_map.items()
+                              if k in canonical_obs.columns})
+        overlay = canonical_obs[['datetime'] + list(canonical_map)].rename(
+            columns=canonical_map
+        )
+        # Avoid merge suffixes, then replace all stale observation values.
+        target_cols = list(canonical_map.values())
+        base.drop(columns=[c for c in target_cols if c in base.columns], inplace=True)
+        base = base.merge(overlay, on='datetime', how='left', validate='one_to_one')
+        print(f"  Canonical WU observation targets: {canonical_obs_path}")
+    except Exception as exc:
+        raise RuntimeError(
+            f"Ne mogu ucitati canonical WU observations: {exc}"
+        ) from exc
 
     solar = pd.to_numeric(base.get('shortwave_radiation_obs', pd.Series(dtype=float)), errors='coerce')
     clear = compute_clear_sky(base['datetime'])
@@ -878,22 +1404,17 @@ def load_historical_data():
     print(f"  Cloud cover derived: {cloud.notna().sum()} valid "
           f"(Apr-Sep 7-18h, Oct-Mar 9-15h)")
 
-    precip_derived = False
-    # Use precipitation RATE (mm/hr), NOT accumulated. Order matters: first valid match wins.
-    for precip_col, multiplier in [('precip_rate_mm', 1.0), ('precipitation_rate_obs', 1.0), ('precip_rate_in', 25.4)]:
-        if precip_col in base.columns:
-            vals = pd.to_numeric(base[precip_col], errors='coerce') * multiplier
-            n_valid = vals.notna().sum()
-            if n_valid < 1000:
-                continue  # skip columns with too little data
-            base['_derived_precip_obs'] = vals
-            n_nonzero = (base['_derived_precip_obs'] > 0).sum()
-            print(f"  Hourly precip derived from '{precip_col}': {n_nonzero} non-zero, {n_valid} valid")
-            precip_derived = True
-            break
-    if not precip_derived:
-        base['_derived_precip_obs'] = np.nan
-        print("  WARNING: No precip obs column found")
+    # Use canonical precipitation RATE (mm/hr), not accumulated precipitation.
+    vals = pd.to_numeric(base['_canonical_precip_rate_mm'], errors='coerce')
+    if (vals.dropna() < 0).any() or np.isinf(vals.to_numpy(dtype=float)).any():
+        raise RuntimeError('Canonical precipitation contains negative/infinite values')
+    _validate_precip_observations(base, vals, '_canonical_precip_rate_mm')
+    base['_derived_precip_obs'] = vals
+    base.drop(columns=['_canonical_precip_rate_mm'], inplace=True)
+    n_valid = int(vals.notna().sum())
+    n_nonzero = int((vals > 0).sum())
+    print(f"  Hourly precip from canonical WU rate: {n_nonzero} non-zero, "
+          f"{n_valid} valid")
 
     print("  Ucitavanje previous runs podataka (Day1/Day2)...")
     prev_merged = 0
@@ -1055,6 +1576,23 @@ def apply_bias_features(df, bias_tables):
     return df
 
 
+def _rain_consensus_stats(rain_values, wet_threshold=0.1,
+                          consensus_fraction=0.5):
+    """Row-wise wet votes with missing members excluded from the denominator.
+
+    Returns ``(wet_count, available_count, agreement, consensus_wet_hour)``.
+    Rows with no available model retain NaN agreement/hour instead of being
+    silently interpreted as dry.
+    """
+    values = rain_values.apply(pd.to_numeric, errors='coerce')
+    available_count = values.notna().sum(axis=1)
+    wet_count = (values > wet_threshold).sum(axis=1)
+    agreement = wet_count.div(available_count.where(available_count > 0))
+    wet_hour = (agreement >= consensus_fraction).astype(float)
+    wet_hour.loc[available_count == 0] = np.nan
+    return wet_count, available_count, agreement, wet_hour
+
+
 def engineer_features(df):
     out = df.copy()
 
@@ -1171,8 +1709,8 @@ def engineer_features(df):
     rain_mcols = [f"{m}_precipitation_model" for m in MODELS if f"{m}_precipitation_model" in out.columns]
     if rain_mcols:
         rain_vals = out[rain_mcols].apply(pd.to_numeric, errors='coerce')
-        out['rain_model_count'] = (rain_vals > 0.1).sum(axis=1)
-        out['rain_agreement'] = out['rain_model_count'] / max(len(rain_mcols), 1)
+        (out['rain_model_count'], out['rain_model_available_count'],
+         out['rain_agreement'], _) = _rain_consensus_stats(rain_vals)
 
         # Precision-first false-alarm fingerprint features.
         # High-res LAMs vs global models. Real frontal rain shows up in both;
@@ -1183,9 +1721,9 @@ def engineer_features(df):
         hr_cols = [f"{m}_precipitation_model" for m in HIGH_RES if f"{m}_precipitation_model" in out.columns]
         gl_cols = [f"{m}_precipitation_model" for m in GLOBAL_M if f"{m}_precipitation_model" in out.columns]
         if hr_cols:
-            out['frac_high_res_wet'] = (out[hr_cols].apply(pd.to_numeric, errors='coerce') >= 0.1).mean(axis=1)
+            _, _, out['frac_high_res_wet'], _ = _rain_consensus_stats(out[hr_cols])
         if gl_cols:
-            out['frac_global_wet'] = (out[gl_cols].apply(pd.to_numeric, errors='coerce') >= 0.1).mean(axis=1)
+            _, _, out['frac_global_wet'], _ = _rain_consensus_stats(out[gl_cols])
         if hr_cols and gl_cols:
             # Large positive = "only high-res sees it" - classic false-alarm pattern
             out['regional_minus_global_wet'] = out['frac_high_res_wet'] - out['frac_global_wet']
@@ -1208,7 +1746,9 @@ def engineer_features(df):
             out['precip_ens_mean_rainy'] = rain_only.mean(axis=1).fillna(0)
 
         # Ensemble dry consensus: all models predict < 0.1mm = strong dry signal
+        _rain_available = rain_vals.notna().any(axis=1)
         out['ens_all_dry'] = (rain_vals.max(axis=1) < 0.1).astype(float)
+        out.loc[~_rain_available, 'ens_all_dry'] = np.nan
         # Max model precipitation — captures extreme predictions the mean smooths out
         out['precip_ens_max_single'] = rain_vals.max(axis=1)
 
@@ -1221,9 +1761,13 @@ def engineer_features(df):
                     if f"{m}_precipitation_model" in out.columns]
         if len(lam_cols) >= 2:
             lam_vals = out[lam_cols].apply(pd.to_numeric, errors='coerce')
-            lam_wet = lam_vals >= 0.1
-            out['lam_frac_wet'] = lam_wet.mean(axis=1)
-            out['lam_all_wet'] = (lam_wet.sum(axis=1) == len(lam_cols)).astype(float)
+            (lam_wet_count, lam_available_count, out['lam_frac_wet'],
+             _) = _rain_consensus_stats(lam_vals)
+            out['lam_all_wet'] = (
+                (lam_available_count == len(lam_cols)) &
+                (lam_wet_count == lam_available_count)
+            ).astype(float)
+            out.loc[lam_available_count == 0, 'lam_all_wet'] = np.nan
             out['lam_precip_median'] = lam_vals.median(axis=1)
             out['lam_precip_spread'] = lam_vals.std(axis=1)
 
@@ -1293,19 +1837,21 @@ def engineer_features(df):
             ).clip(0, 1)
 
     if rain_mcols:
-        rain_vals = out[rain_mcols].apply(pd.to_numeric, errors='coerce').fillna(0)
+        rain_vals = out[rain_mcols].apply(pd.to_numeric, errors='coerce')
         ens_precip = rain_vals.mean(axis=1)
 
         out['precip_running_6h'] = ens_precip.rolling(6, min_periods=1).sum()
         out['precip_running_12h'] = ens_precip.rolling(12, min_periods=1).sum()
         out['precip_running_24h'] = ens_precip.rolling(24, min_periods=1).sum()
 
-        rain_hours = (rain_vals > 0.1).sum(axis=1)
+        (_wet_model_count, available_model_count, agreement,
+         rain_hours) = _rain_consensus_stats(rain_vals)
+        # Count consensus-wet *hours*, not wet model votes. Previously three
+        # wet members in one timestamp were mislabelled as three rain hours.
         out['rain_hours_6h'] = rain_hours.rolling(6, min_periods=1).sum()
         out['rain_hours_12h'] = rain_hours.rolling(12, min_periods=1).sum()
         out['rain_hours_24h'] = rain_hours.rolling(24, min_periods=1).sum()
 
-        agreement = (rain_vals > 0.1).sum(axis=1) / max(len(rain_mcols), 1)
         out['rain_agreement_6h'] = agreement.rolling(6, min_periods=1).mean()
         out['rain_agreement_12h'] = agreement.rolling(12, min_periods=1).mean()
 
@@ -2039,6 +2585,10 @@ def get_feature_columns(df):
         'strong_wind', 'very_strong_wind', 'is_bura', 'winter_bura',
         'cloudy', 'extreme_cold', 'extreme_hot',
         '_derived_cloud_obs', '_derived_precip_obs',
+        '_canonical_precip_rate_mm',
+        # Legacy observation-derived columns: unavailable live and historically
+        # biased because missing station observations were treated as dry.
+        'dry_spell_length', 'monthly_clim_rain_freq',
         'date_str', 'time_str', '_h',
         # Derived display direction in degrees — has the 0/360 wrap; the model
         # should use the wind_u/wind_v components instead (report A1).
@@ -2087,6 +2637,25 @@ def _compute_sample_weights(y, datetime_index=None, decay_half_life_days=365):
     return weights
 
 
+def _timestamp_grouped_cv_splits(datetimes, n_splits=3, embargo_hours=72):
+    """Expanding CV folds that keep duplicate valid-times in one partition."""
+    dt = pd.Series(pd.to_datetime(np.asarray(datetimes))).reset_index(drop=True)
+    unique_times = pd.Index(dt.dropna().sort_values().unique())
+    if len(unique_times) <= n_splits:
+        return []
+    splits = []
+    for train_time_idx, val_time_idx in TimeSeriesSplit(n_splits=n_splits).split(unique_times):
+        val_times = unique_times[val_time_idx]
+        cutoff = pd.Timestamp(val_times.min()) - pd.Timedelta(hours=embargo_hours)
+        train_times = unique_times[train_time_idx]
+        train_times = train_times[train_times <= cutoff]
+        train_idx = np.flatnonzero(dt.isin(train_times).values)
+        val_idx = np.flatnonzero(dt.isin(val_times).values)
+        if len(train_idx) and len(val_idx):
+            splits.append((train_idx, val_idx))
+    return splits
+
+
 def _optuna_tune_hp(X_tr, y_tr, param_name, n_trials=15, base_objective='reg:quantileerror',
                     train_datetimes=None):
     """Bayesian hyperparameter optimization using Optuna with TimeSeriesSplit CV.
@@ -2094,7 +2663,16 @@ def _optuna_tune_hp(X_tr, y_tr, param_name, n_trials=15, base_objective='reg:qua
     3-fold TimeSeriesSplit with embargo gap.
     Wider search bounds + more trials.
     Optionally tunes decay_half_life_days."""
-    tscv = TimeSeriesSplit(n_splits=3, gap=72)  # 3-fold with 72h embargo gap
+    # Build folds on unique valid timestamps, not rows. Lead-stacked training can
+    # contain 12/36/60h copies of the same observation; row-based splitting can
+    # otherwise place the same target timestamp on both sides of a fold.
+    datetime_series = None
+    cv_splits = []
+    if train_datetimes is not None and len(train_datetimes) == len(X_tr):
+        datetime_series = pd.Series(pd.to_datetime(np.asarray(train_datetimes))).reset_index(drop=True)
+        cv_splits = _timestamp_grouped_cv_splits(datetime_series)
+    if not cv_splits:
+        cv_splits = list(TimeSeriesSplit(n_splits=3, gap=72).split(X_tr))
 
     # Variable-specific objective selection
     def get_objective_for_param(trial, param):
@@ -2142,16 +2720,19 @@ def _optuna_tune_hp(X_tr, y_tr, param_name, n_trials=15, base_objective='reg:qua
         }
         hp.update(obj_params)
         scores = []
-        for train_idx, val_idx in tscv.split(X_tr):
+        for train_idx, val_idx in cv_splits:
             X_t, X_v = X_tr.iloc[train_idx], X_tr.iloc[val_idx]
             y_t, y_v = y_tr.iloc[train_idx], y_tr.iloc[val_idx]
             # Compute sample weights with tuned half-life
-            if train_datetimes is not None:
+            if datetime_series is not None:
+                dt_t = datetime_series.iloc[train_idx]
+                sw = _compute_sample_weights(y_t, dt_t, decay_half_life_days=decay_hl)
+            elif train_datetimes is not None:
                 dt_t = train_datetimes.iloc[train_idx] if hasattr(train_datetimes, 'iloc') else train_datetimes[train_idx]
                 sw = _compute_sample_weights(y_t, dt_t, decay_half_life_days=decay_hl)
             else:
                 sw = None
-            model = xgb.XGBRegressor(**hp)
+            model = _new_xgb_regressor(**hp)
             model.fit(X_t, y_t, eval_set=[(X_v, y_v)], verbose=False, sample_weight=sw)
             y_pred = model.predict(X_v)
             scores.append(mean_absolute_error(y_v, y_pred))
@@ -2224,19 +2805,23 @@ def _select_features_by_importance(model, feature_cols, X_tr, y_tr, X_val, y_val
 
 def _train_xgb(X_tr, y_tr, X_val, y_val, hp, sample_weight=None):
     """Two-pass training: find best n_estimators on val, retrain on all data."""
-    model_val = xgb.XGBRegressor(**hp)
+    model_val = _new_xgb_regressor(**hp)
     model_val.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False,
                   sample_weight=sample_weight[:len(X_tr)] if sample_weight is not None else None)
-    best_n = model_val.best_iteration + 1
-    if best_n < 10:
-        best_n = hp.get('n_estimators', 500)
+    best_iteration = getattr(model_val, 'best_iteration', None)
+    best_n = (int(best_iteration) + 1 if best_iteration is not None
+              else int(hp.get('n_estimators', 500)))
+    # An early optimum at (say) five trees is evidence for a small model, not
+    # permission to jump back to the original 500-1500 tree ceiling. Keep a
+    # modest numerical floor while respecting early stopping.
+    best_n = max(best_n, 10)
 
     hp_final = {k: v for k, v in hp.items() if k != 'early_stopping_rounds'}
     hp_final['n_estimators'] = best_n
     X_full = pd.concat([X_tr, X_val], axis=0)
     y_full = pd.concat([y_tr, y_val], axis=0)
     w_full = sample_weight if sample_weight is not None else None
-    model = xgb.XGBRegressor(**hp_final)
+    model = _new_xgb_regressor(**hp_final)
     model.fit(X_full, y_full, verbose=False, sample_weight=w_full)
     return model, list(X_tr.columns)
 
@@ -2264,6 +2849,7 @@ def _train_residual_blended(X_tr, y_tr, X_te, y_te, hp, param, ens_col, df_v_tr,
     ens_te = pd.to_numeric(df_v_te[ens_col], errors='coerce').fillna(0) if ens_col in df_v_te.columns else pd.Series(0, index=y_te.index)
 
     # --- Optuna hyperparameter tuning ---
+    tuned_hl = 365
     if use_optuna:
         hp = _optuna_tune_hp(X_tr, y_tr, param, n_trials=N_TRIALS, base_objective='reg:absoluteerror',
                              train_datetimes=train_datetimes)
@@ -2299,8 +2885,11 @@ def _train_residual_blended(X_tr, y_tr, X_te, y_te, hp, param, ens_col, df_v_tr,
         X_te_sel = X_te
 
     # --- Monotonic constraints ---
-    # Enforce: higher ensemble mean → higher corrected value (positive monotonicity)
-    ens_mean_feature = f'{param}_ens_mean'
+    # Enforce: a higher baseline in the model's target space implies a higher
+    # direct prediction. For transformed targets (dew deficit / solar CSI),
+    # ``ens_col`` is the transformed baseline; constraining the raw ensemble
+    # would encode the wrong physical relationship.
+    ens_mean_feature = ens_col
     sel_feature_list = list(X_tr_sel.columns) if hasattr(X_tr_sel, 'columns') else selected_features
     if ens_mean_feature in sel_feature_list:
         mono_idx = sel_feature_list.index(ens_mean_feature)
@@ -2319,6 +2908,10 @@ def _train_residual_blended(X_tr, y_tr, X_te, y_te, hp, param, ens_col, df_v_tr,
     X_train_b, y_train_b, X_val_b, y_val_b = _make_val_split(X_tr_sel, y_resid_tr)
     hp_resid = hp.copy()
     hp_resid['objective'] = 'reg:pseudohubererror'
+    # The residual target is y - baseline. It must be free to decrease as the
+    # baseline rises (regression to the mean), so a direct-model monotonicity
+    # constraint is invalid here.
+    hp_resid.pop('monotone_constraints', None)
     resid_model, _ = _train_xgb(X_train_b, y_train_b, X_val_b, y_val_b, hp_resid, sample_weight=sample_weight)
     resid_correction = resid_model.predict(X_te_sel)
     resid_pred = ens_te.values + resid_correction
@@ -2332,31 +2925,59 @@ def _train_residual_blended(X_tr, y_tr, X_te, y_te, hp, param, ens_col, df_v_tr,
     mse_pred = mse_model.predict(X_te_sel)
 
     # --- CatBoost base learner ---
+    cb_predict_task = 'GPU' if USING_GPU else 'CPU'
     try:
+        if not RUN_AUX_DIAGNOSTICS:
+            raise _AuxDiagnosticsDisabled
         cb_hp = {
             'iterations': 500,
             'depth': hp.get('max_depth', 6),
             'learning_rate': hp.get('learning_rate', 0.03),
             'l2_leaf_reg': hp.get('reg_lambda', 1.0),
             'subsample': hp.get('subsample', 0.8),
+            # GPU CatBoost does not allow subsample with its default Bayesian
+            # bootstrap. Bernoulli supports subsampling on both CPU and GPU.
+            'bootstrap_type': 'Bernoulli',
             'loss_function': 'MAE',
             'random_seed': 42, 'verbose': 0,
             'early_stopping_rounds': 30,
         }
         cb_pool_tr = cb.Pool(X_train_a, y_train_a, weight=sample_weight[:len(X_train_a)] if sample_weight is not None else None)
         cb_pool_val = cb.Pool(X_val_a, y_val_a)
-        cb_model = cb.CatBoostRegressor(**cb_hp)
+        cb_model = _new_catboost_regressor(**cb_hp)
         cb_model.fit(cb_pool_tr, eval_set=cb_pool_val)
-        cb_pred = cb_model.predict(X_te_sel)
+        cb_pred = _catboost_predict(cb_model, X_te_sel)
         has_catboost = True
-    except Exception as e:
-        print(f"    CatBoost failed ({e}), skipping")
+    except _AuxDiagnosticsDisabled:
         cb_pred = direct_pred.copy()
         cb_model = None
         has_catboost = False
+    except Exception as e:
+        if _DEVICE_REQUEST == 'cuda':
+            raise RuntimeError(f'CatBoost GPU trening nije uspio: {e}') from e
+        if _DEVICE_REQUEST == 'auto' and USING_GPU:
+            try:
+                print(f"    CatBoost GPU failed ({e}); retry na CPU")
+                cb_model = _new_catboost_cpu_regressor(**cb_hp)
+                cb_model.fit(cb_pool_tr, eval_set=cb_pool_val)
+                cb_predict_task = 'CPU'
+                cb_pred = cb_model.predict(X_te_sel, task_type='CPU')
+                has_catboost = True
+            except Exception as cpu_error:
+                print(f"    CatBoost CPU retry failed ({cpu_error}), skipping")
+                cb_pred = direct_pred.copy()
+                cb_model = None
+                has_catboost = False
+        else:
+            print(f"    CatBoost failed ({e}), skipping")
+            cb_pred = direct_pred.copy()
+            cb_model = None
+            has_catboost = False
 
     # --- LightGBM base learner ---
     try:
+        if not RUN_AUX_DIAGNOSTICS:
+            raise _AuxDiagnosticsDisabled
         lgb_hp = {
             'n_estimators': 500,
             'max_depth': hp.get('max_depth', 6),
@@ -2366,20 +2987,46 @@ def _train_residual_blended(X_tr, y_tr, X_te, y_te, hp, param, ens_col, df_v_tr,
             'reg_alpha': hp.get('reg_alpha', 0.05),
             'reg_lambda': hp.get('reg_lambda', 1.0),
             'min_child_weight': hp.get('min_child_weight', 5),
+            # LightGBM recommends smaller histograms for its OpenCL GPU path.
+            'max_bin': 63 if USING_GPU else 255,
             'objective': 'mae',
             'random_state': 42, 'verbose': -1, 'n_jobs': -1,
         }
-        lgb_model = lgb.LGBMRegressor(**lgb_hp)
+        lgb_model = _new_lgbm_regressor(**lgb_hp)
         lgb_model.fit(X_train_a, y_train_a, eval_set=[(X_val_a, y_val_a)],
                        callbacks=[lgb.early_stopping(30, verbose=False)],
                        sample_weight=sample_weight[:len(X_train_a)] if sample_weight is not None else None)
         lgb_pred = lgb_model.predict(X_te_sel)
         has_lightgbm = True
-    except Exception as e:
-        print(f"    LightGBM failed ({e}), skipping")
+    except _AuxDiagnosticsDisabled:
         lgb_pred = direct_pred.copy()
         lgb_model = None
         has_lightgbm = False
+    except Exception as e:
+        if _DEVICE_REQUEST == 'cuda':
+            raise RuntimeError(f'LightGBM GPU trening nije uspio: {e}') from e
+        if _DEVICE_REQUEST == 'auto' and USING_GPU:
+            try:
+                print(f"    LightGBM GPU failed ({e}); retry na CPU")
+                lgb_model = _new_lgbm_cpu_regressor(**lgb_hp)
+                lgb_model.fit(
+                    X_train_a, y_train_a, eval_set=[(X_val_a, y_val_a)],
+                    callbacks=[lgb.early_stopping(30, verbose=False)],
+                    sample_weight=(sample_weight[:len(X_train_a)]
+                                   if sample_weight is not None else None),
+                )
+                lgb_pred = lgb_model.predict(X_te_sel)
+                has_lightgbm = True
+            except Exception as cpu_error:
+                print(f"    LightGBM CPU retry failed ({cpu_error}), skipping")
+                lgb_pred = direct_pred.copy()
+                lgb_model = None
+                has_lightgbm = False
+        else:
+            print(f"    LightGBM failed ({e}), skipping")
+            lgb_pred = direct_pred.copy()
+            lgb_model = None
+            has_lightgbm = False
 
     # --- RidgeCV meta-learner ---
     # Stack predictions from all base learners using RidgeCV for optimal linear combination.
@@ -2400,7 +3047,7 @@ def _train_residual_blended(X_tr, y_tr, X_te, y_te, hp, param, ens_col, df_v_tr,
         direct_model.predict(X_train_a),
         ens_tr.values[:len(X_train_a)] + resid_model.predict(X_train_a) if len(ens_tr) >= len(X_train_a) else direct_model.predict(X_train_a),
         mse_model.predict(X_train_a),
-    ] + ([cb_model.predict(X_train_a)] if has_catboost else [])
+    ] + ([cb_model.predict(X_train_a, task_type=cb_predict_task)] if has_catboost else [])
       + ([lgb_model.predict(X_train_a)] if has_lightgbm else []))
 
     # --- regime x model interactions ("mixture-of-experts za
@@ -2425,13 +3072,16 @@ def _train_residual_blended(X_tr, y_tr, X_te, y_te, hp, param, ens_col, df_v_tr,
 
     meta_y_train = y_train_a.values if hasattr(y_train_a, 'values') else y_train_a
 
-    ridge_meta = RidgeCV(alphas=np.logspace(-3, 3, 20), cv=5)
-    ridge_meta.fit(meta_X_train, meta_y_train)
-    ridge_pred = ridge_meta.predict(meta_X_te)
-    mae_ridge = mean_absolute_error(y_te, ridge_pred)
-    print(f"    RidgeCV meta-learner: MAE={mae_ridge:.3f}, alpha={ridge_meta.alpha_:.4f}, "
-          f"regimes={regime_cols}, "
-          f"coefs=[{', '.join(f'{n}={c:.3f}' for n, c in zip(base_names, ridge_meta.coef_[:len(base_names)]))}]")
+    ridge_meta = None
+    mae_ridge = float('nan')
+    if RUN_AUX_DIAGNOSTICS:
+        ridge_meta = RidgeCV(alphas=np.logspace(-3, 3, 20), cv=5)
+        ridge_meta.fit(meta_X_train, meta_y_train)
+        ridge_pred = ridge_meta.predict(meta_X_te)
+        mae_ridge = mean_absolute_error(y_te, ridge_pred)
+        print(f"    RidgeCV meta-learner: MAE={mae_ridge:.3f}, "
+              f"alpha={ridge_meta.alpha_:.4f}, regimes={regime_cols}, "
+              f"coefs=[{', '.join(f'{n}={c:.3f}' for n, c in zip(base_names, ridge_meta.coef_[:len(base_names)]))}]")
 
     # --- Stack predictions: find optimal mix of MAE, Huber-residual, MSE models ---
     best_stack_mae = float('inf')
@@ -2463,20 +3113,25 @@ def _train_residual_blended(X_tr, y_tr, X_te, y_te, hp, param, ens_col, df_v_tr,
     mae_stack = best_stack_mae
     mae_blend = best_blend_mae
 
+    # Ridge remains diagnostic-only until its base predictions are generated by
+    # embargoed temporal OOF folds. Its current in-sample meta-fit is optimistic
+    # and must not be eligible for production selection.
     methods = {'direct': (mae_direct, direct_pred, direct_model, False),
                'residual': (mae_resid, resid_pred, resid_model, True),
                'stacked': (mae_stack, best_stack_pred, direct_model, False),
-               'blend': (mae_blend, blend_pred, direct_model, False),
-               'ridge_meta': (mae_ridge, ridge_pred, direct_model, False)}
+               'blend': (mae_blend, blend_pred, direct_model, False)}
 
     best_name = min(methods, key=lambda k: methods[k][0])
     best_mae, best_pred, best_model, is_residual = methods[best_name]
     best_rmse = np.sqrt(mean_squared_error(y_te, best_pred))
 
     w_d, w_r, w_m = best_stack_weights
+    ridge_info = (f"ridge_diagnostic={mae_ridge:.3f} (not eligible)"
+                  if RUN_AUX_DIAGNOSTICS else "ridge_diagnostic=disabled")
     info_str = (f"direct={mae_direct:.3f}, residual={mae_resid:.3f}, "
                 f"stacked({w_d:.1f}/{w_r:.1f}/{w_m:.1f})={mae_stack:.3f}, "
-                f"blend({best_alpha:.2f})={mae_blend:.3f} → {best_name}")
+                f"blend({best_alpha:.2f})={mae_blend:.3f}, "
+                f"{ridge_info} → {best_name}")
 
     return {
         'model': best_model, 'direct_model': direct_model, 'resid_model': resid_model,
@@ -2486,9 +3141,12 @@ def _train_residual_blended(X_tr, y_tr, X_te, y_te, hp, param, ens_col, df_v_tr,
         'method': best_name, 'is_residual': is_residual,
         'ridge_meta_regime': regime_cols,
         'blend_alpha': best_alpha if best_name == 'blend' else None,
-        'stack_weights': best_stack_weights if best_name == 'stacked' else None,
+        # blend is built from the optimized three-model stack too, so its
+        # weights must be persisted for report/reload/live parity.
+        'stack_weights': best_stack_weights if best_name in ('stacked', 'blend') else None,
         'selected_features': selected_features if n_sel < n_orig else None,
         'tuned_hp': hp,  # Optuna-tuned hyperparameters for production retrain
+        'decay_half_life': tuned_hl,
         'direct_n_estimators': direct_model.get_params()['n_estimators'],
         'resid_n_estimators': resid_model.get_params()['n_estimators'],
         'mse_n_estimators': mse_model.get_params()['n_estimators'],
@@ -2496,6 +3154,97 @@ def _train_residual_blended(X_tr, y_tr, X_te, y_te, hp, param, ens_col, df_v_tr,
         'method_maes': {k: float(v[0]) for k, v in methods.items()},
         'info_str': info_str,
     }
+
+
+def _predict_nonprecip_bundle(bundle, X, frame, ens_col):
+    """Predict one non-precipitation model bundle in its model target space.
+
+    This is the single dispatcher for untouched-report evaluation and live
+    inference. Keeping the method reconstruction here prevents stored metrics
+    from accidentally scoring the direct model when the shipped method is a
+    residual, stack, blend, or Ridge meta-model.
+    """
+    method = bundle.get('method', 'direct')
+    direct_model = bundle.get('direct_model') or bundle.get('model')
+    direct = direct_model.predict(X)
+    ens = (pd.to_numeric(frame[ens_col], errors='coerce').fillna(0).values
+           if ens_col in frame.columns else np.zeros(len(X)))
+
+    if method == 'direct':
+        return direct
+
+    resid_model = bundle.get('resid_model')
+    mse_model = bundle.get('mse_model')
+    needs_resid = method in ('residual', 'stacked', 'blend', 'ridge_meta') or bundle.get('is_residual')
+    needs_mse = method in ('stacked', 'blend', 'ridge_meta')
+    if needs_resid and resid_model is None:
+        raise ValueError(f'{method} model nema ucitan resid_model artifact')
+    if needs_mse and mse_model is None:
+        raise ValueError(f'{method} model nema ucitan mse_model artifact')
+
+    resid = ens + resid_model.predict(X) if resid_model is not None else direct
+    mse = mse_model.predict(X) if mse_model is not None else direct
+
+    if method == 'residual' or bundle.get('is_residual'):
+        return resid
+
+    if method in ('stacked', 'blend'):
+        weights = bundle.get('stack_weights')
+        if weights is None:
+            raise ValueError(f'{method} model nema sacuvane stack_weights')
+        w_direct, w_resid, w_mse = weights
+        pred = w_direct * direct + w_resid * resid + w_mse * mse
+        if method == 'blend':
+            alpha = bundle.get('blend_alpha')
+            if alpha is None:
+                raise ValueError('blend model nema sacuvan blend_alpha')
+            pred = alpha * pred + (1.0 - alpha) * ens
+        return pred
+
+    if method == 'ridge_meta':
+        ridge = bundle.get('ridge_meta')
+        if ridge is None:
+            raise ValueError('ridge_meta model nije ucitan')
+        base_preds = [direct, resid, mse]
+        if bundle.get('has_catboost') and bundle.get('cb_model') is not None:
+            base_preds.append(_catboost_predict(bundle['cb_model'], X))
+        if bundle.get('has_lightgbm') and bundle.get('lgb_model') is not None:
+            base_preds.append(bundle['lgb_model'].predict(X))
+        base_mat = np.column_stack(base_preds)
+        meta_parts = [base_mat]
+        for regime_col in (bundle.get('ridge_meta_regime') or []):
+            flags = pd.to_numeric(
+                frame.get(regime_col, pd.Series(0, index=frame.index)),
+                errors='coerce',
+            ).fillna(0).values
+            meta_parts.append(base_mat * flags[:, None])
+        return ridge.predict(np.column_stack(meta_parts))
+
+    # Forward compatibility for a simple estimator selected by a future method.
+    return bundle['model'].predict(X)
+
+
+def _postprocess_cloud_prediction(prediction, frame):
+    """Cloud constraints shared by untouched-report and live inference."""
+    pred = np.clip(np.asarray(prediction, dtype=float).copy(), 0, 100)
+    ens_col = 'cloud_cover_ens_mean'
+    if ens_col not in frame.columns:
+        return pred
+    ensemble = pd.to_numeric(frame[ens_col], errors='coerce').fillna(0).values
+    low = ensemble < 10
+    high = ensemble > 90
+    pred[low] = np.minimum(pred[low], ensemble[low] + 30)
+    pred[high] = np.maximum(pred[high], ensemble[high] - 30)
+
+    hours = pd.to_datetime(frame['datetime']).dt.hour
+    months = pd.to_datetime(frame['datetime']).dt.month
+    warm = months.isin([4, 5, 6, 7, 8, 9])
+    in_window = (
+        (warm & hours.between(10, 18)) |
+        (~warm & hours.between(10, 15))
+    ).values
+    pred[~in_window] = ensemble[~in_window]
+    return np.clip(pred, 0, 100)
 
 
 def _pop_blend_inputs(frame, cls_proba, model_cols):
@@ -2515,7 +3264,26 @@ def _pop_blend_inputs(frame, cls_proba, model_cols):
     return np.nan_to_num(np.column_stack(feats), nan=0.0)
 
 
-def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_cols):
+def _clamp_precip_prediction(prediction, features):
+    """Deterministic model-level precipitation clamp used in select/report."""
+    pred = np.clip(np.asarray(prediction, dtype=float).copy(), 0, None)
+    pred[pred < CORRECTED_RAIN_THRESHOLD_MM] = 0.0
+    if 'ens_all_dry' in features.columns:
+        pred[pd.to_numeric(features['ens_all_dry'], errors='coerce').values > 0.5] = 0.0
+    if 'precip_ens_max_single' in features.columns:
+        max_single = pd.to_numeric(
+            features['precip_ens_max_single'], errors='coerce'
+        ).values
+        restore = (pred < CORRECTED_RAIN_THRESHOLD_MM) & (
+            max_single >= CORRECTED_RAIN_THRESHOLD_MM
+        )
+        pred[restore] = max_single[restore]
+    return pred
+
+
+def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val,
+                                  X_cal, y_cal, X_gate, y_gate,
+                                  feature_cols):
     """Enhanced two-stage precipitation: Optuna-tuned classifier + regressor.
     precision-first pipeline:
       * focal loss
@@ -2526,10 +3294,12 @@ def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_
       * full meteorological scorecard incl. Brier + reliability
       * sanity-check baselines vs ICON-2I alone / ensemble / climatology / always-dry
     """
-    RAIN_THRESH = 0.1
+    RAIN_THRESH = CORRECTED_RAIN_THRESHOLD_MM
 
     y_cls_tr = (y_tr >= RAIN_THRESH).astype(int)
     y_cls_val = (y_val >= RAIN_THRESH).astype(int)
+    y_cls_cal = (y_cal >= RAIN_THRESH).astype(int)
+    y_cls_gate = (y_gate >= RAIN_THRESH).astype(int)
     rain_ratio = float(y_cls_tr.mean())
     # NB: we DO NOT use scale_pos_weight together with focal loss. Sample weights handle imbalance instead.
 
@@ -2547,8 +3317,10 @@ def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_
                          feature_names=list(X_tr.columns), missing=np.nan)
     dval = xgb.DMatrix(X_val, label=y_cls_val, weight=sw_val,
                        feature_names=list(X_val.columns), missing=np.nan)
-    dtest = xgb.DMatrix(X_te, feature_names=list(X_te.columns), missing=np.nan)
-
+    dcal = xgb.DMatrix(X_cal, label=y_cls_cal,
+                       feature_names=list(X_cal.columns), missing=np.nan)
+    dgate = xgb.DMatrix(X_gate, label=y_cls_gate,
+                        feature_names=list(X_gate.columns), missing=np.nan)
     # --- Optuna joint tuning: focal-loss hyperparams + tree hyperparams ---
     def cls_objective(trial):
         # recommended ranges
@@ -2567,7 +3339,7 @@ def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_
             'tree_method': 'hist',
             'seed': 42,
         }
-        booster = xgb.train(
+        booster = _train_xgb_booster(
             params, dtrain,
             num_boost_round=trial.suggest_int('n_estimators', 800, 1500, step=100),
             obj=focal_loss_xgb_objective(gamma_focal, alpha_focal),
@@ -2601,7 +3373,7 @@ def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_
           f"min_child_weight={cls_hp['min_child_weight']})")
 
     # --- Retrain on train+val to get final model, get best iteration via early stopping ---
-    cls_val_booster = xgb.train(
+    cls_val_booster = _train_xgb_booster(
         cls_hp, dtrain,
         num_boost_round=n_estimators,
         obj=focal_loss_xgb_objective(focal_gamma, focal_alpha),
@@ -2611,41 +3383,60 @@ def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_
         verbose_eval=False,
         maximize=False,
     )
-    cls_best_n = max(cls_val_booster.best_iteration + 1, 100)
+    cls_best_n = max(int(cls_val_booster.best_iteration) + 1, 1)
 
-    # Pick the precision-maximizing threshold + isotonic calibration.
-    margins_val = cls_val_booster.predict(dval, iteration_range=(0, cls_best_n))
-    proba_val_raw = 1.0 / (1.0 + np.exp(-margins_val))
-    if len(proba_val_raw) >= 500:
+    # Isotonic calibration gets its own chronological block. The later gate
+    # block selects thresholds / trusted-vs-PoP mode and never fits the map.
+    margins_cal = cls_val_booster.predict(dcal, iteration_range=(0, cls_best_n))
+    proba_cal_raw = 1.0 / (1.0 + np.exp(-margins_cal))
+    if len(proba_cal_raw) >= 500 and y_cls_cal.nunique() >= 2:
         iso_cal = IsotonicRegression(out_of_bounds='clip')
-        iso_cal.fit(proba_val_raw, y_cls_val.astype(float))
-        proba_val = iso_cal.transform(proba_val_raw)
-        print(f"    Precip cls: isotonic calibration fit on {len(proba_val_raw)} val points")
+        iso_cal.fit(proba_cal_raw, y_cls_cal.astype(float))
+        print(f"    Precip cls: isotonic calibration fit on "
+              f"{len(proba_cal_raw)} calibration points")
     else:
         iso_cal = None
-        proba_val = proba_val_raw
+
+    margins_gate = cls_val_booster.predict(dgate, iteration_range=(0, cls_best_n))
+    proba_gate_raw = 1.0 / (1.0 + np.exp(-margins_gate))
+    proba_gate = (
+        iso_cal.transform(proba_gate_raw) if iso_cal is not None
+        else proba_gate_raw
+    )
 
     # optimize the decision threshold directly on SEDI (robust to the
     # base-rate problem at 0.1-0.2mm), bounded so FAR doesn't blow past the old
     # precision@recall criterion by more than 5pp.
-    thresh_pr = threshold_for_precision_at_recall(y_cls_val.values, proba_val, min_recall=0.50)
-    far_at_pr = pf.far_score(y_cls_val.values, (proba_val >= thresh_pr).astype(int))
+    thresh_pr = threshold_for_precision_at_recall(
+        y_cls_gate.values, proba_gate, min_recall=0.50
+    )
+    far_at_pr = pf.far_score(
+        y_cls_gate.values, (proba_gate >= thresh_pr).astype(int)
+    )
     thresh_sedi, sedi_val = pf.threshold_for_max_sedi(
-        y_cls_val.values, proba_val, far_cap=min(far_at_pr + 0.05, 0.95))
-    mets_pr = meteorological_metrics(y_cls_val.values,
-                                     (proba_val >= thresh_pr).astype(int), p_proba=proba_val)
-    mets_sedi = meteorological_metrics(y_cls_val.values,
-                                       (proba_val >= thresh_sedi).astype(int), p_proba=proba_val)
+        y_cls_gate.values, proba_gate,
+        far_cap=min(far_at_pr + 0.05, 0.95)
+    )
+    mets_pr = meteorological_metrics(
+        y_cls_gate.values, (proba_gate >= thresh_pr).astype(int),
+        p_proba=proba_gate,
+    )
+    mets_sedi = meteorological_metrics(
+        y_cls_gate.values, (proba_gate >= thresh_sedi).astype(int),
+        p_proba=proba_gate,
+    )
     print(f"    Threshold P@R>=.5: t={thresh_pr:.3f} POD={mets_pr['pod']:.3f} "
           f"FAR={mets_pr['far']:.3f} CSI={mets_pr['csi']:.3f} SEDI={mets_pr['sedi']:.3f}")
     print(f"    Threshold maxSEDI:  t={thresh_sedi:.3f} POD={mets_sedi['pod']:.3f} "
           f"FAR={mets_sedi['far']:.3f} CSI={mets_sedi['csi']:.3f} SEDI={mets_sedi['sedi']:.3f}")
     best_thresh = thresh_sedi if mets_sedi['sedi'] >= mets_pr['sedi'] else thresh_pr
-    pred_at_thresh = (proba_val >= best_thresh).astype(int)
+    pred_at_thresh = (proba_gate >= best_thresh).astype(int)
     # Full scorecard incl. Brier + reliability
-    mets = meteorological_metrics(y_cls_val.values, pred_at_thresh, p_proba=proba_val)
+    mets = meteorological_metrics(
+        y_cls_gate.values, pred_at_thresh, p_proba=proba_gate
+    )
     # CORP decomposition of the calibrated PoP
-    _corp = pf.corp_reliability(y_cls_val.values.astype(float), proba_val)
+    _corp = pf.corp_reliability(y_cls_gate.values.astype(float), proba_gate)
     print(f"    CORP: Brier={_corp['brier']:.4f} MCB={_corp['mcb']:.4f} "
           f"DSC={_corp['dsc']:.4f} UNC={_corp['unc']:.4f}")
     print(f"    Precip cls @ thresh={best_thresh:.3f}: "
@@ -2654,7 +3445,7 @@ def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_
           f"Brier={mets['brier']:.4f}, BSS={mets['brier_skill_score']:.3f}, "
           f"RelRMSE={mets['reliability_rmse']:.4f}")
 
-    # sanity-check baselines on the same validation set.
+    # Sanity-check baselines on the independent gate-selection block.
     # (a) ICON-2I alone (>= RAIN_THRESH)
     # (b) Ensemble mean >= 0.1 mm
     # (c) Climatology (always predict base rate, threshold 0.5 -> always-dry)
@@ -2662,20 +3453,20 @@ def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_
     baselines_info = {}
     try:
         icon_col = 'ITALIAMETEO_ICON2I_precipitation_model'
-        if icon_col in X_val.columns:
-            pred_icon = (pd.to_numeric(X_val[icon_col], errors='coerce').fillna(0) >= RAIN_THRESH).astype(int).values
-            baselines_info['icon2i_alone'] = meteorological_metrics(y_cls_val.values, pred_icon)
+        if icon_col in X_gate.columns:
+            pred_icon = (pd.to_numeric(X_gate[icon_col], errors='coerce').fillna(0) >= RAIN_THRESH).astype(int).values
+            baselines_info['icon2i_alone'] = meteorological_metrics(y_cls_gate.values, pred_icon)
         ens_col = 'precipitation_ens_mean'
-        if ens_col in X_val.columns:
-            pred_ens = (pd.to_numeric(X_val[ens_col], errors='coerce').fillna(0) >= RAIN_THRESH).astype(int).values
-            baselines_info['ensemble_mean'] = meteorological_metrics(y_cls_val.values, pred_ens)
+        if ens_col in X_gate.columns:
+            pred_ens = (pd.to_numeric(X_gate[ens_col], errors='coerce').fillna(0) >= RAIN_THRESH).astype(int).values
+            baselines_info['ensemble_mean'] = meteorological_metrics(y_cls_gate.values, pred_ens)
         baselines_info['always_dry'] = meteorological_metrics(
-            y_cls_val.values, np.zeros_like(y_cls_val.values))
+            y_cls_gate.values, np.zeros_like(y_cls_gate.values))
         baselines_info['climatology'] = meteorological_metrics(
-            y_cls_val.values,
-            (np.full(len(y_cls_val), rain_ratio) >= 0.5).astype(int),
-            p_proba=np.full(len(y_cls_val), rain_ratio))
-        print(f"    Baselines on val (POD / FAR / CSI):")
+            y_cls_gate.values,
+            (np.full(len(y_cls_gate), rain_ratio) >= 0.5).astype(int),
+            p_proba=np.full(len(y_cls_gate), rain_ratio))
+        print(f"    Baselines on gate block (POD / FAR / CSI):")
         for name, b in baselines_info.items():
             print(f"      {name:18s} POD={b['pod']:.3f}  FAR={b['far']:.3f}  CSI={b['csi']:.3f}")
         # acceptance test: we must beat ICON-2I-alone + ensemble on FAR
@@ -2692,13 +3483,13 @@ def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_
     # --- calibrated PoP blend vs the single-LAM trusted gate ---
     # The hard ICON-2I veto throws away the other 9 models' information. Train
     # a logistic blend over per-model PoP inputs on the TRAIN fold, then play
-    # both deciders on the VAL fold, split by regime. The winner is persisted
+    # both deciders on the independent gate fold, split by regime. The winner is persisted
     # as rain_gate_mode and applied at inference.
     pop_blend_info = None
     try:
         from sklearn.linear_model import LogisticRegression
         pop_model_cols = [f"{m}_precipitation_model" for m in MODELS
-                          if f"{m}_precipitation_model" in X_val.columns]
+                          if f"{m}_precipitation_model" in X_gate.columns]
         margins_tr_pb = cls_val_booster.predict(dtrain, iteration_range=(0, cls_best_n))
         proba_tr_pb = 1.0 / (1.0 + np.exp(-margins_tr_pb))
         if iso_cal is not None:
@@ -2706,27 +3497,27 @@ def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_
         M_tr = _pop_blend_inputs(X_tr, proba_tr_pb, pop_model_cols)
         lr_pop = LogisticRegression(max_iter=2000, C=1.0)
         lr_pop.fit(M_tr, y_cls_tr.values)
-        M_val = _pop_blend_inputs(X_val, proba_val, pop_model_cols)
-        pop_val = lr_pop.predict_proba(M_val)[:, 1]
-        tau_pop, _ = pf.threshold_for_max_sedi(y_cls_val.values, pop_val)
+        M_gate = _pop_blend_inputs(X_gate, proba_gate, pop_model_cols)
+        pop_val = lr_pop.predict_proba(M_gate)[:, 1]
+        tau_pop, _ = pf.threshold_for_max_sedi(y_cls_gate.values, pop_val)
         pop_dec = (pop_val >= tau_pop).astype(int)
 
         icon_col = f"{TRUSTED_RAIN_MODEL}_precipitation_model"
         gate_dec = None
-        if icon_col in X_val.columns:
-            gate_dec = (pd.to_numeric(X_val[icon_col], errors='coerce').fillna(0)
+        if icon_col in X_gate.columns:
+            gate_dec = (pd.to_numeric(X_gate[icon_col], errors='coerce').fillna(0)
                         >= TRUSTED_RAIN_THRESHOLD).astype(int).values
 
         mode = 'trusted'
         regime_table = {}
         if gate_dec is not None:
-            yv = y_cls_val.values
+            yv = y_cls_gate.values
             regimes = {'overall': np.ones(len(yv), dtype=bool)}
-            if 'month' in X_val.columns:
-                regimes['summer'] = X_val['month'].isin([6, 7, 8, 9]).values
+            if 'month' in X_gate.columns:
+                regimes['summer'] = X_gate['month'].isin([6, 7, 8, 9]).values
                 regimes['non_summer'] = ~regimes['summer']
-            if 'regime_ne' in X_val.columns:
-                regimes['ne'] = (pd.to_numeric(X_val['regime_ne'], errors='coerce')
+            if 'regime_ne' in X_gate.columns:
+                regimes['ne'] = (pd.to_numeric(X_gate['regime_ne'], errors='coerce')
                                  .fillna(0) > 0.5).values
             for rname, rmask in regimes.items():
                 if rmask.sum() < 100 or yv[rmask].sum() < 10:
@@ -2740,7 +3531,7 @@ def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_
                             'far': pf.far_score(yv[rmask], pop_dec[rmask])},
                     'n': int(rmask.sum()),
                 }
-            print("    PoP-blend vs trusted gate (val, SEDI/CSI/FAR):")
+            print("    PoP-blend vs trusted gate (gate block, SEDI/CSI/FAR):")
             for rname, t in regime_table.items():
                 print(f"      {rname:11s} gate {t['gate']['sedi']:.3f}/{t['gate']['csi']:.3f}/"
                       f"{t['gate']['far']:.3f} | pop {t['pop']['sedi']:.3f}/"
@@ -2756,41 +3547,34 @@ def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_
     except Exception as _e:
         print(f"    PoP blend preskočen ({_e}) — ostaje trusted gate")
 
-    best_f1 = f1_score(y_cls_val, pred_at_thresh, zero_division=0)
+    best_f1 = f1_score(y_cls_gate, pred_at_thresh, zero_division=0)
 
-    # --- Production retrain on train+val with best HP and best_iteration ---
-    X_cls_full = pd.concat([X_tr, X_val], axis=0)
-    y_cls_full = pd.concat([y_cls_tr, y_cls_val], axis=0)
-    if 'month' in X_cls_full.columns:
-        sw_full = seasonal_sample_weights(X_cls_full['month'].values, y_cls_full.values)
-    else:
-        sw_full = np.ones(len(y_cls_full))
-    dfull = xgb.DMatrix(X_cls_full, label=y_cls_full, weight=sw_full,
-                        feature_names=list(X_cls_full.columns), missing=np.nan)
-    cls_booster = xgb.train(
-        cls_hp, dfull,
-        num_boost_round=cls_best_n,
-        obj=focal_loss_xgb_objective(focal_gamma, focal_alpha),
-        verbose_eval=False,
-    )
+    # Keep the classifier that produced the held-out calibration probabilities.
+    # Refitting it on the calibration fold would make the isotonic map, decision
+    # threshold, and PoP blend refer to a different score distribution.
+    cls_booster = cls_val_booster
 
     # Wrap booster in a thin adapter so the rest of the pipeline (which expects
     # an XGBClassifier-like object with predict_proba and save_model) works.
     class _BoosterProbaAdapter:
         """Wraps a booster trained with custom focal-loss objective so it
         looks like an XGBClassifier for the rest of the pipeline."""
-        def __init__(self, booster, feature_names, focal_gamma, focal_alpha):
+        def __init__(self, booster, feature_names, focal_gamma, focal_alpha,
+                     n_rounds):
             self._b = booster
             self._fn = list(feature_names)
             self._gamma = float(focal_gamma)
             self._alpha = float(focal_alpha)
+            self._n_rounds = int(n_rounds)
         def _to_dmatrix(self, X):
             if isinstance(X, xgb.DMatrix):
                 return X
             cols = list(X.columns) if hasattr(X, 'columns') else self._fn
             return xgb.DMatrix(X, feature_names=cols, missing=np.nan)
         def predict_proba(self, X):
-            margins = self._b.predict(self._to_dmatrix(X))
+            margins = self._b.predict(
+                self._to_dmatrix(X), iteration_range=(0, self._n_rounds)
+            )
             p = 1.0 / (1.0 + np.exp(-margins))
             return np.stack([1 - p, p], axis=1)
         def predict(self, X):
@@ -2801,23 +3585,16 @@ def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_
         # Persist hyperparams so production reload can rebuild predictions identically
         def get_params(self, deep=True):
             return {'focal_gamma': self._gamma, 'focal_alpha': self._alpha,
-                    'best_iteration': int(getattr(self._b, 'best_iteration', 0)),
+                    'best_iteration': self._n_rounds - 1,
                     'feature_names': self._fn}
 
-    cls_model = _BoosterProbaAdapter(cls_booster, X_cls_full.columns,
-                                      focal_gamma, focal_alpha)
+    cls_model = _BoosterProbaAdapter(cls_booster, X_tr.columns,
+                                      focal_gamma, focal_alpha, cls_best_n)
 
     # Test-set predictions for downstream blending logic
     cls_proba_te_raw = cls_model.predict_proba(X_te)[:, 1]
     cls_proba_te = iso_cal.transform(cls_proba_te_raw) if iso_cal is not None else cls_proba_te_raw
 
-    # Stash extras to expose through the result dict
-    _cls_extras = {
-        'focal_gamma': focal_gamma,
-        'focal_alpha': focal_alpha,
-        'baselines': baselines_info,
-        'val_metrics_full': mets,
-    }
     # cls_hp_final is needed by downstream code that retrains XGBClassifier(**cls_hp_final);
     # provide a compatible dict (only used by old reload path which now branches to focal loader).
     cls_hp_final = {**cls_hp, 'n_estimators': cls_best_n,
@@ -2842,14 +3619,14 @@ def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_
             'random_state': 42, 'n_jobs': -1, 'early_stopping_rounds': 40,
         }
         if rain_mask_tr.sum() >= 100 and rain_mask_val.sum() >= 20:
-            model = xgb.XGBRegressor(**hp)
+            model = _new_xgb_regressor(**hp)
             model.fit(X_tr[rain_mask_tr], np.sqrt(y_tr[rain_mask_tr]),
                       eval_set=[(X_val[rain_mask_val], np.sqrt(y_val[rain_mask_val]))],
                       verbose=False)
             pred_sqrt = model.predict(X_val)
             pred = np.square(np.clip(pred_sqrt, 0, None))
         else:
-            model = xgb.XGBRegressor(**hp)
+            model = _new_xgb_regressor(**hp)
             model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
             pred = np.clip(model.predict(X_val), 0, None)
         return mean_absolute_error(y_val, pred)
@@ -2866,31 +3643,31 @@ def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_
           f"(depth={reg_hp['max_depth']}, lr={reg_hp['learning_rate']:.4f})")
 
     if rain_mask_tr.sum() >= 100 and rain_mask_val.sum() >= 20:
-        reg_val_model = xgb.XGBRegressor(**reg_hp)
+        reg_val_model = _new_xgb_regressor(**reg_hp)
         y_rain_tr_sqrt = np.sqrt(y_tr[rain_mask_tr])
         y_rain_val_sqrt = np.sqrt(y_val[rain_mask_val])
         reg_val_model.fit(X_tr[rain_mask_tr], y_rain_tr_sqrt,
                           eval_set=[(X_val[rain_mask_val], y_rain_val_sqrt)], verbose=False)
-        reg_best_n = max(reg_val_model.best_iteration + 1, 50)
+        reg_best_n = max(int(reg_val_model.best_iteration) + 1, 1)
 
         reg_hp_final = {k: v for k, v in reg_hp.items() if k != 'early_stopping_rounds'}
         reg_hp_final['n_estimators'] = reg_best_n
         y_full = pd.concat([y_tr, y_val], axis=0)
         X_full = pd.concat([X_tr, X_val], axis=0)
         rain_mask_full = y_full >= RAIN_THRESH
-        reg_model = xgb.XGBRegressor(**reg_hp_final)
+        reg_model = _new_xgb_regressor(**reg_hp_final)
         reg_model.fit(X_full[rain_mask_full], np.sqrt(y_full[rain_mask_full]), verbose=False)
         reg_pred_te_sqrt = reg_model.predict(X_te)
         reg_pred_te = np.square(np.clip(reg_pred_te_sqrt, 0, None))
     else:
-        reg_val_model = xgb.XGBRegressor(**reg_hp)
+        reg_val_model = _new_xgb_regressor(**reg_hp)
         reg_val_model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
-        reg_best_n = max(reg_val_model.best_iteration + 1, 50)
+        reg_best_n = max(int(reg_val_model.best_iteration) + 1, 1)
         reg_hp_final = {k: v for k, v in reg_hp.items() if k != 'early_stopping_rounds'}
         reg_hp_final['n_estimators'] = reg_best_n
         X_full = pd.concat([X_tr, X_val], axis=0)
         y_full = pd.concat([y_tr, y_val], axis=0)
-        reg_model = xgb.XGBRegressor(**reg_hp_final)
+        reg_model = _new_xgb_regressor(**reg_hp_final)
         reg_model.fit(X_full, y_full, verbose=False)
         reg_pred_te = np.clip(reg_model.predict(X_te), 0, None)
 
@@ -2901,14 +3678,14 @@ def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_
         objective='reg:absoluteerror', random_state=42, n_jobs=-1,
         early_stopping_rounds=30
     )
-    single_val_model = xgb.XGBRegressor(**single_hp)
+    single_val_model = _new_xgb_regressor(**single_hp)
     single_val_model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
-    single_best_n = max(single_val_model.best_iteration + 1, 50)
+    single_best_n = max(int(single_val_model.best_iteration) + 1, 1)
     single_hp_final = {k: v for k, v in single_hp.items() if k != 'early_stopping_rounds'}
     single_hp_final['n_estimators'] = single_best_n
     X_full_s = pd.concat([X_tr, X_val], axis=0)
     y_full_s = pd.concat([y_tr, y_val], axis=0)
-    single_model = xgb.XGBRegressor(**single_hp_final)
+    single_model = _new_xgb_regressor(**single_hp_final)
     single_model.fit(X_full_s, y_full_s, verbose=False)
     single_pred = np.clip(single_model.predict(X_te), 0, None)
     single_pred[single_pred < RAIN_THRESH] = 0.0
@@ -2954,10 +3731,10 @@ def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_
         for ti, vi in tscv_tw.split(X_full_tw):
             X_t, X_v = X_full_tw.iloc[ti], X_full_tw.iloc[vi]
             y_t, y_v = y_full_tw.iloc[ti], y_full_tw.iloc[vi]
-            m = xgb.XGBRegressor(**tw_hp)
+            m = _new_xgb_regressor(**tw_hp)
             m.fit(X_t, y_t, eval_set=[(X_v, y_v)], verbose=False)
             p = np.clip(m.predict(X_v), 0, None)
-            p[p < 0.1] = 0.0  # evaluate with clamping to match production behavior
+            p[p < RAIN_THRESH] = 0.0  # evaluate with production amount threshold
             scores.append(mean_absolute_error(y_v, p))
         return np.mean(scores)
 
@@ -2973,37 +3750,19 @@ def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_
     tw_hp['early_stopping_rounds'] = 30
 
     # Train Tweedie model on train, validate on val
-    tw_val_model = xgb.XGBRegressor(**tw_hp)
+    tw_val_model = _new_xgb_regressor(**tw_hp)
     X_full_tw = pd.concat([X_tr, X_val], axis=0)
     y_full_tw = pd.concat([y_tr, y_val], axis=0).clip(lower=0)
     tw_val_model.fit(X_tr, y_tr.clip(lower=0), eval_set=[(X_val, y_val.clip(lower=0))], verbose=False)
-    tw_best_n = max(tw_val_model.best_iteration + 1, 50)
+    tw_best_n = max(int(tw_val_model.best_iteration) + 1, 1)
 
     tw_hp_final = {k: v for k, v in tw_hp.items() if k != 'early_stopping_rounds'}
     tw_hp_final['n_estimators'] = tw_best_n
-    tweedie_model = xgb.XGBRegressor(**tw_hp_final)
+    tweedie_model = _new_xgb_regressor(**tw_hp_final)
     tweedie_model.fit(X_full_tw, y_full_tw, verbose=False)
     tweedie_pred = np.clip(tweedie_model.predict(X_te), 0, None)
     print(f"    Tweedie: p={tw_hp.get('tweedie_variance_power', 1.5):.2f}, "
           f"MAE={mean_absolute_error(y_te, tweedie_pred):.4f}")
-
-    # --- False-alarm clamping: suppress small predictions that are noise ---
-    # Tweedie's exp-link never produces exact 0; clamp sub-threshold values.
-    # Also: when ensemble unanimously says dry, trust it over the XGB.
-    def _clamp_precip(pred, X_data):
-        pred = pred.copy()
-        pred[pred < 0.1] = 0.0
-        if 'ens_all_dry' in X_data.columns:
-            dry_mask = X_data['ens_all_dry'].values > 0.5
-            pred[dry_mask] = 0.0
-
-        if 'precip_ens_max_single' in X_data.columns:
-            max_single = X_data['precip_ens_max_single'].values
-            
-            override_mask = (pred < 0.1) & (max_single >= 0.1)
-            
-            pred[override_mask] = max_single[override_mask]
-        return pred
 
     methods = {
         'single': (np.clip(single_pred, 0, None), single_model),
@@ -3014,18 +3773,13 @@ def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_
         'tweedie': (np.clip(tweedie_pred, 0, None), tweedie_model),
     }
 
-    # Evaluate both raw and clamped versions of each method
+    # Select the algorithm using the deterministic clamp that will also be
+    # applied on the untouched report split and in live output.
     method_maes = {}
     for name, (pred, _) in methods.items():
-        clamped = _clamp_precip(pred, X_te)
-        mae_raw = mean_absolute_error(y_te, pred)
-        mae_clamped = mean_absolute_error(y_te, clamped)
-        # Use clamped if it improves MAE
-        if mae_clamped <= mae_raw:
-            methods[name] = (clamped, methods[name][1])
-            method_maes[name] = mae_clamped
-        else:
-            method_maes[name] = mae_raw
+        clamped = _clamp_precip_prediction(pred, X_te)
+        methods[name] = (clamped, methods[name][1])
+        method_maes[name] = mean_absolute_error(y_te, clamped)
 
     best_method = min(method_maes, key=method_maes.get)
     best_pred = methods[best_method][0]
@@ -3042,7 +3796,7 @@ def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_
         'tweedie_model': tweedie_model,
         'best_method': best_method, 'threshold': best_thresh,
         'mae': mae, 'rmse': rmse, 'features': feature_cols,
-        'use_sqrt': rain_mask_tr.sum() >= 100,
+        'use_sqrt': bool(rain_mask_tr.sum() >= 100 and rain_mask_val.sum() >= 20),
         'iso_calibrator': iso_cal,  # isotonic calibrator for cls proba
         # HP info for production retrain on all data
         'cls_hp_final': cls_hp_final,
@@ -3050,6 +3804,9 @@ def _train_precipitation_twostage(X_tr, y_tr, X_te, y_te, X_val, y_val, feature_
         'single_hp_final': single_hp_final,
         'tweedie_hp_final': tw_hp_final,
         'pop_blend': pop_blend_info,  # (None -> trusted gate)
+        'gate_metrics_full': mets,
+        'gate_corp': _corp,
+        'baselines': baselines_info,
     }
 
 
@@ -3124,14 +3881,71 @@ def _onset_cdf_from_hazard(hazard, dry_age):
     da = np.asarray(dry_age, dtype=float)
     F = np.zeros(len(h))
     S = 1.0
-    prev_da = 0
+    prev_da = np.nan
     for i in range(len(h)):
-        if da[i] <= prev_da:      # new spell started -> reset survival
+        if not np.isfinite(da[i]) or not np.isfinite(h[i]):
+            F[i] = np.nan
+            S = 1.0
+            prev_da = np.nan
+            continue
+        # Equal values are normal after dry_age reaches its cap and on the
+        # positive onset row. Only a decrease marks a new spell.
+        if np.isfinite(prev_da) and da[i] < prev_da:
             S = 1.0
         S *= (1.0 - h[i])
         F[i] = 1.0 - S
         prev_da = da[i]
     return F
+
+
+def _onset_event_hours(hazard, observed_onset, dry_age, datetimes,
+                       threshold=ONSET_HAZARD_DECLARE):
+    """Return per-spell predicted/observed onset elapsed hours.
+
+    Timing is derived from timestamps, not capped ``dry_age``. This prevents a
+    long spell whose age is fixed at 48 from receiving a mechanically zero
+    timing error. Gaps in the person-period table (unknown observations or
+    excluded wet-continuation rows) start a new spell.
+    """
+    hz = np.asarray(hazard, dtype=float)
+    onset = np.asarray(observed_onset, dtype=int)
+    ages = np.asarray(dry_age, dtype=float)
+    times = pd.to_datetime(pd.Series(datetimes)).reset_index(drop=True)
+    if not (len(hz) == len(onset) == len(ages) == len(times)):
+        raise ValueError('onset event arrays moraju imati istu duzinu')
+
+    predicted, observed = [], []
+    spell = None
+    previous_age = np.nan
+    previous_time = None
+    for i in range(len(hz)):
+        timestamp = pd.Timestamp(times.iloc[i])
+        time_gap = (
+            previous_time is not None and
+            timestamp - previous_time > pd.Timedelta(hours=1)
+        )
+        new_spell = (
+            spell is None or time_gap or
+            (np.isfinite(previous_age) and ages[i] < previous_age)
+        )
+        if new_spell:
+            if spell is not None:
+                predicted.append(spell['pred'])
+                observed.append(spell['obs'])
+            spell = {'start': timestamp, 'pred': np.nan, 'obs': np.nan}
+
+        elapsed = (timestamp - spell['start']).total_seconds() / 3600.0
+        if np.isnan(spell['pred']) and np.isfinite(hz[i]) and hz[i] >= threshold:
+            spell['pred'] = elapsed
+        if onset[i] == 1:
+            spell['obs'] = elapsed
+        previous_age = ages[i]
+        previous_time = timestamp
+
+    if spell is not None:
+        predicted.append(spell['pred'])
+        observed.append(spell['obs'])
+    return predicted, observed
 
 
 def train_onset_model(df):
@@ -3145,15 +3959,18 @@ def train_onset_model(df):
         X, y, dt = build_onset_person_period(df, feature_cols)
     except Exception as e:
         print(f"  [Onset] build person-period failed ({e}); preskačem onset model.")
+        _invalidate_onset_artifacts()
         return None
     if len(X) < 1000 or int(y.sum()) < 30:
         print(f"  [Onset] nedovoljno: rows={len(X)}, onsets={int(y.sum())}; preskačem.")
+        _invalidate_onset_artifacts()
         return None
 
     tr = (dt < SPLIT_DATE).values
     te = (dt >= SPLIT_DATE).values
     if tr.sum() < 500 or int(y[tr].sum()) < 20 or te.sum() < 100:
         print(f"  [Onset] split premali (train onsets={int(y[tr].sum())}); preskačem.")
+        _invalidate_onset_artifacts()
         return None
 
     feats = list(X.columns)
@@ -3186,9 +4003,9 @@ def train_onset_model(df):
               eval_metric='logloss', tree_method='hist', max_bin=512,
               monotone_constraints=constraints, random_state=42, n_jobs=-1,
               early_stopping_rounds=40)
-    clf = xgb.XGBClassifier(**hp)
+    clf = _new_xgb_classifier(**hp)
     clf.fit(X_fit, y_fit, sample_weight=sw_fit, eval_set=[(X_val, y_val)], verbose=False)
-    best_n = max(int(getattr(clf, 'best_iteration', 0)) + 1, 100)
+    best_n = max(int(getattr(clf, 'best_iteration', 0)) + 1, 1)
 
     # isotonic calibration of the hazard on val
     proba_val = clf.predict_proba(X_val)[:, 1]
@@ -3207,23 +4024,9 @@ def train_onset_model(df):
     # onset. Predicted onset = first hour the INSTANTANEOUS hazard is elevated
     # (>= ONSET_HAZARD_DECLARE), mirroring the precision-first inference rule.
     da = X_te['dry_age'].values
-    pred_onset, obs_onset = [], []
-    spell_pred = None
-    prev_da = 0
-    for i in range(len(proba_te)):
-        if da[i] <= prev_da:           # new spell
-            if spell_pred is not None:
-                pred_onset.append(spell_pred['pred'])
-                obs_onset.append(spell_pred['obs'])
-            spell_pred = {'pred': np.nan, 'obs': np.nan, 'start_da': da[i]}
-        if spell_pred is not None:
-            if np.isnan(spell_pred['pred']) and proba_te[i] >= ONSET_HAZARD_DECLARE:
-                spell_pred['pred'] = da[i]      # likely onset elapsed-hour
-            if y_te.values[i] == 1:
-                spell_pred['obs'] = da[i]
-        prev_da = da[i]
-    if spell_pred is not None:
-        pred_onset.append(spell_pred['pred']); obs_onset.append(spell_pred['obs'])
+    pred_onset, obs_onset = _onset_event_hours(
+        proba_te, y_te.values, da, dt_te, ONSET_HAZARD_DECLARE
+    )
     ometrics = onset_timing_metrics(pred_onset, obs_onset)
 
     # Baseline: fraction-of-models-wet crossing 0.5 as the onset anchor
@@ -3232,25 +4035,24 @@ def train_onset_model(df):
           f"hit±2h={ometrics['hit_within_2h']:.2f} hit±3h={ometrics['hit_within_3h']:.2f} | "
           f"onset POD={ometrics['onset_pod']:.2f} FAR={ometrics['onset_far']:.2f}")
 
-    # Production retrain on ALL period rows
-    if 'month' in X.columns:
-        sw_all = seasonal_sample_weights(X['month'].values, y.values)
-    else:
-        sw_all = np.ones(len(y))
-    hp_prod = {k: v for k, v in hp.items() if k != 'early_stopping_rounds'}
-    hp_prod['n_estimators'] = best_n
-    clf_prod = xgb.XGBClassifier(**hp_prod)
-    clf_prod.fit(X, y, sample_weight=sw_all, verbose=False)
+    # Keep the exact classifier whose validation scores were isotonic-calibrated.
+    # Refitting across that calibration tail would invalidate the saved map.
+    clf_prod = clf
 
     clf_prod.save_model(os.path.join(MODEL_DIR, 'onset_hazard.json'))
-    with open(os.path.join(MODEL_DIR, 'onset_meta.json'), 'w', encoding='utf-8') as f:
-        json.dump({'features': feats, 'best_iteration': best_n,
-                   'threshold_mm': ONSET_THRESHOLD_MM, 'dry_gap': ONSET_DRY_GAP_HOURS,
-                   'metrics': ometrics, 'brier': brier}, f, ensure_ascii=False, indent=2)
+    _write_json_atomic(
+        os.path.join(MODEL_DIR, 'onset_meta.json'),
+        {'features': feats, 'best_iteration': best_n,
+         'threshold_mm': ONSET_THRESHOLD_MM, 'dry_gap': ONSET_DRY_GAP_HOURS,
+         'metrics': ometrics, 'brier': brier},
+        ensure_ascii=False, indent=2,
+    )
     if iso is not None:
         import joblib
         joblib.dump(iso, os.path.join(MODEL_DIR, 'onset_iso.joblib'))
-    print(f"  [Onset] sačuvan (features={len(feats)}, best_n={best_n}).")
+    else:
+        _remove_if_exists(os.path.join(MODEL_DIR, 'onset_iso.joblib'))
+    print(f"  [Onset] sačuvan kalibrisani bundle (features={len(feats)}, best_n={best_n}).")
     return {'model': clf_prod, 'calibrator': iso, 'features': feats, 'metrics': ometrics}
 
 
@@ -3261,8 +4063,9 @@ def load_onset_model():
     if not (os.path.exists(mpath) and os.path.exists(metapath)):
         return None
     try:
-        clf = xgb.XGBClassifier()
+        clf = _new_xgb_classifier()
         clf.load_model(mpath)
+        _restore_xgb_device(clf)
         with open(metapath, encoding='utf-8') as f:
             meta = json.load(f)
         iso = None
@@ -3273,8 +4076,43 @@ def load_onset_model():
         return {'model': clf, 'calibrator': iso, 'features': meta.get('features', []),
                 'metrics': meta.get('metrics', {})}
     except Exception as e:
+        if _DEVICE_REQUEST == 'cuda':
+            raise RuntimeError(f'Onset GPU reload failed: {e}') from e
         print(f"  [Onset] reload failed ({e}); bez onset bloka.")
         return None
+
+
+def _forecast_onset_dry_age(precip):
+    """Dry-age feature for live onset rows, matching training onset semantics."""
+    values = np.asarray(precip, dtype=float)
+    dry_age = np.zeros(len(values), dtype=float)
+    previous_dry = 0
+    for i, amount in enumerate(values):
+        if not np.isfinite(amount):
+            dry_age[i] = np.nan
+            previous_dry = 0
+        elif amount >= ONSET_THRESHOLD_MM:
+            dry_age[i] = min(previous_dry, ONSET_MAX_DRY_AGE)
+            previous_dry = 0
+        else:
+            previous_dry += 1
+            dry_age[i] = min(previous_dry, ONSET_MAX_DRY_AGE)
+    return dry_age
+
+
+def _align_onset_features_to_display(fc_features):
+    """Align the complete onset feature row to displayed rain intervals.
+
+    Open-Meteo precipitation at raw timestamp T describes [T-1h, T], while
+    the public output moves it to timestamp T-1h. The hazard model was trained
+    on the complete raw row, so live inference must move every model feature
+    with that precipitation row. Moving only corrected rain made dry age come
+    from T+1 while humidity/agreement still came from T.
+    """
+    aligned = fc_features.copy()
+    feature_cols = [c for c in aligned.columns if c != 'datetime']
+    aligned.loc[:, feature_cols] = aligned[feature_cols].shift(-1)
+    return aligned
 
 
 def predict_onset_timing(fc, bundle):
@@ -3289,17 +4127,14 @@ def predict_onset_timing(fc, bundle):
         model = bundle['model']
         iso = bundle.get('calibrator')
 
-        ens_precip = pd.to_numeric(fc.get('precipitation_ens_mean', pd.Series(0, index=fc.index)),
-                                   errors='coerce').fillna(0).values
-        n = len(fc)
-        dry_age = np.zeros(n)
-        prev = 0
-        for i in range(n):
-            if ens_precip[i] >= ONSET_THRESHOLD_MM:
-                prev = 0
-            else:
-                prev += 1
-            dry_age[i] = min(prev, ONSET_MAX_DRY_AGE)
+        # Prefer the same gated/corrected precipitation that is displayed to
+        # users. Fall back to the raw ensemble only for older callers.
+        state_precip = fc.get(
+            '_onset_state_precip',
+            fc.get('precipitation_ens_mean', pd.Series(np.nan, index=fc.index)),
+        )
+        ens_precip = pd.to_numeric(state_precip, errors='coerce').values
+        dry_age = _forecast_onset_dry_age(ens_precip)
 
         X = pd.DataFrame(index=fc.index)
         for c in feats:
@@ -3360,6 +4195,8 @@ def predict_onset_timing(fc, bundle):
             'prob_by_hour': prob_by_hour,
         }
     except Exception as e:
+        if _DEVICE_REQUEST == 'cuda':
+            raise RuntimeError(f'Onset GPU inference failed: {e}') from e
         print(f"  [Onset] inference failed ({e}); bez onset bloka.")
         return None
 
@@ -3565,43 +4402,246 @@ def build_lead_stacked_frames(hist_raw, bias_tables):
     return frames
 
 
-def _train_target_quantiles(param, X_tr, y_tr, X_te_rep, y_te_rep):
+def _quantile_clock_split(X, y, datetimes, *, fraction=0.10,
+                          min_fold_rows=500, min_fit_rows=1000,
+                          embargo_hours=72):
+    """Build fit/validation/calibration folds by valid timestamp.
+
+    Lead stacking contributes several rows for one valid forecast hour. Split
+    boundaries therefore operate on timestamp groups, while target sizes remain
+    row based. Embargoes are measured with Timedelta rather than row counts.
+    """
+    n_rows = len(X)
+    if len(y) != n_rows:
+        raise ValueError('X/y duzine nijesu poravnate')
+    if datetimes is None:
+        if isinstance(X, pd.DataFrame) and 'datetime' in X.columns:
+            datetimes = X['datetime']
+        elif isinstance(getattr(X, 'index', None), pd.DatetimeIndex):
+            datetimes = X.index
+        else:
+            raise ValueError('nema poravnatih valid datetime vrijednosti')
+    if len(datetimes) != n_rows:
+        raise ValueError('datetime/X duzine nijesu poravnate')
+
+    raw_times = pd.Series(np.asarray(datetimes)).reset_index(drop=True)
+    try:
+        times = pd.to_datetime(raw_times, errors='coerce')
+    except (TypeError, ValueError):
+        times = pd.to_datetime(raw_times, errors='coerce', utc=True)
+    # Mixed-offset timezone data can otherwise remain object dtype and cannot
+    # be safely ordered/subtracted. Normalizing that exceptional case to UTC
+    # preserves actual clock durations.
+    if not (pd.api.types.is_datetime64_any_dtype(times.dtype)
+            or isinstance(times.dtype, pd.DatetimeTZDtype)):
+        times = pd.to_datetime(raw_times, errors='coerce', utc=True)
+    if times.isna().any():
+        raise ValueError(f'{int(times.isna().sum())} neispravnih datetime vrijednosti')
+
+    order = times.sort_values(kind='mergesort').index.to_numpy()
+    times = times.iloc[order].reset_index(drop=True)
+    X_sorted = X.iloc[order].reset_index(drop=True)
+    y_sorted = pd.Series(y).iloc[order].reset_index(drop=True)
+
+    target_rows = max(int(n_rows * fraction), int(min_fold_rows))
+
+    def _tail_group_start(candidate_times, wanted_rows, fold_name):
+        counts = candidate_times.value_counts(sort=False).sort_index()
+        if int(counts.sum()) < wanted_rows:
+            raise ValueError(
+                f'nema dovoljno redova za {fold_name} '
+                f'({int(counts.sum())} < {wanted_rows})'
+            )
+        reverse_cumulative = counts.iloc[::-1].cumsum().to_numpy()
+        reverse_position = int(np.searchsorted(
+            reverse_cumulative, wanted_rows, side='left'
+        ))
+        return counts.index[-(reverse_position + 1)]
+
+    calibration_start = _tail_group_start(times, target_rows, 'kalibraciju')
+    calibration_mask = times >= calibration_start
+
+    embargo = pd.Timedelta(hours=embargo_hours)
+    validation_latest = calibration_start - embargo
+    validation_candidates = times[times <= validation_latest]
+    validation_start = _tail_group_start(
+        validation_candidates, target_rows, 'early-stop validaciju'
+    )
+    validation_mask = ((times >= validation_start)
+                       & (times <= validation_latest))
+
+    fit_latest = validation_start - embargo
+    fit_mask = times <= fit_latest
+    if int(fit_mask.sum()) < min_fit_rows:
+        raise ValueError(
+            f'nema dovoljno fit redova poslije clock-hour embargoa '
+            f'({int(fit_mask.sum())} < {min_fit_rows})'
+        )
+
+    def _take(mask):
+        positions = np.flatnonzero(mask.to_numpy())
+        return (
+            X_sorted.iloc[positions].reset_index(drop=True),
+            y_sorted.iloc[positions].reset_index(drop=True),
+            times.iloc[positions].reset_index(drop=True),
+        )
+
+    X_fit, y_fit, time_fit = _take(fit_mask)
+    X_val, y_val, time_val = _take(validation_mask)
+    X_cal, y_cal, time_cal = _take(calibration_mask)
+    fit_val_gap = time_val.min() - time_fit.max()
+    val_cal_gap = time_cal.min() - time_val.max()
+    if fit_val_gap < embargo or val_cal_gap < embargo:
+        raise AssertionError(
+            f'quantile embargo je kraci od {embargo_hours}h '
+            f'(fit-val={fit_val_gap}, val-cal={val_cal_gap})'
+        )
+
+    return {
+        'X_fit': X_fit, 'y_fit': y_fit, 'time_fit': time_fit,
+        'X_val': X_val, 'y_val': y_val, 'time_val': time_val,
+        'X_cal': X_cal, 'y_cal': y_cal, 'time_cal': time_cal,
+        'fit_val_gap': fit_val_gap, 'val_cal_gap': val_cal_gap,
+    }
+
+
+def _precip_clock_split(X, y, datetimes, *, embargo_hours=72):
+    """Four chronological precipitation blocks with grouped valid times.
+
+    ``fit`` trains models, ``val`` drives Optuna/early stopping, ``cal`` fits
+    isotonic calibration, and ``gate`` selects thresholds and the trusted-vs-
+    PoP gate. Three real 72-hour embargoes separate the blocks.
+    """
+    base = _quantile_clock_split(
+        X, y, datetimes, fraction=0.12, min_fold_rows=1500,
+        min_fit_rows=3000, embargo_hours=embargo_hours,
+    )
+    X_tail = base['X_cal']
+    y_tail = base['y_cal']
+    time_tail = base['time_cal'].reset_index(drop=True)
+    target_gate_rows = max(int(len(time_tail) * 0.45), 500)
+    counts = time_tail.value_counts(sort=False).sort_index()
+    reverse_cumulative = counts.iloc[::-1].cumsum().to_numpy()
+    reverse_position = int(np.searchsorted(
+        reverse_cumulative, target_gate_rows, side='left'
+    ))
+    gate_start = counts.index[-(reverse_position + 1)]
+    embargo = pd.Timedelta(hours=embargo_hours)
+    calibration_latest = gate_start - embargo
+    cal_mask = time_tail <= calibration_latest
+    gate_mask = time_tail >= gate_start
+    if int(cal_mask.sum()) < 500 or int(gate_mask.sum()) < 500:
+        raise ValueError(
+            'premali precipitation calibration/gate blok poslije embargoa '
+            f"(cal={int(cal_mask.sum())}, gate={int(gate_mask.sum())})"
+        )
+
+    def _tail_take(mask):
+        positions = np.flatnonzero(mask.to_numpy())
+        return (
+            X_tail.iloc[positions].reset_index(drop=True),
+            y_tail.iloc[positions].reset_index(drop=True),
+            time_tail.iloc[positions].reset_index(drop=True),
+        )
+
+    X_cal, y_cal, time_cal = _tail_take(cal_mask)
+    X_gate, y_gate, time_gate = _tail_take(gate_mask)
+    cal_gate_gap = time_gate.min() - time_cal.max()
+    if cal_gate_gap < embargo:
+        raise AssertionError(
+            f'precip calibration-gate embargo je kraci od {embargo_hours}h'
+        )
+    return {
+        'X_fit': base['X_fit'], 'y_fit': base['y_fit'],
+        'time_fit': base['time_fit'],
+        'X_val': base['X_val'], 'y_val': base['y_val'],
+        'time_val': base['time_val'],
+        'X_cal': X_cal, 'y_cal': y_cal, 'time_cal': time_cal,
+        'X_gate': X_gate, 'y_gate': y_gate, 'time_gate': time_gate,
+        'fit_val_gap': base['fit_val_gap'],
+        'val_cal_gap': time_cal.min() - base['time_val'].max(),
+        'cal_gate_gap': cal_gate_gap,
+    }
+
+
+def _train_target_quantiles(param, X_tr, y_tr, X_te_rep, y_te_rep,
+                            train_datetimes=None):
     """multi-quantile LightGBM wrapped in CQR.
 
-    Calibration fold = last 12% of the TRAIN period (72h embargo before it),
-    so the conformal offsets never see the test set. Reported coverage/CRPS
+    Uses distinct chronological fit, early-stop validation, and conformal
+    calibration folds, with 72h embargoes between them. Reported coverage/CRPS
     come from the untouched report half. Persists the bundle to MODEL_DIR for
     --skip-training reload. Returns the in-memory bundle dict or None."""
     n = len(X_tr)
-    if n < 3000 or y_tr.notna().sum() < 2000:
+    if n < 3000 or pd.Series(y_tr).notna().sum() < 2000:
+        reason = f'nedovoljno podataka (rows={n}, valid_y={pd.Series(y_tr).notna().sum()})'
+        print(f"    Quantile+CQR ({param}): {reason}")
+        _invalidate_quantile_artifacts(param, reason)
         return None
-    n_cal = max(int(n * 0.12), 500)
-    embargo = 72
-    X_q_tr = X_tr.iloc[:n - n_cal - embargo]
-    y_q_tr = y_tr.iloc[:n - n_cal - embargo]
-    X_cal = X_tr.iloc[n - n_cal:]
-    y_cal = y_tr.iloc[n - n_cal:]
     try:
-        models = pf.train_quantile_models(X_q_tr, y_q_tr, X_cal, y_cal)
+        folds = _quantile_clock_split(X_tr, y_tr, train_datetimes)
+    except (AssertionError, TypeError, ValueError) as exc:
+        reason = f'neispravan hronoloski split: {exc}'
+        print(f"    Quantile+CQR ({param}): {reason}")
+        _invalidate_quantile_artifacts(param, reason)
+        return None
+    X_q_tr, y_q_tr = folds['X_fit'], folds['y_fit']
+    X_q_val, y_q_val = folds['X_val'], folds['y_val']
+    X_cal, y_cal = folds['X_cal'], folds['y_cal']
+    print(
+        f"    Quantile split ({param}): fit={len(X_q_tr)}, val={len(X_q_val)}, "
+        f"cal={len(X_cal)} | clock gaps="
+        f"{folds['fit_val_gap'] / pd.Timedelta(hours=1):.0f}h/"
+        f"{folds['val_cal_gap'] / pd.Timedelta(hours=1):.0f}h"
+    )
+    try:
+        quantile_device = dict(LIGHTGBM_DEVICE_PARAMS)
+        if USING_GPU:
+            quantile_device['max_bin'] = 63
+        models = pf.train_quantile_models(
+            X_q_tr, y_q_tr, X_q_val, y_q_val, lgb_params=quantile_device
+        )
         offsets = pf.cqr_calibrate(models, X_cal, y_cal)
     except Exception as _e:
-        print(f"    Quantile+CQR ({param}): trening neuspio ({_e})")
-        return None
-    lower = 0.0 if param in ('wind_speed_10m', 'wind_gusts_10m', 'precipitation') else None
-    qdf_te = pf.predict_quantiles(models, X_te_rep, offsets=offsets, lower_bound=lower)
-    ok = y_te_rep.notna().values
-    crps = pf.crps_from_quantiles(y_te_rep.values[ok], qdf_te[ok].reset_index(drop=True))
-    cov90, w90 = pf.coverage_width(y_te_rep.values[ok], qdf_te['q05'].values[ok], qdf_te['q95'].values[ok])
-    cov50, w50 = pf.coverage_width(y_te_rep.values[ok], qdf_te['q25'].values[ok], qdf_te['q75'].values[ok])
+        if _DEVICE_REQUEST == 'cuda':
+            _invalidate_quantile_artifacts(param, f'GPU trening nije uspio: {_e}')
+            raise RuntimeError(f'LightGBM GPU quantile trening nije uspio: {_e}') from _e
+        if _DEVICE_REQUEST == 'auto' and USING_GPU:
+            try:
+                print(f"    Quantile+CQR ({param}): GPU fail ({_e}); retry na CPU")
+                models = pf.train_quantile_models(
+                    X_q_tr, y_q_tr, X_q_val, y_q_val,
+                    lgb_params={'device_type': 'cpu'},
+                )
+                offsets = pf.cqr_calibrate(models, X_cal, y_cal)
+            except Exception as cpu_error:
+                print(f"    Quantile+CQR ({param}): CPU retry neuspio ({cpu_error})")
+                _invalidate_quantile_artifacts(
+                    param, f'GPU i CPU trening nijesu uspjeli: {cpu_error}'
+                )
+                return None
+        else:
+            print(f"    Quantile+CQR ({param}): trening neuspio ({_e})")
+            _invalidate_quantile_artifacts(param, f'trening nije uspio: {_e}')
+            return None
+    try:
+        lower = 0.0 if param in ('wind_speed_10m', 'wind_gusts_10m', 'precipitation') else None
+        qdf_te = pf.predict_quantiles(models, X_te_rep, offsets=offsets, lower_bound=lower)
+        ok = y_te_rep.notna().values
+        crps = pf.crps_from_quantiles(y_te_rep.values[ok], qdf_te[ok].reset_index(drop=True))
+        cov90, w90 = pf.coverage_width(y_te_rep.values[ok], qdf_te['q05'].values[ok], qdf_te['q95'].values[ok])
+        cov50, w50 = pf.coverage_width(y_te_rep.values[ok], qdf_te['q25'].values[ok], qdf_te['q75'].values[ok])
+    except Exception as exc:
+        _invalidate_quantile_artifacts(param, f'evaluacija nije uspjela: {exc}')
+        raise
     print(f"    Quantile+CQR ({param}): CRPS={crps:.3f} | cov90={cov90:.3f} "
           f"(w={w90:.2f}) | cov50={cov50:.3f} (w={w50:.2f})")
-    prefix = os.path.join(MODEL_DIR, f"qmod_{param}")
     try:
-        pf.save_quantile_bundle(models, offsets, prefix)
-        with open(f"{prefix}_features.json", 'w', encoding='utf-8') as f:
-            json.dump(list(X_tr.columns), f)
+        _promote_quantile_artifacts(param, models, offsets, list(X_tr.columns))
     except Exception as _e:
         print(f"    Quantile bundle save failed ({_e})")
+        _invalidate_quantile_artifacts(param, f'save/promocija nije uspjela: {_e}')
+        return None
     return {'models': models, 'offsets': offsets, 'features': list(X_tr.columns),
             'crps': round(float(crps), 4), 'cov90': round(float(cov90), 3),
             'cov50': round(float(cov50), 3)}
@@ -3645,6 +4685,7 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
 
     trained = {}
     results = {}
+    report_predictions = {}
     feature_lists_acc = {}
     # RESUME: preload existing on-disk metadata so per-target writes MERGE with
     # (rather than clobber) the targets completed in a previous run.
@@ -3660,14 +4701,11 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
               f"zadržavam {len(results)} postojećih rezultata")
 
     def _persist_artifacts():
-        """Write feature_lists + results after EACH target (champion-gate bookkeeping
-        robustness: a crash mid-run no longer loses completed-target metadata)."""
+        """Atomically snapshot metadata after each completed target."""
         fl = dict(feature_lists_acc)
         fl.update({k: v['features'] for k, v in trained.items()})
-        with open(_fl_path, 'w') as f:
-            json.dump(fl, f)
-        with open(_res_path, 'w', encoding='utf-8') as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
+        _write_json_atomic(_fl_path, fl)
+        _write_json_atomic(_res_path, results, indent=2, ensure_ascii=False)
 
     for param, info in TARGET_PARAMS.items():
         if only_targets is not None and param not in only_targets:
@@ -3675,6 +4713,8 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
         obs_col = info['obs']
         if obs_col not in df.columns:
             print(f"  {info['display']:20s} --- SKIP (nema obs)")
+            if param in QUANTILE_TARGETS:
+                _invalidate_quantile_artifacts(param, 'ciljna observation kolona ne postoji')
             continue
 
         y = pd.to_numeric(df[obs_col], errors='coerce')
@@ -3687,13 +4727,20 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
 
         if len(df_v) < 500:
             print(f"  {info['display']:20s} --- SKIP ({len(df_v)} redova)")
+            if param in QUANTILE_TARGETS:
+                _invalidate_quantile_artifacts(
+                    param, f'nedovoljno validnih ciljnih redova ({len(df_v)})'
+                )
             continue
 
         tr = df_v['datetime'] < SPLIT_DATE
         te = df_v['datetime'] >= SPLIT_DATE
 
+        # Freeze feature eligibility from the training period only; report-row
+        # availability must not decide the schema being evaluated.
+        n_train_rows = int(tr.sum())
         vf = [c for c in feature_cols if c in df_v.columns
-              and df_v[c].notna().sum() > len(df_v) * 0.15]
+              and df_v.loc[tr, c].notna().sum() > n_train_rows * 0.15]
 
         # Per-target model subset: e.g. for wind, keep only ITALIAMETEO/KNMI/DMI features
         # (high-res LAMs analog to MARINE_WIND_MODELS) plus generic engineered features.
@@ -3800,8 +4847,32 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
                 y_tr, y_te = y_tr_csi, y_te_csi
                 print(f"    Solar: using CSI target (clear-sky index)")
 
+        # Residuals, stacks, and blends must use a baseline expressed in the
+        # same target space as y. Raw dew point (deg C) cannot be added to a
+        # dew-deficit prediction, nor W/m2 radiation to a CSI prediction.
+        raw_ens_col = f'{param}_ens_mean'
+        model_ens_col = raw_ens_col
+        if dew_deficit_mode:
+            model_ens_col = f'{param}_target_baseline'
+            temp_ens = pd.to_numeric(df_v.get('temperature_2m_ens_mean'), errors='coerce')
+            dew_ens = pd.to_numeric(df_v.get(raw_ens_col), errors='coerce')
+            df_v[model_ens_col] = (temp_ens - dew_ens).clip(lower=0)
+            df_tr_frame[model_ens_col] = df_v.loc[df_tr_frame.index, model_ens_col].values
+        elif csi_mode:
+            model_ens_col = f'{param}_target_baseline'
+            raw_solar = pd.to_numeric(df_v.get(raw_ens_col), errors='coerce')
+            clear_sky_all = compute_clear_sky(df_v['datetime']).clip(lower=1)
+            csi_baseline = (raw_solar / clear_sky_all).clip(lower=0, upper=1.5)
+            csi_baseline[clear_sky_all <= 20] = 0.0
+            df_v[model_ens_col] = csi_baseline
+            df_tr_frame[model_ens_col] = df_v.loc[df_tr_frame.index, model_ens_col].values
+
         if len(X_tr) < 300 or len(X_te) < 50:
             print(f"  {info['display']:20s} --- SKIP (train={len(X_tr)}, test={len(X_te)})")
+            if param in QUANTILE_TARGETS:
+                _invalidate_quantile_artifacts(
+                    param, f'nedovoljan train/test split ({len(X_tr)}/{len(X_te)})'
+                )
             continue
 
         # --- LEAKAGE FIX: the test set must not be used for BOTH choosing the
@@ -3822,16 +4893,31 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
         X_te_rep, y_te_rep, df_te_rep = X_te.iloc[_rep_sl], y_te.iloc[_rep_sl], _df_te.iloc[_rep_sl]
 
         if param == 'precipitation':
-            X_train_p, y_train_p, X_val_p, y_val_p = _make_val_split(X_tr, y_tr)
+            precip_folds = _precip_clock_split(
+                X_tr, y_tr, df_tr_frame['datetime']
+            )
+            X_train_p, y_train_p = precip_folds['X_fit'], precip_folds['y_fit']
+            X_val_p, y_val_p = precip_folds['X_val'], precip_folds['y_val']
+            X_cal_p, y_cal_p = precip_folds['X_cal'], precip_folds['y_cal']
+            X_gate_p, y_gate_p = precip_folds['X_gate'], precip_folds['y_gate']
+            print(
+                f"    Precip split: fit={len(X_train_p)}, val={len(X_val_p)}, "
+                f"cal={len(X_cal_p)}, gate={len(X_gate_p)} | clock gaps="
+                f"{precip_folds['fit_val_gap'] / pd.Timedelta(hours=1):.0f}h/"
+                f"{precip_folds['val_cal_gap'] / pd.Timedelta(hours=1):.0f}h/"
+                f"{precip_folds['cal_gate_gap'] / pd.Timedelta(hours=1):.0f}h"
+            )
             # Method selection inside the two-stage happens on the SELECTION half.
             precip_result = _train_precipitation_twostage(
-                X_train_p, y_train_p, X_te_sel, y_te_sel, X_val_p, y_val_p, vf
+                X_train_p, y_train_p, X_te_sel, y_te_sel,
+                X_val_p, y_val_p, X_cal_p, y_cal_p,
+                X_gate_p, y_gate_p, vf,
             )
             rmse = precip_result['rmse']
 
             ens_col = f'{param}_ens_mean'
             blend_alpha = 1.0
-            RAIN_THRESH = 0.1
+            RAIN_THRESH = CORRECTED_RAIN_THRESHOLD_MM
             best_method = precip_result['best_method']
             _iso = precip_result.get('iso_calibrator')
             thresh = precip_result['threshold']
@@ -3861,18 +4947,22 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
                     xp = np.clip(precip_result['tweedie_model'].predict(X_sub), 0, None)
                 else:
                     xp = single_p
-                xp = np.clip(xp, 0, None)
-                xp[xp < RAIN_THRESH] = 0.0
-                if 'ens_all_dry' in X_sub.columns:
-                    xp[X_sub['ens_all_dry'].values > 0.5] = 0.0
-                return xp
+                return _clamp_precip_prediction(xp, X_sub)
 
             # Choose the blend alpha on the SELECTION half only.
             if ens_col in df_v.columns:
                 ens_sel = pd.to_numeric(df_te_sel[ens_col], errors='coerce').fillna(0).values
                 xgb_sel = _precip_xgb_pred(X_te_sel)
                 base_mae_sel = mean_absolute_error(y_te_sel, xgb_sel)
-                b_alpha, b_mae_sel, _ = _find_optimal_blend(xgb_sel, y_te_sel.values, ens_sel)
+                b_alpha, b_mae_sel = 1.0, base_mae_sel
+                for candidate_alpha in np.arange(0.50, 1.01, 0.025):
+                    candidate = _clamp_precip_prediction(
+                        candidate_alpha * xgb_sel + (1 - candidate_alpha) * ens_sel,
+                        X_te_sel,
+                    )
+                    candidate_mae = mean_absolute_error(y_te_sel, candidate)
+                    if candidate_mae < b_mae_sel:
+                        b_alpha, b_mae_sel = candidate_alpha, candidate_mae
                 if b_mae_sel < base_mae_sel:
                     blend_alpha = b_alpha
                     precip_result['blend_alpha'] = blend_alpha
@@ -3881,9 +4971,33 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
 
             # Report on the REPORT half with the chosen method + alpha (no further choice).
             xgb_rep = _precip_xgb_pred(X_te_rep)
+            cls_rep_raw = precip_result['cls_model'].predict_proba(X_te_rep)[:, 1]
+            cls_rep_pop = (
+                _iso.transform(cls_rep_raw) if _iso is not None else cls_rep_raw
+            )
+            y_cls_rep = (y_te_rep >= RAIN_THRESH).astype(int).values
+            report_cls_metrics = meteorological_metrics(
+                y_cls_rep, (cls_rep_pop >= thresh).astype(int),
+                p_proba=cls_rep_pop,
+            )
+            report_corp = pf.corp_reliability(
+                y_cls_rep.astype(float), cls_rep_pop
+            )
+            precip_result['report_metrics_full'] = report_cls_metrics
+            precip_result['report_corp'] = report_corp
+            print(
+                f"    Untouched report PoP: Brier={report_cls_metrics['brier']:.4f}, "
+                f"BSS={report_cls_metrics['brier_skill_score']:.3f}, "
+                f"RelRMSE={report_cls_metrics['reliability_rmse']:.4f}, "
+                f"POD={report_cls_metrics['pod']:.3f}, "
+                f"FAR={report_cls_metrics['far']:.3f}"
+            )
             if blend_alpha < 1.0 and ens_col in df_v.columns:
                 ens_rep = pd.to_numeric(df_te_rep[ens_col], errors='coerce').fillna(0).values
-                final_rep = blend_alpha * xgb_rep + (1 - blend_alpha) * ens_rep
+                final_rep = _clamp_precip_prediction(
+                    blend_alpha * xgb_rep + (1 - blend_alpha) * ens_rep,
+                    X_te_rep,
+                )
             else:
                 final_rep = xgb_rep
             mae = mean_absolute_error(y_te_rep, final_rep)
@@ -3917,69 +5031,30 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
             print(f"    Retraining {info['display']} na SVIM podacima za produkciju...")
             X_all = pd.concat([X_tr, X_te], axis=0)
             y_all = pd.concat([y_tr, y_te], axis=0)
-            y_cls_all = (y_all >= RAIN_THRESH).astype(int)
             rain_mask_all = y_all >= RAIN_THRESH
 
-            # Retrain classifier on all data using focal loss + seasonal weights.
-            # cls_hp_final contains focal_gamma / focal_alpha alongside xgb.train params
-            # plus n_estimators (which we map to num_boost_round).
-            _focal_g = float(precip_result['cls_hp_final'].pop('focal_gamma', 2.0))
-            _focal_a = float(precip_result['cls_hp_final'].pop('focal_alpha', 0.25))
-            _n_round = int(precip_result['cls_hp_final'].pop('n_estimators', 1000))
-            _cls_train_params = {k: v for k, v in precip_result['cls_hp_final'].items()
-                                  if k not in ('focal_gamma', 'focal_alpha', 'n_estimators')}
-            # Put them back so they're persisted in cls_hp_final
-            precip_result['cls_hp_final']['focal_gamma'] = _focal_g
-            precip_result['cls_hp_final']['focal_alpha'] = _focal_a
-            precip_result['cls_hp_final']['n_estimators'] = _n_round
-            if 'month' in X_all.columns:
-                _sw_all = seasonal_sample_weights(X_all['month'].values, y_cls_all.values)
-            else:
-                _sw_all = np.ones(len(y_cls_all))
-            _d_all = xgb.DMatrix(X_all, label=y_cls_all, weight=_sw_all,
-                                  feature_names=list(X_all.columns), missing=np.nan)
-            _cls_booster_prod = xgb.train(
-                _cls_train_params, _d_all,
-                num_boost_round=_n_round,
-                obj=focal_loss_xgb_objective(_focal_g, _focal_a),
-                verbose_eval=False,
-            )
-            # Wrap in the same adapter used during training so downstream save/predict works
-            class _BoosterProbaAdapter2:
-                def __init__(self, booster, feature_names, fg, fa):
-                    self._b = booster; self._fn = list(feature_names)
-                    self._gamma = float(fg); self._alpha = float(fa)
-                def _to_dmatrix(self, X):
-                    if isinstance(X, xgb.DMatrix): return X
-                    cols = list(X.columns) if hasattr(X, 'columns') else self._fn
-                    return xgb.DMatrix(X, feature_names=cols, missing=np.nan)
-                def predict_proba(self, X):
-                    margins = self._b.predict(self._to_dmatrix(X))
-                    p = 1.0 / (1.0 + np.exp(-margins))
-                    return np.stack([1 - p, p], axis=1)
-                def predict(self, X):
-                    return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
-                def save_model(self, path):
-                    self._b.save_model(path)
-                def get_params(self, deep=True):
-                    return {'focal_gamma': self._gamma, 'focal_alpha': self._alpha,
-                            'feature_names': self._fn}
-            cls_prod = _BoosterProbaAdapter2(_cls_booster_prod, X_all.columns, _focal_g, _focal_a)
+            # The focal classifier, isotonic calibrator, threshold, and PoP blend
+            # are one calibrated bundle. Keep that exact classifier instead of
+            # refitting it on rows that defined its calibration transform.
+            cls_prod = precip_result['cls_model']
+            _focal_g = float(precip_result['cls_hp_final'].get('focal_gamma', 2.0))
+            _focal_a = float(precip_result['cls_hp_final'].get('focal_alpha', 0.25))
+            _n_round = int(precip_result['cls_hp_final'].get('n_estimators', 1000))
 
             # Retrain regressor on all data
             if precip_result.get('use_sqrt', False) and rain_mask_all.sum() >= 100:
-                reg_prod = xgb.XGBRegressor(**precip_result['reg_hp_final'])
+                reg_prod = _new_xgb_regressor(**precip_result['reg_hp_final'])
                 reg_prod.fit(X_all[rain_mask_all], np.sqrt(y_all[rain_mask_all]), verbose=False)
             else:
-                reg_prod = xgb.XGBRegressor(**precip_result['reg_hp_final'])
+                reg_prod = _new_xgb_regressor(**precip_result['reg_hp_final'])
                 reg_prod.fit(X_all, y_all, verbose=False)
 
             # Retrain single model on all data
-            single_prod = xgb.XGBRegressor(**precip_result['single_hp_final'])
+            single_prod = _new_xgb_regressor(**precip_result['single_hp_final'])
             single_prod.fit(X_all, y_all, verbose=False)
 
             # Retrain Tweedie model on all data
-            tweedie_prod = xgb.XGBRegressor(**precip_result['tweedie_hp_final'])
+            tweedie_prod = _new_xgb_regressor(**precip_result['tweedie_hp_final'])
             tweedie_prod.fit(X_all, y_all.clip(lower=0), verbose=False)
 
             # Update precip_result with production models
@@ -3987,7 +5062,8 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
             precip_result['reg_model'] = reg_prod
             precip_result['single_model'] = single_prod
             precip_result['tweedie_model'] = tweedie_prod
-            print(f"    Production retrain: cls={len(X_all)}, reg={rain_mask_all.sum()}, single={len(X_all)} redova")
+            print(f"    Production retrain: cls=calibrated bundle retained, "
+                  f"reg={rain_mask_all.sum()}, single={len(X_all)} redova")
 
             cls_prod.save_model(os.path.join(MODEL_DIR, f"xgb_{param}_cls.json"))
             reg_prod.save_model(os.path.join(MODEL_DIR, f"xgb_{param}_reg.json"))
@@ -3999,9 +5075,11 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
             # in the same adapter (probabilities from raw margins via sigmoid).
             try:
                 _focal_sidecar = os.path.join(MODEL_DIR, f"xgb_{param}_cls_focal.json")
-                with open(_focal_sidecar, 'w', encoding='utf-8') as _fs:
-                    json.dump({'focal_gamma': _focal_g, 'focal_alpha': _focal_a,
-                               'n_estimators': _n_round}, _fs)
+                _write_json_atomic(
+                    _focal_sidecar,
+                    {'focal_gamma': _focal_g, 'focal_alpha': _focal_a,
+                     'n_estimators': _n_round},
+                )
             except Exception as _e:
                 print(f"    WARN: couldn't persist focal sidecar: {_e}")
 
@@ -4010,16 +5088,25 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
             if _iso is not None:
                 import joblib
                 joblib.dump(_iso, os.path.join(MODEL_DIR, f"xgb_{param}_iso_calibrator.joblib"))
+            else:
+                _remove_if_exists(
+                    os.path.join(MODEL_DIR, f"xgb_{param}_iso_calibrator.joblib")
+                )
 
             # persist the PoP blend (LR + spec) for reload
             _pb = precip_result.get('pop_blend')
             if _pb is not None:
                 import joblib
                 joblib.dump(_pb['lr'], os.path.join(MODEL_DIR, f"xgb_{param}_pop_blend.joblib"))
-                with open(os.path.join(MODEL_DIR, f"xgb_{param}_pop_blend.json"),
-                          'w', encoding='utf-8') as _pbf:
-                    json.dump({'cols': _pb['cols'], 'tau': _pb['tau'],
-                               'mode': _pb['mode']}, _pbf)
+                _write_json_atomic(
+                    os.path.join(MODEL_DIR, f"xgb_{param}_pop_blend.json"),
+                    {'cols': _pb['cols'], 'tau': _pb['tau'], 'mode': _pb['mode']},
+                )
+            else:
+                _remove_if_exists(
+                    os.path.join(MODEL_DIR, f"xgb_{param}_pop_blend.joblib"),
+                    os.path.join(MODEL_DIR, f"xgb_{param}_pop_blend.json"),
+                )
 
             trained[param] = {
                 'precip_info': precip_result,
@@ -4041,9 +5128,17 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
                 'use_sqrt': bool(precip_result.get('use_sqrt', False)),
                 'is_precip': True,
                 'rain_gate_mode': (precip_result.get('pop_blend') or {}).get('mode', 'trusted'),
+                'pop_brier': round(float(report_cls_metrics['brier']), 5),
+                'pop_brier_skill': round(float(report_cls_metrics['brier_skill_score']), 4),
+                'pop_reliability_rmse': round(float(report_cls_metrics['reliability_rmse']), 5),
+                'pop_pod': round(float(report_cls_metrics['pod']), 4),
+                'pop_far': round(float(report_cls_metrics['far']), 4),
             }
             # predictive distribution for precipitation amounts
-            qb = _train_target_quantiles(param, X_tr, y_tr, X_te_rep, y_te_rep)
+            qb = _train_target_quantiles(
+                param, X_tr, y_tr, X_te_rep, y_te_rep,
+                train_datetimes=df_tr_frame['datetime'],
+            )
             if qb is not None:
                 trained[param]['quantiles'] = qb
                 results[param]['quantile_crps'] = qb['crps']
@@ -4086,7 +5181,7 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
             _lt = pd.to_numeric(X_tr['lead_time'], errors='coerce').fillna(12).values
             sample_weight = sample_weight * np.where(_lt > 24, 0.5, 1.0)
 
-        ens_col = f'{param}_ens_mean'
+        ens_col = model_ens_col
         # Method/blend/stack chosen on the SELECTION half (out-of-sample, not the
         # reported set). Reporting below uses the untouched REPORT half.
         rb_result = _train_residual_blended(
@@ -4095,27 +5190,19 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
             use_optuna=True, sample_weight=sample_weight,
             train_datetimes=train_datetimes
         )
-
         method_str = rb_result['method']
-        model_obj = rb_result['model']
+        _deploy_ridge_meta = method_str == 'ridge_meta'
+
         # Use selected features if feature selection was applied
         sel_feats = rb_result.get('selected_features')
         # Report on the REPORT half (never used to choose the config above).
         X_te_eval = X_te_rep[sel_feats] if sel_feats else X_te_rep
-        y_pred = model_obj.predict(X_te_eval)
-
-        if rb_result['is_residual']:
-            ens_te_vals = pd.to_numeric(df_te_rep[ens_col], errors='coerce').fillna(0).values if ens_col in df_v.columns else np.zeros(len(X_te_rep))
-            y_pred = ens_te_vals + y_pred
-        elif rb_result.get('blend_alpha') is not None:
-            ens_te_vals = pd.to_numeric(df_te_rep[ens_col], errors='coerce').fillna(0).values if ens_col in df_v.columns else np.zeros(len(X_te_rep))
-            alpha = rb_result['blend_alpha']
-            y_pred = alpha * y_pred + (1 - alpha) * ens_te_vals
+        y_pred = _predict_nonprecip_bundle(rb_result, X_te_eval, df_te_rep, ens_col)
 
         if param == 'relative_humidity_2m':
             y_pred = np.clip(y_pred, 0, 100)
         elif param == 'cloud_cover':
-            y_pred = np.clip(y_pred, 0, 100)
+            y_pred = _postprocess_cloud_prediction(y_pred, df_te_rep)
         elif param in ['wind_speed_10m', 'wind_gusts_10m', 'shortwave_radiation']:
             y_pred = np.clip(y_pred, 0, None)
 
@@ -4135,9 +5222,13 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
         # --- Dew deficit back-transform: convert deficit to dew point for evaluation ---
         if dew_deficit_mode and param == 'dew_point_2m':
             y_pred = np.clip(y_pred, 0, None)  # deficit is always ≥ 0
-            # Need corrected temperature for back-transform; use ensemble mean as proxy during eval
-            t_ens_col = 'temperature_2m_ens_mean'
-            if t_ens_col in df_v.columns:
+            # Couple to the untouched-report corrected temperature, matching
+            # live inference without leaking its later production retrain.
+            temp_report = report_predictions.get('temperature_2m')
+            if temp_report is not None:
+                t_proxy = temp_report.reindex(df_te_rep.index).values
+            elif 'temperature_2m_ens_mean' in df_v.columns:
+                t_ens_col = 'temperature_2m_ens_mean'
                 t_proxy = pd.to_numeric(df_te_rep[t_ens_col], errors='coerce').values
             else:
                 t_proxy = pd.to_numeric(df_te_rep['temperature_2m_obs'], errors='coerce').values
@@ -4147,6 +5238,9 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
 
         mae = mean_absolute_error(y_eval, y_pred)
         rmse = np.sqrt(mean_squared_error(y_eval, y_pred))
+        report_predictions[param] = pd.Series(
+            np.asarray(y_pred, dtype=float), index=df_te_rep.index
+        )
 
         best_mae, best_m = float('inf'), ""
         for m in MODELS:
@@ -4160,8 +5254,8 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
                         best_mae, best_m = mm, m
 
         ens_mae = float('inf')
-        if ens_col in df_v.columns:
-            ev = pd.to_numeric(df_te_rep[ens_col], errors='coerce')
+        if raw_ens_col in df_v.columns:
+            ev = pd.to_numeric(df_te_rep[raw_ens_col], errors='coerce')
             vv = ev.notna() & y_eval.notna()
             if vv.sum() > 50:
                 ens_mae = mean_absolute_error(y_eval[vv], ev[vv])
@@ -4183,7 +5277,10 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
 
         # Temporal weights for full dataset (df_tr_frame: lead-stack aware)
         all_datetimes = pd.concat([df_tr_frame['datetime'], df_v.loc[te, 'datetime']])
-        sw_all = _compute_sample_weights(y_all, all_datetimes, decay_half_life_days=365)
+        sw_all = _compute_sample_weights(
+            y_all, all_datetimes,
+            decay_half_life_days=rb_result.get('decay_half_life', 365),
+        )
         if 'lead_time' in X_all.columns:
             _lt_all = pd.to_numeric(X_all['lead_time'], errors='coerce').fillna(12).values
             sw_all = sw_all * np.where(_lt_all > 24, 0.5, 1.0)
@@ -4193,7 +5290,7 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
         # Retrain direct model (MAE loss) on all data
         hp_prod = {k: v for k, v in tuned_hp.items() if k != 'early_stopping_rounds'}
         hp_prod['n_estimators'] = rb_result['direct_n_estimators']
-        direct_prod = xgb.XGBRegressor(**hp_prod)
+        direct_prod = _new_xgb_regressor(**hp_prod)
         direct_prod.fit(X_all_sel, y_all, verbose=False, sample_weight=sw_all)
 
         # Retrain residual model (Huber loss) on all data
@@ -4203,37 +5300,42 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
         y_resid_all = y_all - ens_all.values
         hp_resid_prod = hp_prod.copy()
         hp_resid_prod['objective'] = 'reg:pseudohubererror'
+        hp_resid_prod.pop('monotone_constraints', None)
         hp_resid_prod['n_estimators'] = rb_result['resid_n_estimators']
-        resid_prod = xgb.XGBRegressor(**hp_resid_prod)
+        resid_prod = _new_xgb_regressor(**hp_resid_prod)
         resid_prod.fit(X_all_sel, y_resid_all, verbose=False, sample_weight=sw_all)
 
         # Retrain MSE model on all data
         hp_mse_prod = hp_prod.copy()
         hp_mse_prod['objective'] = 'reg:squarederror'
         hp_mse_prod['n_estimators'] = rb_result['mse_n_estimators']
-        mse_prod = xgb.XGBRegressor(**hp_mse_prod)
+        mse_prod = _new_xgb_regressor(**hp_mse_prod)
         mse_prod.fit(X_all_sel, y_all, verbose=False, sample_weight=sw_all)
 
         # Retrain CatBoost on all data
         cb_prod = None
-        if rb_result.get('has_catboost') and rb_result.get('cb_model') is not None:
-            cb_prod = cb.CatBoostRegressor(
+        if (_deploy_ridge_meta and rb_result.get('has_catboost')
+                and rb_result.get('cb_model') is not None):
+            cb_prod = _new_catboost_regressor(
                 iterations=rb_result['cb_model'].get_params().get('iterations', 2000),
                 depth=rb_result['cb_model'].get_params().get('depth', 6),
                 learning_rate=rb_result['cb_model'].get_params().get('learning_rate', 0.03),
                 l2_leaf_reg=rb_result['cb_model'].get_params().get('l2_leaf_reg', 1.0),
+                subsample=rb_result['cb_model'].get_params().get('subsample', 0.8),
+                bootstrap_type='Bernoulli',
                 loss_function='MAE', random_seed=42, verbose=0,
             )
             cb_prod.fit(cb.Pool(X_all_sel, y_all, weight=sw_all))
 
         # Retrain LightGBM on all data
         lgb_prod = None
-        if rb_result.get('has_lightgbm') and rb_result.get('lgb_model') is not None:
+        if (_deploy_ridge_meta and rb_result.get('has_lightgbm')
+                and rb_result.get('lgb_model') is not None):
             lgb_params = rb_result['lgb_model'].get_params()
             lgb_params.pop('callbacks', None)
             lgb_params.pop('early_stopping_round', None)
             lgb_params.pop('early_stopping_rounds', None)
-            lgb_prod = lgb.LGBMRegressor(**lgb_params)
+            lgb_prod = _new_lgbm_regressor(**lgb_params)
             lgb_prod.fit(X_all_sel, y_all, sample_weight=sw_all)
 
         print(f"    Production retrain: {len(X_all)} redova (train={len(X_tr)}, test={len(X_te)})")
@@ -4252,8 +5354,14 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
             joblib.dump(cb_prod, os.path.join(MODEL_DIR, f"xgb_{param}_catboost.joblib"))
         if lgb_prod is not None:
             joblib.dump(lgb_prod, os.path.join(MODEL_DIR, f"xgb_{param}_lightgbm.joblib"))
-        if rb_result.get('ridge_meta') is not None:
+        if _deploy_ridge_meta and rb_result.get('ridge_meta') is not None:
             joblib.dump(rb_result['ridge_meta'], os.path.join(MODEL_DIR, f"xgb_{param}_ridge_meta.joblib"))
+        else:
+            _remove_if_exists(
+                os.path.join(MODEL_DIR, f"xgb_{param}_catboost.joblib"),
+                os.path.join(MODEL_DIR, f"xgb_{param}_lightgbm.joblib"),
+                os.path.join(MODEL_DIR, f"xgb_{param}_ridge_meta.joblib"),
+            )
 
         # Update result with production models
         rb_result['direct_model'] = direct_prod
@@ -4276,14 +5384,15 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
             'mse_model': rb_result.get('mse_model'),
             'cb_model': rb_result.get('cb_model'),
             'lgb_model': rb_result.get('lgb_model'),
-            'ridge_meta': rb_result.get('ridge_meta'),
+            'ridge_meta': rb_result.get('ridge_meta') if _deploy_ridge_meta else None,
             'ridge_meta_regime': rb_result.get('ridge_meta_regime') or [],
-            'has_catboost': rb_result.get('has_catboost', False),
-            'has_lightgbm': rb_result.get('has_lightgbm', False),
+            'has_catboost': bool(_deploy_ridge_meta and rb_result.get('has_catboost', False)),
+            'has_lightgbm': bool(_deploy_ridge_meta and rb_result.get('has_lightgbm', False)),
             'method': method_str,
             'is_residual': rb_result['is_residual'],
             'blend_alpha': rb_result.get('blend_alpha'),
             'stack_weights': rb_result.get('stack_weights'),
+            'model_ens_col': model_ens_col,
             'features': effective_features,
             'csi_mode': csi_mode,
             'dew_deficit_mode': dew_deficit_mode,
@@ -4302,19 +5411,24 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
             'ridge_meta_regime': rb_result.get('ridge_meta_regime') or [],
             'blend_alpha': float(rb_result['blend_alpha']) if rb_result.get('blend_alpha') is not None else None,
             'stack_weights': [float(w) for w in rb_result['stack_weights']] if rb_result.get('stack_weights') else None,
+            'model_ens_col': model_ens_col,
+            'decay_half_life': int(rb_result.get('decay_half_life', 365)),
             # Persist back-transform flags + base-learner availability so
             # --skip-training reload reproduces the exact training-time path.
             'csi_mode': bool(csi_mode),
             'dew_deficit_mode': bool(dew_deficit_mode),
-            'has_catboost': bool(rb_result.get('has_catboost', False)),
-            'has_lightgbm': bool(rb_result.get('has_lightgbm', False)),
+            'has_catboost': bool(_deploy_ridge_meta and rb_result.get('has_catboost', False)),
+            'has_lightgbm': bool(_deploy_ridge_meta and rb_result.get('has_lightgbm', False)),
             'is_precip': False,
         }
 
         # predictive distribution (T2m / wind / gusts; raw-target only,
         # so CSI- and deficit-transformed params are skipped by the tuple).
         if param in QUANTILE_TARGETS:
-            qb = _train_target_quantiles(param, X_tr, y_tr, X_te_rep, y_te_rep)
+            qb = _train_target_quantiles(
+                param, X_tr, y_tr, X_te_rep, y_te_rep,
+                train_datetimes=df_tr_frame['datetime'],
+            )
             if qb is not None:
                 trained[param]['quantiles'] = qb
                 results[param]['quantile_crps'] = qb['crps']
@@ -4367,14 +5481,19 @@ def load_trained_models():
             if not all(os.path.exists(p) for p in [cls_path, reg_path, single_path]):
                 print(f"  {rinfo['display']:20s} --- SKIP (fajlovi ne postoje)")
                 continue
+            if rinfo.get('method') == 'tweedie' and not os.path.exists(tweedie_path):
+                raise FileNotFoundError(
+                    f"{rinfo['display']}: izabran je Tweedie, ali nedostaje {tweedie_path}"
+                )
 
             # classifier was trained with focal loss (custom objective)
             # using xgb.train, so we reload it as a Booster and wrap it in a thin
             # adapter that exposes predict_proba (sigmoid of raw margin).
-            _cls_booster = xgb.Booster()
+            _cls_booster = _new_xgb_booster()
             _cls_booster.load_model(cls_path)
+            _restore_xgb_device(_cls_booster)
             # Read focal hyperparams from sidecar (best effort; safe defaults if absent)
-            _focal_g, _focal_a = 2.0, 0.25
+            _focal_g, _focal_a, _focal_n = 2.0, 0.25, 0
             _focal_sidecar = os.path.join(MODEL_DIR, f"xgb_{param}_cls_focal.json")
             if os.path.exists(_focal_sidecar):
                 try:
@@ -4382,34 +5501,45 @@ def load_trained_models():
                         _fsj = json.load(_fs)
                         _focal_g = float(_fsj.get('focal_gamma', _focal_g))
                         _focal_a = float(_fsj.get('focal_alpha', _focal_a))
+                        _focal_n = int(_fsj.get('n_estimators', _focal_n))
                 except Exception:
                     pass
 
             class _BoosterProbaAdapterReload:
-                def __init__(self, booster, fg, fa):
+                def __init__(self, booster, fg, fa, n_rounds=0):
                     self._b = booster; self._gamma = float(fg); self._alpha = float(fa)
+                    self._n_rounds = int(n_rounds)
                 def _to_dmatrix(self, X):
                     if isinstance(X, xgb.DMatrix): return X
                     cols = list(X.columns) if hasattr(X, 'columns') else None
                     return xgb.DMatrix(X, feature_names=cols, missing=np.nan)
                 def predict_proba(self, X):
-                    margins = self._b.predict(self._to_dmatrix(X))
+                    dmatrix = self._to_dmatrix(X)
+                    margins = (
+                        self._b.predict(dmatrix, iteration_range=(0, self._n_rounds))
+                        if self._n_rounds > 0 else self._b.predict(dmatrix)
+                    )
                     p = 1.0 / (1.0 + np.exp(-margins))
                     return np.stack([1 - p, p], axis=1)
                 def predict(self, X):
                     return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
                 def save_model(self, path):
                     self._b.save_model(path)
-            cls_model = _BoosterProbaAdapterReload(_cls_booster, _focal_g, _focal_a)
-            reg_model = xgb.XGBRegressor()
+            cls_model = _BoosterProbaAdapterReload(
+                _cls_booster, _focal_g, _focal_a, _focal_n
+            )
+            reg_model = _new_xgb_regressor()
             reg_model.load_model(reg_path)
-            single_model = xgb.XGBRegressor()
+            _restore_xgb_device(reg_model)
+            single_model = _new_xgb_regressor()
             single_model.load_model(single_path)
+            _restore_xgb_device(single_model)
 
             tweedie_model = None
             if os.path.exists(tweedie_path):
-                tweedie_model = xgb.XGBRegressor()
+                tweedie_model = _new_xgb_regressor()
                 tweedie_model.load_model(tweedie_path)
+                _restore_xgb_device(tweedie_model)
 
             precip_info = {
                     'cls_model': cls_model,
@@ -4464,8 +5594,9 @@ def load_trained_models():
                 print(f"  {rinfo['display']:20s} --- SKIP (fajl ne postoji)")
                 continue
 
-            direct_model = xgb.XGBRegressor()
+            direct_model = _new_xgb_regressor()
             direct_model.load_model(direct_path)
+            _restore_xgb_device(direct_model)
 
             is_residual = rinfo.get('is_residual', False)
             # Load resid_model whenever it exists — NOT only when is_residual.
@@ -4474,13 +5605,15 @@ def load_trained_models():
             # collapsed their residual term to direct in --skip-training mode.
             resid_model = None
             if os.path.exists(resid_path):
-                resid_model = xgb.XGBRegressor()
+                resid_model = _new_xgb_regressor()
                 resid_model.load_model(resid_path)
+                _restore_xgb_device(resid_model)
 
             mse_model = None
             if os.path.exists(mse_path):
-                mse_model = xgb.XGBRegressor()
+                mse_model = _new_xgb_regressor()
                 mse_model.load_model(mse_path)
+                _restore_xgb_device(mse_model)
 
             # CatBoost / LightGBM base learners + RidgeCV meta-learner (joblib).
             # Needed so method=='ridge_meta' reproduces the trained prediction
@@ -4526,6 +5659,7 @@ def load_trained_models():
                 'ridge_meta_regime': rinfo.get('ridge_meta_regime') or [],
                 'blend_alpha': rinfo.get('blend_alpha'),
                 'stack_weights': rinfo.get('stack_weights'),
+                'model_ens_col': rinfo.get('model_ens_col', f'{param}_ens_mean'),
                 'csi_mode': bool(rinfo.get('csi_mode', False)),
                 'dew_deficit_mode': bool(rinfo.get('dew_deficit_mode', False)),
                 'features': features,
@@ -4541,7 +5675,12 @@ def load_trained_models():
     for param in QUANTILE_TARGETS:
         if param not in trained:
             continue
-        prefix = os.path.join(MODEL_DIR, f"qmod_{param}")
+        if 'quantile_crps' not in results.get(param, {}):
+            continue
+        prefix = _active_quantile_prefix(param)
+        if prefix is None:
+            print(f"  Kvantili {param}: nema aktivnog, validnog bundle-a")
+            continue
         try:
             q_models, q_offsets = pf.load_quantile_bundle(prefix)
             feats_path = f"{prefix}_features.json"
@@ -4707,9 +5846,12 @@ def fetch_live_forecasts():
                     if attempt < max_attempts - 1:
                         print("empty/no-precip; retrying", end=" ")
                         time.sleep(5 * (attempt + 1)); continue
-                    print(f"FAIL: trusted response missing precipitation after "
-                          f"{max_attempts} attempts")
-                    break
+                    # Route through the normal exception path so the final
+                    # attempt can use a valid stale cache instead of bypassing
+                    # that fallback on a malformed HTTP 200 response.
+                    raise ValueError(
+                        f"trusted response missing precipitation after {max_attempts} attempts"
+                    )
                 d = pd.DataFrame({'datetime': pd.to_datetime(h.get('time', []))})
                 for v in HOURLY_VARS:
                     if v in h:
@@ -4874,6 +6016,21 @@ def fetch_live_forecasts():
 # Marine forecast: ensemble of 2 wave models + offshore wind, no bias
 # correction. Its own pipeline, so the atmospheric path stays clean.
 
+
+def _circular_mean_degrees(values, axis=1):
+    """Mean compass direction without the 0/360 wrap-around artifact."""
+    frame = values.apply(pd.to_numeric, errors='coerce') if hasattr(values, 'apply') else np.asarray(values, dtype=float)
+    radians = np.radians(frame)
+    sin_mean = np.nanmean(np.sin(radians), axis=axis)
+    cos_mean = np.nanmean(np.cos(radians), axis=axis)
+    direction = np.degrees(np.arctan2(sin_mean, cos_mean)) % 360
+    resultant = np.hypot(sin_mean, cos_mean)
+    direction = np.where(resultant > 1e-12, direction, np.nan)
+    if isinstance(frame, pd.DataFrame):
+        direction = pd.Series(direction, index=frame.index, dtype=float)
+        direction[~frame.notna().any(axis=axis)] = np.nan
+    return direction
+
 # Beaufort thresholds (m/s, upper bound of each Bft 0..11).
 _BEAUFORT_THRESHOLDS = [0.3, 1.6, 3.4, 5.5, 8.0, 10.8, 13.9, 17.2, 20.8, 24.5, 28.5, 32.7]
 
@@ -5036,7 +6193,11 @@ def _fetch_marine_waves(lat, lon, label):
     for v in MARINE_VARS:
         cols = [f"{m}_{v}" for m in MARINE_MODELS if f"{m}_{v}" in df.columns]
         if cols:
-            df[f'{v}_mean'] = df[cols].apply(pd.to_numeric, errors='coerce').mean(axis=1)
+            values = df[cols].apply(pd.to_numeric, errors='coerce')
+            if v.endswith('_direction'):
+                df[f'{v}_mean'] = _circular_mean_degrees(values)
+            else:
+                df[f'{v}_mean'] = values.mean(axis=1)
 
     now = local_now().floor('h')
     df = df[df['datetime'] >= now].copy().reset_index(drop=True)
@@ -5386,8 +6547,9 @@ def correct_weather_code_row(row, raw_row=None):
     precip_xgb = row.get('precipitation_xgb', None)
     cloud_xgb = row.get('cloud_cover_xgb', None)
     
-    is_rain_code = 51 <= wc_raw <= 82  # drizzle + rain + showers
-    is_snow_code = 71 <= wc_raw <= 77
+    # Do not classify snow or freezing precipitation as ordinary rain merely
+    # because their WMO codes happen to lie numerically between 51 and 82.
+    is_rain_code = wc_raw in (51, 53, 55, 61, 63, 65, 80, 81, 82)
     is_thunderstorm = wc_raw >= 95
     
     # We don't want to mess with thunderstorm codes, as they are often correct and XGBoost precip can be underestimated in convective events
@@ -5492,7 +6654,10 @@ def _apply_burst_wind_boost(corrected, fc):
     if trusted_col not in fc.columns:
         return
 
-    italia_precip = pd.to_numeric(fc[trusted_col], errors='coerce').fillna(0).values
+    # Raw Open-Meteo precipitation is end-of-hour labelled. Align it to the
+    # already shifted output rows before deciding which instantaneous wind/gust
+    # values to boost.
+    italia_precip = pd.to_numeric(fc[trusted_col], errors='coerce').shift(-1).fillna(0).values
     burst_mask = _detect_short_rain_bursts(
         italia_precip, TRUSTED_RAIN_THRESHOLD,
         BURST_MAX_HOURS, BURST_MAX_HOURS_EXTENDED,
@@ -5670,9 +6835,10 @@ def apply_correction(fc_df, trained, bias_tables, local_dry_nowcast=False):
             if n_nan > 0:
                 print(f"  UPOZORENJE: {TRUSTED_RAIN_MODEL} ima NaN za "
                       f"{n_nan}/{len(trusted_vals)} sati. Ti sati se "
-                      f"tretiraju kao 'bez signala' (suvo).")
-            # NaN -> 0 samo za poredjenje sa pragom; gate ostaje zatvoren
-            # za NaN sate. Ovo razdvaja "Italia kaze nula" od "Italia nema podatak".
+                      f"oznacavaju kao nepoznati, ne kao suvi.")
+            # NaN -> 0 is only an internal comparison convenience. Before the
+            # precipitation branch returns, those rows are restored to NaN so
+            # "trusted model has no data" can never become a dry forecast.
             trusted_vals_filled = np.where(trusted_nan, 0.0, trusted_vals)
             trusted_signal = trusted_vals_filled >= TRUSTED_RAIN_THRESHOLD
 
@@ -5826,6 +6992,26 @@ def apply_correction(fc_df, trained, bias_tables, local_dry_nowcast=False):
 
             pred[pred < CORRECTED_RAIN_THRESHOLD_MM] = 0.0
 
+            # A missing trusted-gate value is unknown, not evidence of dry
+            # weather. Other global models may still extend farther, but this
+            # policy cannot make a trusted-gate decision for that hour.
+            pred[trusted_nan] = np.nan
+            if 'precipitation_pop' in corrected.columns:
+                corrected.loc[trusted_nan, 'precipitation_pop'] = np.nan
+
+            # Missing NWP input means unknown, not dry. The precipitation
+            # branch returns before the generic missing-data guard below, so it
+            # needs its own guard (especially beyond the trusted 48h window).
+            precip_source_cols = [
+                f'{m}_precipitation_model' for m in MODELS
+                if f'{m}_precipitation_model' in fc.columns
+            ]
+            if precip_source_cols:
+                no_precip_data = ~fc[precip_source_cols].notna().any(axis=1).values
+                pred[no_precip_data] = np.nan
+                if 'precipitation_pop' in corrected.columns:
+                    corrected.loc[no_precip_data, 'precipitation_pop'] = np.nan
+
             corrected[f'{param}_xgb'] = pred
             # (precipitation_pop set above, before the radar block, and gated)
             method_lbl = method + (f'+blend({p_blend_alpha:.2f})' if p_blend_alpha < 1.0 else '')
@@ -5835,100 +7021,43 @@ def apply_correction(fc_df, trained, bias_tables, local_dry_nowcast=False):
             continue
 
         method_name = minfo.get('method', 'direct')
-        model = minfo['model']
-        pred = model.predict(X)
-
-        if method_name == 'stacked' and minfo.get('stack_weights') is not None:
-            # Multi-objective stacked prediction
-            w_d, w_r, w_m = minfo['stack_weights']
-            direct_pred = minfo['direct_model'].predict(X)
-            ens_col = f'{param}_ens_mean'
-            ens_vals = pd.to_numeric(fc[ens_col], errors='coerce').fillna(0).values if ens_col in fc.columns else np.zeros(len(X))
-            resid_pred = ens_vals + minfo['resid_model'].predict(X) if minfo.get('resid_model') else direct_pred
-            mse_pred = minfo['mse_model'].predict(X) if minfo.get('mse_model') else direct_pred
-            pred = w_d * direct_pred + w_r * resid_pred + w_m * mse_pred
-        elif method_name == 'ridge_meta' and minfo.get('ridge_meta') is not None:
-            # RidgeCV meta-learner stacking
-            ens_col = f'{param}_ens_mean'
-            ens_vals = pd.to_numeric(fc[ens_col], errors='coerce').fillna(0).values if ens_col in fc.columns else np.zeros(len(X))
-            base_preds = [
-                minfo['direct_model'].predict(X),
-                ens_vals + minfo['resid_model'].predict(X) if minfo.get('resid_model') else minfo['direct_model'].predict(X),
-                minfo['mse_model'].predict(X) if minfo.get('mse_model') else minfo['direct_model'].predict(X),
-            ]
-            if minfo.get('has_catboost') and minfo.get('cb_model') is not None:
-                base_preds.append(minfo['cb_model'].predict(X))
-            if minfo.get('has_lightgbm') and minfo.get('lgb_model') is not None:
-                base_preds.append(minfo['lgb_model'].predict(X))
-            # mirror the regime x model interaction layout used at
-            # training time ([base | base*flag1 | base*flag2 | ...]).
-            base_mat = np.column_stack(base_preds)
-            meta_parts = [base_mat]
-            for rc in (minfo.get('ridge_meta_regime') or []):
-                flags = pd.to_numeric(
-                    fc.get(rc, pd.Series(0, index=fc.index)), errors='coerce'
-                ).fillna(0).values
-                meta_parts.append(base_mat * flags[:, None])
-            meta_X = np.column_stack(meta_parts)
-            try:
-                pred = minfo['ridge_meta'].predict(meta_X)
-            except Exception as _e:
-                # Base-learner set didn't match what RidgeCV was fit on (e.g. a
-                # missing cb/lgb joblib after reload). Degrade to direct rather
-                # than crash the whole forecast.
-                print(f"  {TARGET_PARAMS[param]['display']}: ridge_meta predict failed "
-                      f"({_e}); fallback na direct model")
-                pred = minfo['direct_model'].predict(X)
-        elif minfo.get('is_residual'):
-            ens_col = f'{param}_ens_mean'
-            ens_vals = pd.to_numeric(fc[ens_col], errors='coerce').fillna(0).values if ens_col in fc.columns else np.zeros(len(X))
-            pred = ens_vals + pred
-        elif minfo.get('blend_alpha') is not None:
-            ens_col = f'{param}_ens_mean'
-            ens_vals = pd.to_numeric(fc[ens_col], errors='coerce').fillna(0).values if ens_col in fc.columns else np.zeros(len(X))
-            alpha = minfo['blend_alpha']
-            pred = alpha * pred + (1 - alpha) * ens_vals
+        ens_col = minfo.get('model_ens_col', f'{param}_ens_mean')
+        if ens_col not in fc.columns and minfo.get('dew_deficit_mode'):
+            temp_ens = pd.to_numeric(
+                fc.get('temperature_2m_ens_mean', pd.Series(np.nan, index=fc.index)),
+                errors='coerce',
+            )
+            dew_ens = pd.to_numeric(
+                fc.get('dew_point_2m_ens_mean', pd.Series(np.nan, index=fc.index)),
+                errors='coerce',
+            )
+            fc[ens_col] = (temp_ens - dew_ens).clip(lower=0)
+        elif ens_col not in fc.columns and minfo.get('csi_mode'):
+            raw_solar = pd.to_numeric(
+                fc.get('shortwave_radiation_ens_mean', pd.Series(np.nan, index=fc.index)),
+                errors='coerce',
+            )
+            clear_sky_live = compute_clear_sky(fc['datetime']).clip(lower=1)
+            fc[ens_col] = (raw_solar / clear_sky_live).clip(lower=0, upper=1.5)
+            fc.loc[clear_sky_live <= 20, ens_col] = 0.0
+        try:
+            pred = _predict_nonprecip_bundle(minfo, X, fc, ens_col)
+        except Exception as _e:
+            if _DEVICE_REQUEST == 'cuda':
+                raise RuntimeError(
+                    f"{TARGET_PARAMS[param]['display']} GPU prediction failed: {_e}"
+                ) from _e
+            # Old/incomplete artifact bundles may not contain every component.
+            # Keep the forecast alive, but make the degradation explicit.
+            print(f"  {TARGET_PARAMS[param]['display']}: {minfo.get('method')} predict failed "
+                  f"({_e}); fallback na direct model")
+            pred = minfo['direct_model'].predict(X)
+            method_name = f"{method_name}->direct-fallback"
 
         if param == 'relative_humidity_2m':
             pred = np.clip(pred, 0, 100)
         elif param == 'cloud_cover':
-            pred = np.clip(pred, 0, 100)
-            # One issue that I've had with clouds is winter morning overcast scenarios, the XGBoost model regularly overpowers, so to fix the XGBoost offset: when ensemble unanimously says clear sky,
-            # don't let XGBoost hallucinate clouds from climatology.
-            ens_col_cc = f'{param}_ens_mean'
-            if ens_col_cc in fc.columns:
-                ens_cc = pd.to_numeric(fc[ens_col_cc], errors='coerce').fillna(0).values
-                # If ensemble < 10%, cap XGBoost at ensemble + 30%
-                low_ens = ens_cc < 10
-                if low_ens.any():
-                    pred[low_ens] = np.minimum(pred[low_ens], ens_cc[low_ens] + 30)
-                # If ensemble > 90%, floor XGBoost at ensemble - 30%
-                high_ens = ens_cc > 90
-                if high_ens.any():
-                    pred[high_ens] = np.maximum(pred[high_ens], ens_cc[high_ens] - 30)
-                pred = np.clip(pred, 0, 100)
-
-                # OUT-OF-WINDOW FIX:
-                # XGB was trained on the per-season daytime window
-                # (Apr-Sep 7-18h, Oct-Mar 9-15h), but in PRODUCTION we further
-                # restrict inference to start at 10:00 LT regardless of season.
-                # Reason: between sunrise and ~10:00 the derived-cloud target
-                # (1 - solar/clear_sky) is noisy due to low solar elevation +
-                # terrain shading from Lovcen, and the model carries that
-                # noise into a visible jump at 07-09h vs the smooth ensemble.
-                # So: for hours < 10 (any season) use NWP ensemble. From 10:00
-                # inclusive up to the seasonal upper bound (18 warm / 15 cold)
-                # use XGB. Outside the upper bound, ensemble again.
-                _h = fc['datetime'].dt.hour
-                _m = fc['datetime'].dt.month
-                _warm = _m.isin([4, 5, 6, 7, 8, 9])
-                _warm_ok = _warm & (_h >= 10) & (_h <= 18)
-                _cold_ok = (~_warm) & (_h >= 10) & (_h <= 15)
-                _in_window = (_warm_ok | _cold_ok).values
-                out_of_window = ~_in_window
-                if out_of_window.any():
-                    pred[out_of_window] = ens_cc[out_of_window]
-                    pred = np.clip(pred, 0, 100)
+            pred = _postprocess_cloud_prediction(pred, fc)
         elif param in ['wind_speed_10m', 'wind_gusts_10m', 'shortwave_radiation']:
             pred = np.clip(pred, 0, None)
 
@@ -6061,24 +7190,15 @@ def apply_correction(fc_df, trained, bias_tables, local_dry_nowcast=False):
             v = (-np.cos(rad)).mean(axis=1)
             corrected['wind_direction_10m_ens'] = (np.degrees(np.arctan2(-u, -v)) % 360)
 
-    # Microcellular-shower wind boost. Runs LAST so it can see the final
-    # wind_speed_10m_xgb / wind_gusts_10m_xgb that the param loop produced.
-    _apply_burst_wind_boost(corrected, fc)
-
     # Open-Meteo labels accumulations / preceding-hour maxima at the END of
     # the hour: row T's precip/gusts cover [T-1h, T]. Shift these columns
     # back by 1 so a row labelled T means "from T to T+1h" -- intuitive on
     # the UI (precip at 12:00 = what falls between 12:00 and 13:00).
     # weather_code_raw follows precip (same convention) and shifts with it.
-    # wind_speed_10m is also shifted: the burst boost ties sustained wind to
-    # the trusted-model precip in that hour, so shifting precip without wind
-    # would misalign the boosted value (e.g., 5 m/s at the rain hour would
-    # display 1h later than the rain that drove the boost).
-    # Other variables (temp, humidity, pressure, cloud cover, wind direction)
-    # are instantaneous and stay anchored to the row's timestamp.
+    # Sustained wind is instantaneous and therefore stays anchored to its row;
+    # gust is a preceding-hour maximum and shifts with precipitation.
     shift_cols = [
         'precipitation_xgb', 'precipitation_ensemble',
-        'wind_speed_10m_xgb', 'wind_speed_10m_ensemble',
         'wind_gusts_10m_xgb', 'wind_gusts_10m_ensemble',
         'weather_code_raw',
         'rain_ens', 'snowfall_ens',
@@ -6087,11 +7207,14 @@ def apply_correction(fc_df, trained, bias_tables, local_dry_nowcast=False):
         'precipitation_pop', 'p_precip_gt1', 'p_precip_gt5',
         'p_gust_gt10', 'p_gust_gt17',
     ] + [c for c in corrected.columns
-         if (c.startswith('precipitation_q') or c.startswith('wind_speed_10m_q')
-             or c.startswith('wind_gusts_10m_q'))]
+         if (c.startswith('precipitation_q') or c.startswith('wind_gusts_10m_q'))]
     for col in shift_cols:
         if col in corrected.columns:
             corrected[col] = corrected[col].shift(-1)
+
+    # Boost after temporal alignment so instantaneous sustained wind is not
+    # moved one hour merely because it is coupled to a shower interval.
+    _apply_burst_wind_boost(corrected, fc)
 
     # weather_code MUST be recomputed AFTER the shift so it sees the shifted
     # precip (for "rain coming" decisions) AND the instantaneous cloud cover
@@ -6409,6 +7532,22 @@ def _daily_narrative(grp):
     }
 
 
+def _daily_model_rain_probability(raw_group):
+    """Daily NWP rain consensus using only models with data for that day."""
+    votes = []
+    for model_name in MODELS:
+        column = f'{model_name}_precipitation_model'
+        if column not in raw_group.columns:
+            continue
+        values = pd.to_numeric(raw_group[column], errors='coerce')
+        valid = values.notna()
+        if valid.any():
+            votes.append(bool((values[valid] > 0.1).any()))
+    if not votes:
+        return None
+    return round(sum(votes) / len(votes) * 100)
+
+
 def _build_daily_summary(date_str, day_name, grp_df, fc_raw=None):
     """Build a single daily summary dict from a group of hourly forecast rows.
     Uses _daily_narrative for icon/desc/narrative (unified, not split).
@@ -6434,7 +7573,9 @@ def _build_daily_summary(date_str, day_name, grp_df, fc_raw=None):
         ds['wind_max'] = round(float(wind.max()), 1)
     if gusts.notna().any():
         ds['gust_max'] = round(float(gusts.max()), 1)
-    ds['precip_total'] = round(float(precip.sum()), 1) if precip.notna().any() else 0
+    ds['precip_total'] = (
+        round(float(precip.sum()), 1) if precip.notna().any() else None
+    )
     if humid.notna().any():
         ds['humidity_avg'] = round(float(humid.mean()), 0)
     if pres.notna().any():
@@ -6478,12 +7619,9 @@ def _build_daily_summary(date_str, day_name, grp_df, fc_raw=None):
     if fc_raw is not None:
         raw_mask = fc_raw['datetime'].isin(grp_df['datetime'])
         raw_grp = fc_raw[raw_mask]
-        pcols = [f"{m}_precipitation_model" for m in MODELS
-                 if f"{m}_precipitation_model" in raw_grp.columns]
-        if pcols:
-            has_rain = [(pd.to_numeric(raw_grp[c], errors='coerce').fillna(0) > 0.1).any()
-                        for c in pcols]
-            ds['precip_probability'] = round(sum(has_rain) / len(has_rain) * 100)
+        rain_probability = _daily_model_rain_probability(raw_grp)
+        if rain_probability is not None:
+            ds['precip_probability'] = rain_probability
 
     return ds
 
@@ -6567,10 +7705,12 @@ def _gemini_narrative_daily(date_str, ds):
     tmax = ds.get('temp_max', '?')
     cloud = ds.get('cloud_cover_day', ds.get('cloud_cover_avg', '?'))
     precip = ds.get('precip_total', 0)
+    precip_text = 'nema podataka' if precip is None else f'{precip}mm'
     wind = ds.get('wind_max', '?')
-    pp = ds.get('precip_probability', 0)
+    pp = ds.get('precip_probability')
+    pp_text = 'nema podataka' if pp is None else f'{pp}%'
     summary = (f"Budva {date_str}: temp {tmin}-{tmax}°C, oblačnost {cloud}%, "
-               f"padavine {precip}mm (šansa {pp}%), vjetar do {wind}m/s.")
+               f"padavine {precip_text} (šansa {pp_text}), vjetar do {wind}m/s.")
     prompt = (
         f"{summary}\n\n"
         "Napiši JEDNU rečenicu (max 10 riječi) koja opisuje vremenske uslove.\n"
@@ -6854,7 +7994,7 @@ def generate_output(corrected, trained, results, fc_raw=None, marine=None, onset
                       "timezone": FORECAST_TIMEZONE,
                       "station": "ibudva5 (Weather Underground)"},
         "method": "XGBoost Multi-Model Ensemble + Historical Bias + Forecast Revision v3",
-        "description": "11 modela, 6 godina podataka (2020-2026), pametna korekcija + Day1/Day2 revizije",
+        "description": f"{len(MODELS)} modela, 6 godina podataka (2020-2026), pametna korekcija + Day1/Day2 revizije",
         "models": MODELS,
         "training_metrics": results,
         "daily_summary": daily,
@@ -6870,8 +8010,15 @@ def generate_output(corrected, trained, results, fc_raw=None, marine=None, onset
         output["precip_scenarios"] = precip_scenarios
 
     json_path = os.path.join(OUTPUT_DIR, "forecast_48h.json")
-    with open(json_path, 'w', encoding='utf-8') as f:
-        json.dump(output, f, indent=2, ensure_ascii=False)
+    json_tmp = json_path + '.tmp'
+    try:
+        with open(json_tmp, 'w', encoding='utf-8') as f:
+            # RFC 8259 JSON does not permit NaN/Infinity. Validate while writing
+            # a temporary file so a failure cannot truncate the prior forecast.
+            json.dump(output, f, indent=2, ensure_ascii=False, allow_nan=False)
+        os.replace(json_tmp, json_path)
+    finally:
+        _remove_if_exists(json_tmp)
     csv_path = os.path.join(OUTPUT_DIR, "forecast_48h.csv")
     corrected.to_csv(csv_path, index=False)
 
@@ -6886,7 +8033,9 @@ def generate_output(corrected, trained, results, fc_raw=None, marine=None, onset
         print(f"\n  {em} {d['day_name']} {d['date']}")
         print(f"     Temp: {d.get('temp_min', '?')}° — {d.get('temp_max', '?')}°C  |  Vlaznost: {d.get('humidity_avg', '?')}%")
         print(f"     Vjetar: do {d.get('wind_max', '?')} m/s (udari {d.get('gust_max', '?')} m/s)")
-        print(f"     Padavine: {d.get('precip_total', 0)} mm  |  Pritisak: {d.get('pressure_avg', '?')} hPa")
+        _daily_precip = d.get('precip_total')
+        _daily_precip_text = f"{_daily_precip} mm" if _daily_precip is not None else "N/A"
+        print(f"     Padavine: {_daily_precip_text}  |  Pritisak: {d.get('pressure_avg', '?')} hPa")
         print(f"     {d.get('day_narrative', d.get('weather_desc', ''))}")
 
     print("\n  " + "-" * 68)
@@ -6916,6 +8065,81 @@ def generate_output(corrected, trained, results, fc_raw=None, marine=None, onset
 
 
 if __name__ == "__main__":
+    _allowed_args = {
+        '--gpu', '--cpu', '--check-device', '--check_device',
+        '--skip-training', '--skip_training', '--dry-now', '--dry_now',
+        '--aux-diagnostics',
+    }
+    _backend_args = [arg for arg in sys.argv[1:]
+                     if arg.startswith('--check-backend=')]
+    _unknown_args = [arg for arg in sys.argv[1:]
+                     if arg not in _allowed_args
+                     and not arg.startswith('--check-backend=')]
+    if _unknown_args:
+        raise ValueError(f"Nepoznati argumenti: {_unknown_args}")
+    if len(_backend_args) > 1:
+        raise ValueError('Dozvoljen je samo jedan --check-backend argument')
+
+    def _exercise_backend(backend):
+        probe_rng = np.random.default_rng(42)
+        probe_X = probe_rng.normal(size=(512, 8)).astype(np.float32)
+        probe_y = (probe_X[:, 0] - 0.25 * probe_X[:, 1]).astype(np.float32)
+        if backend == 'xgboost':
+            model = _new_xgb_regressor(
+                n_estimators=1, max_depth=2, objective='reg:squarederror',
+                random_state=42, verbosity=0,
+            )
+            model.fit(probe_X, probe_y)
+            model.predict(probe_X[:4])
+        elif backend == 'catboost':
+            model = _new_catboost_regressor(
+                iterations=3, depth=3, learning_rate=0.1,
+                loss_function='MAE', bootstrap_type='Bernoulli',
+                subsample=0.8, random_seed=42, verbose=0,
+            )
+            model.fit(probe_X, probe_y)
+            _catboost_predict(model, probe_X[:4])
+        elif backend == 'lightgbm':
+            model = _new_lgbm_regressor(
+                n_estimators=3, max_depth=3, max_bin=63,
+                random_state=42, verbose=-1,
+            )
+            model.fit(probe_X, probe_y)
+            model.predict(probe_X[:4])
+        else:
+            raise ValueError(f'Nepoznat backend za provjeru: {backend}')
+
+    if _backend_args:
+        _backend = _backend_args[0].split('=', 1)[1].strip().lower()
+        _exercise_backend(_backend)
+        print(f"  BACKEND CHECK OK: {_backend} ({ML_DEVICE})")
+        sys.exit(0)
+
+    if '--check-device' in sys.argv or '--check_device' in sys.argv:
+        # Windows GPU runtimes can conflict during interpreter teardown when
+        # CUDA CatBoost and OpenCL LightGBM live in the same process. Probe each
+        # backend in an isolated child and require a clean process exit, not
+        # merely a successful fit/predict before a late native crash.
+        _device_flag = '--gpu' if USING_GPU else '--cpu'
+        sys.stdout.flush()
+        for _backend in ('xgboost', 'catboost', 'lightgbm'):
+            _completed = subprocess.run(
+                [sys.executable, os.path.abspath(__file__), _device_flag,
+                 f'--check-backend={_backend}'],
+                check=False,
+            )
+            if _completed.returncode != 0:
+                raise RuntimeError(
+                    f'{_backend} device probe exited with '
+                    f'code {_completed.returncode}'
+                )
+
+        print("\n  DEVICE CHECK OK")
+        print(f"  XGBoost:  {ML_DEVICE} (fit + predict passed)")
+        print(f"  CatBoost: {CATBOOST_DEVICE_PARAMS['task_type']} (fit + predict passed)")
+        print(f"  LightGBM: {LIGHTGBM_DEVICE_PARAMS['device_type']} (fit + predict passed)")
+        sys.exit(0)
+
     skip_training = '--skip-training' in sys.argv or '--skip_training' in sys.argv
     local_dry_nowcast = '--dry-now' in sys.argv or '--dry_now' in sys.argv
 
@@ -6940,14 +8164,16 @@ if __name__ == "__main__":
         bt_serializable = {}
         for k, v in bias_tables.items():
             bt_serializable[k] = v.to_dict(orient='records')
-        with open(bias_path, 'w') as f:
-            json.dump(bt_serializable, f)
+        _write_json_atomic(bias_path, bt_serializable)
         print(f"  Bias tabele: {bias_path}")
 
         trained, results = train_all_models(hist, lead_frames=lead_frames)
         try:
             onset_bundle = train_onset_model(hist)
         except Exception as _e:
+            _invalidate_onset_artifacts()
+            if _DEVICE_REQUEST == 'cuda':
+                raise
             print(f"  [Onset] trening preskočen ({_e})")
             onset_bundle = None
 
@@ -6975,7 +8201,20 @@ if __name__ == "__main__":
         # existing hourly/precip display. Best-effort: never breaks the forecast.
         onset_info = None
         try:
-            _fc_feat = engineer_features(apply_bias_features(fc_all.copy(), bias_tables))
+            _fc_onset = apply_bias_features(fc_all.copy(), bias_tables)
+            _onset_now = local_now().floor('h')
+            _fc_onset['lead_time'] = (
+                (pd.to_datetime(_fc_onset['datetime']) - _onset_now)
+                .dt.total_seconds() / 3600.0
+            ).clip(lower=0.0, upper=72.0)
+            _fc_feat = _align_onset_features_to_display(
+                engineer_features(_fc_onset)
+            )
+            if 'precipitation_xgb' in corrected.columns:
+                _state_by_time = corrected.set_index('datetime')['precipitation_xgb']
+                _fc_feat['_onset_state_precip'] = pd.to_datetime(
+                    _fc_feat['datetime']
+                ).map(_state_by_time)
             onset_info = predict_onset_timing(_fc_feat, onset_bundle)
             if onset_info and onset_info.get('declared'):
                 if onset_info.get('already_raining'):
@@ -6985,6 +8224,8 @@ if __name__ == "__main__":
                           f"(najranije {onset_info.get('earliest_datetime')}, "
                           f"najkasnije {onset_info.get('latest_datetime')}).")
         except Exception as _e:
+            if _DEVICE_REQUEST == 'cuda':
+                raise
             print(f"  [Onset] preskočen ({_e})")
             onset_info = None
     except TrustedRainGateError as e:

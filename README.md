@@ -1,7 +1,7 @@
 # Budva ML Weather Forecast pipeline
 
 Korigovana 48-satna i 7-dnevna prognoza za Budvu. Pipeline preuzima sirove
-prognoze sa 11 globalnih NWP modela, uči njihov bias na 6 godina lokalnih
+prognoze sa 10 globalnih NWP modela, uči njihov bias na 6 godina lokalnih
 mjerenja i objavljuje JSON koji pokreće web stranicu.
 
 ## Kako radi
@@ -9,11 +9,12 @@ mjerenja i objavljuje JSON koji pokreće web stranicu.
 1. **Historijski podaci** — satne prognoze (2020–2026) sa Open-Meteo API-ja,
    uparene sa mjerenjima sa [IBUDVA5](https://www.wunderground.com/dashboard/pws/IBUDVA5)
    Weather Underground stanice.
-2. **Trening** — XGBoost, CatBoost i LightGBM uče bias svakog NWP modela za
-   temperaturu, vlažnost, vjetar, pritisak, oblačnost i padavine; Ridge
-   stacking kombinuje korekcije. Za padavine: focal loss, izotonička
-   kalibracija i precision-first prag, uz kvantilne modele (CQR) za
-   distribucionu prognozu.
+2. **Trening** — produkcione korekcije koriste XGBoost direct/residual/MSE
+   modele i validaciono izabran blend. LightGBM trenira kvantilne modele (CQR).
+   Za padavine se koriste focal loss, izotonička kalibracija i precision-first
+   prag na odvojenim hronološkim blokovima. CatBoost, dodatni LightGBM i Ridge
+   meta-model dostupni su kao eksplicitna dijagnostika, ali nijesu kandidati za
+   produkciju dok Ridge ne dobije temporalne OOF predikcije.
 3. **Live prognoza** — GitHub Actions pokreće pipeline na svakih 5 sati
    (`--skip-training`): preuzme najnovije prognoze, primijeni korekciju i
    generiše `forecast_48h.json`. SKALA radar nowcast (poseban budva-radar
@@ -35,7 +36,6 @@ mjerenja i objavljuje JSON koji pokreće web stranicu.
 | ECMWF IFS 0.25° | ~25 km |
 | ItaliaMeteo ICON-2I | ~2.2 km |
 | UKMO Seamless | ~10 km |
-| BOM ACCESS | ~12 km |
 | ECMWF IFS | ~9 km |
 | KNMI Seamless | ~11 km |
 | DMI Seamless | ~13 km |
@@ -67,11 +67,48 @@ pip install -r requirements.txt
 python forecast_48h_v3.py                  # puni pipeline (trening + prognoza)
 python forecast_48h_v3.py --skip-training  # samo prognoza, postojeći modeli
 
+# opciono: skupi CatBoost/LightGBM/Ridge dijagnostički kandidati
+python forecast_48h_v3.py --gpu --aux-diagnostics
+
 python test_gemini_narrative.py            # testovi guardrail-a
 python test_narrative_variants.py
 
 node test_nowcast_hourly.js                # SKALA NOWCAST gating u docs/forecast.html
 ```
+
+## GPU trening
+
+Pipeline automatski koristi NVIDIA CUDA GPU kada ga XGBoost može stvarno
+koristiti. `--gpu` uključuje fail-fast režim: proces se prekida umjesto da
+neprimjetno nastavi na CPU-u.
+
+```powershell
+# Brza provjera (fit + predict za XGBoost, CatBoost i LightGBM)
+python forecast_48h_v3.py --gpu --check-device
+
+# Puni trening na GPU-u
+python forecast_48h_v3.py --gpu
+
+# Eksplicitni CPU fallback
+python forecast_48h_v3.py --cpu
+```
+
+Isto se može podesiti varijablama `FC_DEVICE=auto|cuda|cpu` i `FC_GPU_ID=0`.
+Na računarima sa više OpenCL platformi LightGBM se može odvojeno usmjeriti sa
+`FC_LGB_GPU_PLATFORM_ID` i `FC_LGB_GPU_DEVICE_ID`.
+XGBoost koristi CUDA, CatBoost koristi svoj CUDA backend, a LightGBM na Windowsu
+koristi GPU preko OpenCL-a. Pandas feature engineering, Optuna orchestration i
+kalibracija ostaju na CPU-u; focal-loss gradijenti su NumPy/CPU dok se XGBoost
+stabla grade na GPU-u. Skupa pomoćna dijagnostika je podrazumijevano isključena;
+uključuje se sa `--aux-diagnostics` ili `FC_AUX_DIAGNOSTICS=1`. GitHub-hosted
+`ubuntu-latest` job ostaje CPU-only i pokreće samo `--skip-training`; modeli
+trenirani lokalno na GPU-u mogu se normalno učitati tamo.
+
+Puni retraining zahtijeva `wu_data/merged_observations.csv`. Canonical WU tabela
+zamjenjuje stale observation kolone iz modelskih CSV fajlova (uključujući stari
+mean-gust bug), a godišnji rain-label QA prekida trening ako coverage ili odnos
+suvih/kišnih sati izgleda neispravno. NaN u canonical tabeli ostaje nepoznat —
+nikad se ne pretvara automatski u suvi sat.
 
 Output ide u `forecast_output/forecast_48h.json`; GitHub Actions ga kopira u
 `docs/forecast_data/`. Gemini narativ traži `GEMINI_API_KEY` u okruženju;
@@ -79,7 +116,7 @@ bez ključa pipeline koristi pravilo-bazirane rečenice.
 
 ## Šansa za padavine
 
-`precip_probability` na dnevnoj kartici je procenat NWP modela (od 11) koji
+`precip_probability` na dnevnoj kartici je procenat NWP modela (od 10) koji
 predviđaju >0.1 mm u bilo kom satu tog dana — consensus metrika. Satna
 kalibrisana PoP (izotonička kalibracija + prag) i kvantilna traka postoje
 kao poseban sloj u JSON-u kad su modeli trenirani.

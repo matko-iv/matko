@@ -26,28 +26,38 @@ DEFAULT_ALPHAS = (0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95)
 # Verification statistics.
 
 def dm_test_hln(loss_a, loss_b, h=24):
-    """Diebold–Mariano test with HAC (uniform-kernel) variance over h-1 lags and
+    """Diebold–Mariano test with Bartlett/Newey-West HAC variance over h-1 lags and
     the Harvey–Leybourne–Newbold small-sample correction.
 
     loss_a/loss_b: per-time losses of the two systems on the SAME cases.
     Returns (dm_stat, p_value). dm_stat < 0 -> system A has lower loss.
     """
     d = np.asarray(loss_a, dtype=float) - np.asarray(loss_b, dtype=float)
-    d = d[~np.isnan(d)]
+    d = d[np.isfinite(d)]
     n = len(d)
     if n < 10:
         return np.nan, np.nan
     dbar = d.mean()
     dc = d - dbar
     gamma0 = np.mean(dc * dc)
+    # Newey-West / Bartlett HAC weights keep distant, noisy autocovariances
+    # from dominating the variance estimate (the former uniform kernel could
+    # produce a negative variance and then an enormous fabricated DM score).
+    max_lag = min(max(int(h) - 1, 0), n - 1)
     var = gamma0
-    for k in range(1, min(h, n - 1)):
+    for k in range(1, max_lag + 1):
         gk = np.mean(dc[k:] * dc[:-k])
-        var += 2.0 * gk
-    var = max(var, 1e-12) / n
+        var += 2.0 * (1.0 - k / (max_lag + 1.0)) * gk
+    if not np.isfinite(var) or var <= 1e-12:
+        return np.nan, np.nan
+    var /= n
     dm = dbar / np.sqrt(var)
     # HLN correction
-    hln = np.sqrt(max((n + 1 - 2 * h + h * (h - 1) / n) / n, 1e-12))
+    h_eff = min(max(int(h), 1), n - 1)
+    correction = (n + 1 - 2 * h_eff + h_eff * (h_eff - 1) / n) / n
+    if correction <= 0:
+        return np.nan, np.nan
+    hln = np.sqrt(correction)
     dm_c = dm * hln
     p = 2 * stats.t.sf(abs(dm_c), df=n - 1)
     return float(dm_c), float(p)
@@ -266,33 +276,80 @@ def predict_quantiles(models, X, offsets=None, lower_bound=None):
 
 def cqr_calibrate(models, X_cal, y_cal,
                   pairs=((0.05, 0.95), (0.10, 0.90), (0.25, 0.75))):
-    """Conformalized Quantile Regression (Romano et al. 2019): per interval pair,
-    the (1-alpha_mis)(1+1/n) empirical quantile of s = max(q_lo - y, y - q_hi).
-    Returns {(lo, hi): offset}."""
-    y = np.asarray(y_cal, dtype=float)
+    """Calibrate CQR intervals with a split-conformal finite-sample quantile.
+
+    For nominal coverage ``hi - lo``, the offset is the empirical quantile of
+    ``max(q_lo - y, y - q_hi)`` at
+    ``ceil((n + 1) * coverage) / n``, capped at one and selected with NumPy's
+    conservative ``method='higher'`` rule.  A negative offset is intentional:
+    standard CQR can shrink an over-wide base interval as well as expand an
+    under-covering one.  Returns ``{(lo, hi): offset}``.
+    """
+    y = np.asarray(y_cal, dtype=float).reshape(-1)
     offsets = {}
     for lo, hi in pairs:
-        q_lo = models[lo].predict(X_cal)
-        q_hi = models[hi].predict(X_cal)
+        if not (0.0 <= lo < hi <= 1.0):
+            raise ValueError(f"Invalid CQR quantile pair ({lo}, {hi})")
+        q_lo = np.asarray(models[lo].predict(X_cal), dtype=float).reshape(-1)
+        q_hi = np.asarray(models[hi].predict(X_cal), dtype=float).reshape(-1)
+        if q_lo.shape != y.shape or q_hi.shape != y.shape:
+            raise ValueError("CQR predictions and calibration targets must have equal length")
         s = np.maximum(q_lo - y, y - q_hi)
-        s = s[~np.isnan(s)]
+        s = s[np.isfinite(s)]
         n = len(s)
-        if n < 50:
+        if n == 0:
             offsets[(lo, hi)] = 0.0
             continue
-        alpha_mis = 1.0 - (hi - lo)
-        level = min((1 - alpha_mis) * (1 + 1.0 / n), 1.0)
-        offsets[(lo, hi)] = float(np.quantile(s, level))
+        coverage = hi - lo
+        level = min(np.ceil((n + 1) * coverage) / n, 1.0)
+        offsets[(lo, hi)] = float(np.quantile(s, level, method='higher'))
     return offsets
 
 
 def crps_from_quantiles(y, qdf, alphas=DEFAULT_ALPHAS):
-    """Mean-pinball CRPS approximation: CRPS ≈ 2 * mean_alpha pinball_alpha."""
-    losses = []
-    for a in alphas:
-        col = f"q{int(round(a * 100)):02d}"
-        losses.append(pinball_loss(y, qdf[col].values, a))
-    return 2.0 * float(np.mean(losses))
+    """Approximate mean CRPS by integrating pinball loss over quantile level.
+
+    The supplied (possibly nonuniform) alpha grid is integrated case-by-case
+    with the trapezoidal rule.  Outside the supplied grid, the lowest and
+    highest predicted quantiles are held constant to alpha 0 and 1; endpoint
+    pinball losses are evaluated under that explicit finite-tail convention.
+    Rows missing the target or any requested quantile are excluded.
+    """
+    alphas = np.asarray(alphas, dtype=float)
+    if alphas.ndim != 1 or alphas.size == 0:
+        raise ValueError("alphas must be a non-empty one-dimensional sequence")
+    if not np.isfinite(alphas).all() or np.any((alphas <= 0.0) | (alphas >= 1.0)):
+        raise ValueError("alphas must be finite and strictly between 0 and 1")
+    order = np.argsort(alphas)
+    alphas = alphas[order]
+    if np.any(np.diff(alphas) <= 0.0):
+        raise ValueError("alphas must be unique")
+
+    y = np.asarray(y, dtype=float).reshape(-1)
+    cols = [f"q{int(round(a * 100)):02d}" for a in alphas]
+    if len(set(cols)) != len(cols):
+        raise ValueError("alphas must map to distinct quantile column names")
+    q = qdf[cols].to_numpy(dtype=float)
+    if q.shape[0] != y.size:
+        raise ValueError("Quantile predictions and targets must have equal length")
+    valid = np.isfinite(y) & np.isfinite(q).all(axis=1)
+    if not valid.any():
+        return np.nan
+
+    yy = y[valid, None]
+    q = q[valid]
+    diff = yy - q
+    losses = np.maximum(alphas[None, :] * diff,
+                        (alphas[None, :] - 1.0) * diff)
+
+    # Constant-quantile extrapolation supplies the otherwise unobserved tails:
+    # rho_0(y - q_min) on the left and rho_1(y - q_max) on the right.
+    left_loss = np.maximum(q[:, 0] - yy[:, 0], 0.0)
+    right_loss = np.maximum(yy[:, 0] - q[:, -1], 0.0)
+    grid = np.concatenate(([0.0], alphas, [1.0]))
+    losses = np.column_stack((left_loss, losses, right_loss))
+    case_crps = 2.0 * np.trapezoid(losses, grid, axis=1)
+    return float(np.mean(case_crps))
 
 
 def exceedance_from_quantiles(qdf, alphas, threshold):
@@ -311,7 +368,26 @@ def exceedance_from_quantiles(qdf, alphas, threshold):
         if threshold < v[0]:
             cdf = alphas[0] * (threshold / v[0] if v[0] > 0 else 1.0)
         elif threshold >= v[-1]:
-            cdf = alphas[-1]
+            # Exponential upper-tail extrapolation anchored by the last two
+            # quantiles. A flat CDF above q95 incorrectly returned exactly 5%
+            # exceedance for every larger threshold, however extreme.
+            tail_last = 1.0 - alphas[-1]
+            if threshold == v[-1]:
+                out[i] = tail_last
+                continue
+            # Repeated upper quantiles are common for zero-inflated targets.
+            # Anchor to the nearest *distinct* lower quantile so the survival
+            # curve stays continuous instead of dropping 5% -> 0 immediately.
+            distinct = np.flatnonzero(v[:-1] < v[-1])
+            previous = int(distinct[-1]) if distinct.size else -1
+            width = v[-1] - v[previous] if previous >= 0 else 0.0
+            tail_prev = 1.0 - alphas[previous] if previous >= 0 else tail_last
+            if width > 0 and tail_prev > tail_last > 0:
+                scale = width / np.log(tail_prev / tail_last)
+                out[i] = float(tail_last * np.exp(-(threshold - v[-1]) / scale))
+            else:
+                out[i] = 0.0
+            continue
         else:
             below = v <= threshold
             k = int(np.max(np.nonzero(below)))

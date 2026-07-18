@@ -914,9 +914,13 @@
     </div>
 
     <h1>Matkov model v4</h1>
-	
+
 	<p>
         <a href="index.html">Poruka autora</a>
+    </p>
+
+	<p>
+        <b>POZOR!</b> Sljedeće verzije ovog modela bazirane su na treniranju na CUDA arhitekturi, te će zahtijevati RTX grafičku kartu 2080 ili noviju. Ovo ubrzava ponovno treniranje modela i omogućava opsežniju optimizaciju i kalibraciju. Bez obzira na to, trenutni live i stariji modeli će biti arhivirani i dostupni za instalaciju.
     </p>
 
     <p>
@@ -2535,7 +2539,7 @@ function render(data) {
             </div>
             <div class="day-details">
                 <div class="detail-item">${weatherIcon('wind', 30)}<span class="detail-val">${d.wind_max} m/s${wdText}</span></div>
-                <div class="detail-item">${weatherIcon('rain_icon', 30)}<span class="detail-val">${d.precip_total} mm</span></div>
+                <div class="detail-item">${weatherIcon('rain_icon', 30)}<span class="detail-val">${d.precip_total != null ? d.precip_total + ' mm' : 'N/A'}</span></div>
                 <div class="detail-item"><img src="${ICON_CDN}humidity.svg" width="30" height="30" alt="" style="vertical-align:middle" loading="lazy"><span class="detail-val">${d.humidity_avg}%</span></div>
                 <div class="detail-item"><img src="${ICON_CDN}barometer.svg" width="30" height="30" alt="" style="vertical-align:middle" loading="lazy"><span class="detail-val">${d.pressure_avg} hPa</span></div>
                 ${sstByDate[d.date] != null ? '<div class="detail-item" title="Temperatura mora"><span style="font-size:24px;line-height:30px;vertical-align:middle">\u{1F30A}</span><span class="detail-val">' + sstByDate[d.date].toFixed(1) + '°C</span></div>' : ''}
