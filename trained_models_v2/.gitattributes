@@ -1,0 +1,6 @@
+# Model artifacts must NOT get line-ending conversion. With core.autocrlf=true,
+# git was rewriting these LightGBM text-model files (.txt) with CRLF on checkout,
+# which breaks LightGBM's parser: "Model format error, expect a tree here."
+# Treat them as binary so LF is preserved verbatim.
+*.txt   -text
+*.joblib -text
