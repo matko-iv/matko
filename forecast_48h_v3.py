@@ -6074,6 +6074,41 @@ def douglas_sea_state(m):
     return 9
 
 
+# Bečići faces the open sea to the S/SW; only two winds raise real waves here.
+# Jugo (E-SE-S, long Adriatic fetch) brings the big, long-period waves; bura
+# (NE, short fetch off the mountains) brings short, sharp chop that stays
+# small. Wave directions from N or W come off the land, so anything the
+# 5.5 km wave model puts there is a grid artifact — the displayed sea state
+# is capped per direction sector (upper bound in degrees, waves-FROM):
+_SEA_STATE_DIRECTION_CAPS = [
+    (22.5, 2),    # N: off the land            -> max "Blagi talasi"
+    (90.0, 4),    # NE (bura): short chop      -> max "Talasasto"
+    (240.0, 9),   # E-SE-S-SW (jugo fetch)     -> full Douglas scale
+    (337.5, 2),   # W-NW: off the land         -> max "Blagi talasi"
+    (360.0, 2),   # wraps back into N
+]
+
+
+def sea_state_direction_cap(direction_deg):
+    """Highest Douglas state a wave from this direction can deliver at Bečići.
+    Mirrored client-side in docs/forecast.html (adriaticSeaState)."""
+    if direction_deg is None or pd.isna(direction_deg):
+        return 9
+    d = float(direction_deg) % 360
+    for upper, cap in _SEA_STATE_DIRECTION_CAPS:
+        if d < upper:
+            return cap
+    return 2
+
+
+def adriatic_sea_state(height_m, direction_deg):
+    """Douglas state from height, capped by what the direction can deliver."""
+    sea = douglas_sea_state(height_m)
+    if sea is None:
+        return None
+    return min(sea, sea_state_direction_cap(direction_deg))
+
+
 def cg_wind_name(direction_deg, speed_ms):
     """Adriatic-specific wind name from direction + speed."""
     if direction_deg is None or pd.isna(direction_deg):
@@ -6100,16 +6135,19 @@ def cg_wind_name(direction_deg, speed_ms):
 
 
 def sailing_score(bft, wave_height):
-    """Traffic-light + label for sailing comfort."""
+    """Traffic-light + label for sailing comfort. Deliberately strict: the
+    audience is small boats and swimmers at Bečići, not offshore keelboats,
+    so Bft 4 already drops to "Prihvatljivo" and Bft 6+ or >1.8 m is
+    "Opasno"."""
     if bft is None or wave_height is None:
         return ("gray", "N/A")
-    if bft <= 3 and wave_height <= 0.5:
+    if bft <= 2 and wave_height <= 0.3:
         return ("green", "Idealno")
-    if bft <= 4 and wave_height <= 1.0:
+    if bft <= 3 and wave_height <= 0.6:
         return ("green", "Dobro")
-    if bft <= 5 and wave_height <= 1.5:
+    if bft <= 4 and wave_height <= 1.0:
         return ("yellow", "Prihvatljivo")
-    if bft <= 6 and wave_height <= 2.5:
+    if bft <= 5 and wave_height <= 1.8:
         return ("orange", "Oprez")
     return ("red", "Opasno")
 
@@ -6348,7 +6386,7 @@ def _build_wave_block(waves_df):
         sw_h = row.get('swell_wave_height_mean')
         sw_p = row.get('swell_wave_period_mean')
         sst = row.get('sea_surface_temperature_mean')
-        sea = douglas_sea_state(wh)
+        sea = adriatic_sea_state(wh, wd)
         hourly.append({
             "datetime": row['datetime'].isoformat(),
             "hour": int(row['datetime'].hour),
@@ -6368,15 +6406,23 @@ def _build_wave_block(waves_df):
     df['_date'] = df['datetime'].dt.strftime('%Y-%m-%d')
     daily = []
     for date_str, grp in df.groupby('_date', sort=True):
-        wh_max = pd.to_numeric(grp.get('wave_height_mean', pd.Series()), errors='coerce').max()
+        wh_series = pd.to_numeric(grp.get('wave_height_mean', pd.Series()), errors='coerce')
+        wh_max = wh_series.max()
         wp_max = pd.to_numeric(grp.get('wave_period_mean', pd.Series()), errors='coerce').max()
         sst_avg = pd.to_numeric(grp.get('sea_surface_temperature_mean', pd.Series()), errors='coerce').mean()
-        sea_max = douglas_sea_state(wh_max) if pd.notna(wh_max) else None
+        # Direction at the hour of the daily maximum, so the direction cap
+        # judges the same wave the label describes.
+        wd_at_max = None
+        if wh_series.notna().any() and 'wave_direction_mean' in grp.columns:
+            wd_at_max = pd.to_numeric(
+                grp['wave_direction_mean'], errors='coerce').get(wh_series.idxmax())
+        sea_max = adriatic_sea_state(wh_max, wd_at_max) if pd.notna(wh_max) else None
         daily.append({
             "date": date_str,
             "day_name": pd.Timestamp(date_str).strftime('%A'),
             "wave_height_max": round(float(wh_max), 2) if pd.notna(wh_max) else None,
             "wave_period_max": round(float(wp_max), 1) if pd.notna(wp_max) else None,
+            "wave_dir_at_max": round(float(wd_at_max), 0) if wd_at_max is not None and pd.notna(wd_at_max) else None,
             "sst_avg": round(float(sst_avg), 1) if pd.notna(sst_avg) else None,
             "sea_state_max": sea_max,
             "sea_state_label": DOUGLAS_LABELS.get(sea_max, "") if sea_max is not None else "",
@@ -6495,7 +6541,10 @@ def build_marine_output(marine_results):
             "Talasi su modelirani na rezoluciji od 5.5km, pa pokazujemo jednu vrijednost "
             "za cijelu pomorsku zonu Budve (Bečićka plaža i otvoreno more dijele istu "
             "prognozu). Vjetar je precizniji (~2 km rezolucija) i razlikuje se "
-            "između zaliva i otvorenog mora."
+            "između zaliva i otvorenog mora. Stanje mora uzima u obzir i smjer talasa: "
+            "velike talase u Bečićima donosi samo jugo (JI–J), bura (SI) pravi kratke i "
+            "oštre ali manje talase, a smjerovi sa kopna (S, Z) ne mogu dati više od "
+            "blagih talasa."
         ),
         "wave_location": {
             "lat": MARINE_WAVE_LOCATION['lat'],
@@ -7410,7 +7459,9 @@ def _daily_narrative(grp):
             parts.append(nv.variant("thunder_unstable", _seed))
         if total_precip >= 5:
             parts[0] += f" ({total_precip:.0f} mm)"
-    elif total_precip > 0.2:
+    # Any hour with measurable rain must surface in the narrative — even a
+    # 2-hour shower on an otherwise fine day gets its note.
+    elif total_precip > 0.2 or rain_hours_total >= 1:
         precip_str = f" ({total_precip:.1f} mm)" if total_precip >= 1 else ""
         if rain_m and rain_a and rain_e:
             if total_precip >= 15:
@@ -7582,6 +7633,9 @@ def _build_daily_summary(date_str, day_name, grp_df, fc_raw=None):
     ds['precip_total'] = (
         round(float(precip.sum()), 1) if precip.notna().any() else None
     )
+    # Hours with measurable rain — drives the "must mention rain" guarantee
+    # in the narrative and in gemini_narrative.validate().
+    ds['rain_hours'] = int((precip > 0.1).sum()) if precip.notna().any() else 0
     if humid.notna().any():
         ds['humidity_avg'] = round(float(humid.mean()), 0)
     if pres.notna().any():

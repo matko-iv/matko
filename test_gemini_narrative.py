@@ -65,6 +65,19 @@ def test_lenient_sun_plus_rain_not_false_rejected():
     assert gn.validate("Sunčano ujutru, kiša od podneva", ds) is True
 
 
+def test_rejects_rephrase_that_drops_supported_rain():
+    # A 5 mm day whose candidate reads as dry weather must not ship.
+    assert gn.validate("Pretežno oblačno tokom dana", RAINY) is False
+
+
+def test_short_shower_must_still_be_mentioned():
+    # Two rain hours and 0.4 mm on an otherwise sunny day: the note stays.
+    ds = {"precip_total": 0.4, "rain_hours": 2, "weather_code": 61,
+          "wind_max": 3.0, "gust_max": 5.0, "cloud_cover_day": 40}
+    assert gn.validate("Sunčano i toplo tokom dana", ds) is False
+    assert gn.validate("Sunčano, kratka kiša popodne", ds) is True
+
+
 def test_rejects_phantom_strong_wind():
     assert gn.validate("Jak vjetar tokom dana", DRY) is False
 

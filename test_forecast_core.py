@@ -365,5 +365,52 @@ class ForecastCoreTests(unittest.TestCase):
         self.assertTrue(np.isnan(cancelling))
 
 
+class MarineLogicTests(unittest.TestCase):
+    def test_direction_capped_sea_state(self):
+        # Jugo (SE) keeps the full Douglas scale.
+        self.assertEqual(fc.adriatic_sea_state(2.0, 140.0), 4)
+        # Bura (NE) chop never rates above "Talasasto" regardless of height.
+        self.assertEqual(fc.adriatic_sea_state(3.0, 45.0), 4)
+        # Waves "from" N or W come off the land: capped at "Blagi talasi",
+        # so 0.8 m from those sectors can no longer show "Umjereni talasi".
+        self.assertEqual(fc.adriatic_sea_state(0.8, 0.0), 2)
+        self.assertEqual(fc.adriatic_sea_state(0.8, 270.0), 2)
+        self.assertEqual(fc.adriatic_sea_state(0.8, 350.0), 2)
+        # Unknown direction leaves the plain Douglas state; no height -> None.
+        self.assertEqual(fc.adriatic_sea_state(0.8, None), 3)
+        self.assertIsNone(fc.adriatic_sea_state(None, 140.0))
+
+    def test_sailing_score_is_strict(self):
+        self.assertEqual(fc.sailing_score(2, 0.2), ("green", "Idealno"))
+        self.assertEqual(fc.sailing_score(3, 0.5), ("green", "Dobro"))
+        # Bft 4 or a metre of wave is no longer "Dobro".
+        self.assertEqual(fc.sailing_score(4, 0.8), ("yellow", "Prihvatljivo"))
+        self.assertEqual(fc.sailing_score(5, 1.5), ("orange", "Oprez"))
+        self.assertEqual(fc.sailing_score(6, 1.0), ("red", "Opasno"))
+        self.assertEqual(fc.sailing_score(3, 2.0), ("red", "Opasno"))
+        self.assertEqual(fc.sailing_score(None, 1.0), ("gray", "N/A"))
+
+    def test_daily_narrative_mentions_short_rain(self):
+        # A clear summer day with a single 0.15 mm shower hour (total 0.2 mm,
+        # below the old 0.2 mm gate) must still carry the rain note.
+        precip = [0.0] * 24
+        precip[14] = 0.15
+        precip[15] = 0.05
+        grp = pd.DataFrame({
+            'hour': list(range(24)),
+            'cloud_cover': [20.0] * 24,
+            'precipitation': precip,
+            'wind_speed_10m': [3.0] * 24,
+            'wind_gusts_10m': [5.0] * 24,
+            'temperature_2m': [26.0] * 24,
+            'weather_code': [1.0] * 24,
+            'wind_direction_10m': [180.0] * 24,
+        })
+        narrative = fc._daily_narrative(grp)['narrative'].lower()
+        self.assertTrue(
+            any(tok in narrative for tok in ('kiš', 'pljus', 'padavin')),
+            narrative)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

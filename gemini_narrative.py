@@ -69,6 +69,19 @@ _PHANTOM = {
 # "jaka kiša, slab vjetar" is not mis-flagged.
 _STRONG_WIND_RE = re.compile(r"jak\w*\s+(?:\w+\s+)?vjet|oluj|orkan|udar")
 
+# Precipitation the data DOES have must not be dropped either: a candidate
+# that reads as a dry forecast on a day with measurable rain is as wrong as
+# a phantom shower. Any of these stems counts as a mention.
+_PRECIP_MENTION_TOKENS = ("kiš", "pljus", "padavin", "grmljav", "nevrijeme",
+                          "snij", "snjež", "susnježic")
+
+
+def _requires_precip_mention(ds):
+    """True when the day has enough rain that omitting it is misleading —
+    matches the rule-based narrative's own mention threshold."""
+    return (_num(ds, "precip_total") > 0.2
+            or _num(ds, "rain_hours") >= 1)
+
 
 def validate(text, ds):
     """True iff `text` is a faithful rephrase: no phantom rain/thunder/snow/
@@ -83,6 +96,10 @@ def validate(text, ds):
     for token, supported in _PHANTOM.items():
         if token in t and not supported(ds):
             return False
+
+    if _requires_precip_mention(ds) and not any(
+            tok in t for tok in _PRECIP_MENTION_TOKENS):
+        return False
 
     if _STRONG_WIND_RE.search(t):
         if not (_num(ds, "wind_max") >= STRONG_WIND_MS
@@ -216,7 +233,7 @@ def generate(date_str, hourly_rows, wmo_codes, *, api_key=None, timeout=15, retr
     prompt = (
         f"Satni podaci za Budvu, {date_str} (sat  ikonica  temp  vlažnost  vjetar_m/s  pritisak_hPa  oblačnost  padavine_mm):\n"
         f"{hourly_text}\n\n"
-        "Na osnovu ovih satnih podataka za Budvu, napiši kratak izvještaj.\n\nPravila:\n1. Maksimalno 6-7 riječi.\n2. Fokusiraj se na glavnu promjenu vremena (npr. prelaz iz oblačnog u sunčano).\n3. Navedi doba dana kada se promjena dešava.\n4.Ako nema kiše ili vjetra, ne spominji ih."
+        "Na osnovu ovih satnih podataka za Budvu, napiši kratak izvještaj.\n\nPravila:\n1. Maksimalno 6-7 riječi.\n2. Fokusiraj se na glavnu promjenu vremena (npr. prelaz iz oblačnog u sunčano).\n3. Navedi doba dana kada se promjena dešava.\n4.Ako nema kiše ili vjetra, ne spominji ih.\n5. Ako podaci pokazuju kišu u bilo kom satu, OBAVEZNO je pomeni, makar kratko (npr. \"kratka kiša popodne\")."
     )
 
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
