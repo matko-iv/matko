@@ -7683,6 +7683,25 @@ def _build_daily_summary(date_str, day_name, grp_df, fc_raw=None):
         if rain_probability is not None:
             ds['precip_probability'] = rain_probability
 
+        # Median of per-model daily maxima. The multi-model ensemble MEAN
+        # wipes out hourly peaks (models disagree on timing), so beyond 48h
+        # every day's wind_max collapses to 1-2 m/s and reads "slab". The
+        # median of each model's own daily max keeps a realistic peak.
+        # Consumed (then dropped) for long-range days only — see the
+        # daily/long_range split.
+        for var, key in (('wind_speed_10m', 'wind_max_models'),
+                         ('wind_gusts_10m', 'gust_max_models')):
+            maxima = []
+            for model_name in MODELS:
+                column = f'{model_name}_{var}_model'
+                if column not in raw_grp.columns:
+                    continue
+                values = pd.to_numeric(raw_grp[column], errors='coerce')
+                if values.notna().any():
+                    maxima.append(float(values.max()))
+            if maxima:
+                ds[key] = round(float(np.median(maxima)), 1)
+
     return ds
 
 
@@ -8007,6 +8026,20 @@ def generate_output(corrected, trained, results, fc_raw=None, marine=None, onset
             daily.append(ds)
         else:
             long_range.append(ds)
+
+    # Long-range days: floor the smoothed daily wind peaks with the model
+    # consensus so the cards stop labeling every day "slab". Within 48h the
+    # calibrated XGB wind stays authoritative; the helper fields never ship.
+    for ds in long_range:
+        if ds.get('wind_max_models') is not None:
+            ds['wind_max'] = round(max(ds.get('wind_max') or 0.0,
+                                       ds['wind_max_models']), 1)
+        if ds.get('gust_max_models') is not None:
+            ds['gust_max'] = round(max(ds.get('gust_max') or 0.0,
+                                       ds['gust_max_models']), 1)
+    for ds in daily + long_range:
+        ds.pop('wind_max_models', None)
+        ds.pop('gust_max_models', None)
 
     if long_range:
         print(f"  Long range: {len(long_range)} dana")

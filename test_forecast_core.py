@@ -390,6 +390,34 @@ class MarineLogicTests(unittest.TestCase):
         self.assertEqual(fc.sailing_score(3, 2.0), ("red", "Opasno"))
         self.assertEqual(fc.sailing_score(None, 1.0), ("gray", "N/A"))
 
+    def test_daily_wind_consensus_keeps_model_peaks(self):
+        # Ensemble-mean wind flattens to ~1.5 m/s, but each model's own daily
+        # max is 4 and 6: the consensus field must carry their median so
+        # long-range days stop all reading "slab".
+        dts = pd.date_range('2026-07-25', periods=24, freq='h')
+        grp = pd.DataFrame({
+            'datetime': dts,
+            'hour': list(range(24)),
+            'temperature_2m_ensemble': [25.0] * 24,
+            'wind_speed_10m_ensemble': [1.5] * 24,
+            'wind_gusts_10m_ensemble': [3.0] * 24,
+            'precipitation_ensemble': [0.0] * 24,
+            'relative_humidity_2m_ensemble': [60.0] * 24,
+            'pressure_msl_ensemble': [1013.0] * 24,
+            'cloud_cover_ensemble': [20.0] * 24,
+            'weather_code': [1.0] * 24,
+        })
+        m1, m2 = fc.MODELS[0], fc.MODELS[1]
+        fc_raw = pd.DataFrame({
+            'datetime': dts,
+            f'{m1}_wind_speed_10m_model': [4.0] * 24,
+            f'{m2}_wind_speed_10m_model': [6.0] * 24,
+            f'{m1}_precipitation_model': [0.0] * 24,
+        })
+        ds = fc._build_daily_summary('2026-07-25', 'Saturday', grp, fc_raw=fc_raw)
+        self.assertEqual(ds['wind_max'], 1.5)
+        self.assertEqual(ds['wind_max_models'], 5.0)
+
     def test_daily_narrative_mentions_short_rain(self):
         # A clear summer day with a single 0.15 mm shower hour (total 0.2 mm,
         # below the old 0.2 mm gate) must still carry the rain note.

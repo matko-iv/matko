@@ -346,8 +346,8 @@
             margin-top: 4px;
         }
 
-        /* The day narrative IS the "dnevni izvještaj" — set it as a report
-           note, not a caption lost under the icon. */
+        /* The day narrative IS the "dnevni izvještaj" — a quiet note panel,
+           hairline all around, no colored edge. */
         .day-card .day-narrative {
             font-size: 13.5px;
             color: #424a53;
@@ -356,8 +356,8 @@
             line-height: 1.45;
             padding: 8px 12px;
             background: #f6f8fa;
-            border-left: 3px solid #0366d6;
-            border-radius: 0 6px 6px 0;
+            border: 1px solid #eaeef2;
+            border-radius: 8px;
         }
 
         .day-card .temp-range {
@@ -615,26 +615,48 @@
         }
         .marine-hourly-wrap {
             border: 1px solid #d0d7de;
-            border-radius: 6px;
+            border-radius: 10px;
             background: #fff;
             box-shadow: 0 6px 18px rgba(27, 31, 36, 0.04);
             overflow-x: auto;
         }
-        .marine-hourly-wrap h4 { margin: 12px 14px 8px; font-size: 14px; color: #24292e; }
+        .marine-hourly-wrap h4 {
+            margin: 0;
+            padding: 12px 16px;
+            font-size: 14px;
+            font-weight: 600;
+            color: #24292e;
+            background: #f6f8fa;
+            border-bottom: 1px solid #e1e4e8;
+        }
         .marine-hourly {
             display: flex;
-            min-width: 100%;
-            padding: 0 8px 12px;
+            gap: 2px;
+            min-width: max-content;
+            padding: 6px;
         }
         .mh-cell {
             min-width: 64px;
             text-align: center;
             font-size: 11.5px;
-            padding: 6px 4px;
-            border-right: 1px solid #f1f3f5;
+            padding: 8px 4px;
+            border-radius: 8px;
             color: #424a53;
+            transition: background 0.12s ease;
         }
-        .mh-cell:last-child { border-right: none; }
+        .mh-cell:hover { background: #eef2f6; }
+        .mh-cell.day-break {
+            border-left: 1px solid #d0d7de;
+            border-radius: 0 8px 8px 0;
+            margin-left: 8px;
+        }
+        .mh-day {
+            font-size: 9px;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+            color: #0366d6;
+        }
         .mh-time { font-weight: 600; color: #24292e; font-size: 12px; }
         .mh-wave { font-size: 13px; color: #0969da; font-weight: 600; margin-top: 4px; }
         .mh-period { font-size: 10px; color: #6a737d; }
@@ -2737,7 +2759,7 @@ function render(data) {
         <div class="${cwClass}">
             <div class="cw-icon" id="cwIconBox" data-code="${currentData.weather_code}" data-cloud="${currentData.cloud_cover != null ? currentData.cloud_cover : ''}" data-hour="${currentData.hour}" data-datetime="${currentData.datetime || ''}">${weatherIcon(cwIcon, 96)}</div>
             <div class="cw-main">
-                <div class="cw-label"><span class="cw-live"></span>Trenutno stanje · ${String(currentHour).padStart(2,'0')}:00h</div>
+                <div class="cw-label"><span class="cw-live"></span>${String(currentHour).padStart(2,'0')}:00h</div>
                 <div class="cw-temp">${currentData.temperature_2m.toFixed(1)}°C</div>
                 <div class="cw-desc">${cwDesc}</div>
                 <div class="cw-details">
@@ -2890,6 +2912,14 @@ function render(data) {
                     dirAtMaxByDate[dt] = { h: h.wave_height, d: h.wave_direction };
                 }
             });
+            // Sailing score on the wave cards pairs the shared wave height
+            // with the Bečići bay wind (first wind location) for that date.
+            const bftByDate = {};
+            if (winds.length > 0 && winds[0].daily_summary) {
+                winds[0].daily_summary.forEach(w => {
+                    if (w.beaufort_max != null) bftByDate[w.date] = w.beaufort_max;
+                });
+            }
             html += '<h3 class="marine-subhead">Talasi</h3>';
             html += '<div class="marine-daily-grid">';
             waves.daily_summary.forEach(d => {
@@ -2901,10 +2931,13 @@ function render(data) {
                     : (dirAtMaxByDate[d.date] ? dirAtMaxByDate[d.date].d : null);
                 const seaLabel = seaStateLabel(d.wave_height_max, wdir, d.sea_state_label);
                 const sst = d.sst_avg != null ? d.sst_avg.toFixed(1) + '°C' : '';
+                const wsc = sailingScore(
+                    bftByDate[d.date] != null ? bftByDate[d.date] : null, d.wave_height_max);
                 html += `
                 <div class="m-day">
                     <div class="m-day-name">${dn}</div>
                     <div class="m-day-date">${dateShort}</div>
+                    ${wsc.label !== 'N/A' ? '<div><span class="m-score-pill m-score-' + wsc.color + '">' + wsc.label + '</span></div>' : ''}
                     <div class="m-day-row"><b>${wave}</b>${period ? ' · ' + period : ''}</div>
                     <div class="m-day-row" title="${seaLabel}">${douglasPill(seaLabel)}${seaLabel}</div>
                     ${wdir != null ? '<div class="m-day-row m-wave-dir">' + windArrow(wdir) + ' iz ' + windDirText(wdir) + '</div>' : ''}
@@ -2920,15 +2953,18 @@ function render(data) {
             html += '<div class="marine-hourly-wrap">';
             html += '<h4>Talasi po satima (48h)</h4>';
             html += '<div class="marine-hourly">';
-            waves.hourly.forEach(h => {
+            waves.hourly.forEach((h, hi) => {
                 const time = String(h.hour).padStart(2, '0') + 'h';
                 const wave = h.wave_height != null ? h.wave_height.toFixed(1) : '–';
                 const period = h.wave_period != null ? h.wave_period.toFixed(0) + 's' : '';
                 const seaLabel = seaStateLabel(h.wave_height, h.wave_direction, h.sea_state_label);
                 const dir = h.wave_direction != null ? windArrow(h.wave_direction) : '';
+                const dayBreak = h.hour === 0 && hi > 0;
+                const dayLbl = dayBreak && h.datetime
+                    ? new Date(h.datetime).toLocaleDateString('sr-Latn', { weekday: 'short' }) : '';
                 html += `
-                <div class="mh-cell" title="${seaLabel}">
-                    <div class="mh-time">${time}</div>
+                <div class="mh-cell${dayBreak ? ' day-break' : ''}" title="${seaLabel}">
+                    <div class="mh-time">${dayLbl ? `<span class="mh-day">${dayLbl}</span> ` : ''}${time}</div>
                     <div class="mh-wave">${wave}m</div>
                     <div class="mh-period">${period}${dir ? ' ' + dir : ''}</div>
                 </div>`;
@@ -2988,15 +3024,18 @@ function render(data) {
                     html += '<div class="marine-hourly-wrap">';
                     html += '<h4>Vjetar po satima (48h) — ' + loc.name + '</h4>';
                     html += '<div class="marine-hourly">';
-                    loc.hourly.forEach(h => {
+                    loc.hourly.forEach((h, hi) => {
                         const time = String(h.hour).padStart(2, '0') + 'h';
                         const bft = h.beaufort != null ? h.beaufort + ' Bft' : '–';
                         const wname = h.wind_name || '';
                         const ws = h.wind_speed_10m != null ? h.wind_speed_10m.toFixed(0) : '';
                         const wg = h.wind_gusts_10m != null ? h.wind_gusts_10m.toFixed(0) : '';
+                        const dayBreak = h.hour === 0 && hi > 0;
+                        const dayLbl = dayBreak && h.datetime
+                            ? new Date(h.datetime).toLocaleDateString('sr-Latn', { weekday: 'short' }) : '';
                         html += `
-                        <div class="mh-cell" title="${wname}">
-                            <div class="mh-time">${time}</div>
+                        <div class="mh-cell${dayBreak ? ' day-break' : ''}" title="${wname}">
+                            <div class="mh-time">${dayLbl ? `<span class="mh-day">${dayLbl}</span> ` : ''}${time}</div>
                             <div class="mh-bft">${bft}</div>
                             <div class="mh-wind">${ws}/${wg}${wname ? ' ' + wname.slice(0, 3) : ''}</div>
                             ${h.wind_speed_10m != null && h.wind_gusts_10m != null
