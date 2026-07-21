@@ -390,6 +390,22 @@ class MarineLogicTests(unittest.TestCase):
         self.assertEqual(fc.sailing_score(3, 2.0), ("red", "Opasno"))
         self.assertEqual(fc.sailing_score(None, 1.0), ("gray", "N/A"))
 
+    def test_hail_votes_from_model_codes(self):
+        # WMO 96/99 votes per hour, shifted -1 to the start-of-hour convention
+        # (Open-Meteo labels the preceding hour, same as precipitation).
+        m1, m2 = fc.MODELS[0], fc.MODELS[1]
+        dts = pd.date_range('2026-07-25 12:00', periods=4, freq='h')
+        raw = pd.DataFrame({
+            'datetime': dts,
+            f'{m1}_weather_code_model': [95, 96, 96, 95],
+            f'{m2}_weather_code_model': [95, 95, 99, 0],
+        })
+        votes = fc._hail_votes_by_datetime(raw)
+        self.assertEqual(votes, {dts[0]: 1, dts[1]: 2})
+        self.assertEqual(fc._hail_votes_by_datetime(None), {})
+        self.assertEqual(fc._hail_votes_by_datetime(
+            pd.DataFrame({'datetime': dts})), {})
+
     def test_daily_wind_consensus_keeps_model_peaks(self):
         # Ensemble-mean wind flattens to ~1.5 m/s, but each model's own daily
         # max is 4 and 6: the consensus field must carry their median so

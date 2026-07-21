@@ -2508,6 +2508,28 @@ function computeWarnings(hourly, currentHour, currentDate) {
         });
     });
 
+    // --- Hail ---
+    // hail_models = how many raw models explicitly diagnose WMO 96/99
+    // (thunderstorm with hail) that hour. Open-Meteo has no dedicated hail
+    // variable, so these codes are the direct signal; the corrected ensemble
+    // code rarely lands on 96/99 itself, hence the separate field.
+    const hailPred = h => (h.hail_models || 0) >= 1 || [96, 99].includes(h.weather_code);
+    findRuns(hailPred).forEach(r => {
+        const slice = hourly.slice(r.start, r.end + 1);
+        const maxVotes = Math.max(...slice.map(h => h.hail_models || 0));
+        const maxRain = Math.max(...slice.map(h => h.precipitation || 0));
+        let sev = maxVotes >= 2 ? 'extreme' : 'severe';
+        if (isImminent(r.start, r.end)) sev = 'extreme';
+        const who = maxVotes >= 2 ? `${maxVotes} modela prognoziraju` : 'Model prognozira';
+        warnings.push({
+            kind: 'hail', sev, title: 'Grad',
+            time: fmtSpan(r.start, r.end),
+            details: `${who} grmljavinu sa gradom; maks. kiša ${maxRain.toFixed(1)} mm/h`,
+            active: isCovered(r.start, r.end),
+            startIdx: r.start, endIdx: r.end,
+        });
+    });
+
     // --- Heavy rain (3h sum gate) ---
     // Trigger only when next 3h cumulative precipitation > 6 mm. This
     // catches stacked moderate hours (e.g. 3+3+2) that any-single-hour
@@ -2603,6 +2625,7 @@ function warningIcon(kind) {
         rainHeavy: '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 16.58A5 5 0 0 0 18 7h-1.26A8 8 0 1 0 4 15.25M8 19v2M8 13v2M12 21v2M12 15v2M16 19v2M16 13v2"/></svg>',
         shower:    '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 16.58A5 5 0 0 0 18 7h-1.26A8 8 0 1 0 4 15.25M16 14l-2 4M9 14l-2 4"/></svg>',
         thunder:   '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 16.9A5 5 0 0 0 18 7h-1.26a8 8 0 1 0-11.62 9M13 11l-4 6h6l-4 6"/></svg>',
+        hail:      '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 16.58A5 5 0 0 0 18 7h-1.26A8 8 0 1 0 4 15.25M8 16v.01M8 20v.01M12 18v.01M12 22v.01M16 16v.01M16 20v.01"/></svg>',
     };
     return ICONS[kind] || ICONS.wind;
 }
@@ -2740,7 +2763,7 @@ function render(data) {
         if (warnings.length > 0) {
             html += '<div class="weather-warnings">';
             warnings.forEach(w => {
-                const badgeLabels = { wind: 'Moguće', rainHeavy: 'Moguće', shower: 'Moguće', thunder: 'Upozorenje' };
+                const badgeLabels = { wind: 'Moguće', rainHeavy: 'Moguće', shower: 'Moguće', thunder: 'Upozorenje', hail: 'Upozorenje' };
                 const badge = w.active ? '<span class="w-now-badge">' + (badgeLabels[w.kind] || 'Upozorenje') + '</span>' : '';
                 html += `
                 <div class="warning-row sev-${w.sev}">
@@ -2787,10 +2810,8 @@ function render(data) {
         const t = h.temperature_2m != null ? Math.round(h.temperature_2m) + '°' : '-';
         const rain = h.precipitation > 0.05 ? h.precipitation.toFixed(1) + 'mm' : '';
         const wind = h.wind_speed_10m != null ? h.wind_speed_10m.toFixed(1) : '';
-        // Calibrated PoP + gust-exceedance badge (fields exist only
-        // after the quantile-upgrade retrain; render nothing on old JSONs)
-        const pop = (h.precipitation_pop != null && h.precipitation_pop >= 0.15)
-            ? Math.round(h.precipitation_pop * 100) + '%' : '';
+        // Gust-exceedance badge (field exists only after the quantile-upgrade
+        // retrain; renders nothing on old JSONs)
         const gustWarn = h.p_gust_gt17 != null && h.p_gust_gt17 >= 0.3;
         // The nowcast gates by clock hour, so every cell carries what the lookup needs;
         // cells outside the DGMR horizon simply find no bucket and keep the model's code.
@@ -2811,7 +2832,6 @@ function render(data) {
             <span class="h-icon">${weatherIcon(iconKey, 48)}</span>
             <span class="h-temp">${t}</span>
             <span class="h-rain">${rain}</span>
-            ${pop ? `<span class="h-pop" style="font-size:11px;color:#0366d6;font-weight:600">${pop}</span>` : ''}
             <span class="h-wind"${gustWarn ? ` title="P(udar > 17 m/s) = ${Math.round(h.p_gust_gt17 * 100)}%"` : ''}>${wind ? windArrow(h.wind_direction_10m) + ' ' + wind + ' m/s' + (gustWarn ? ' ⚠' : '') : ''}</span>
             <span class="h-uv" style="display:none"></span>
         </div>`;

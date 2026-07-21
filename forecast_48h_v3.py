@@ -7589,6 +7589,27 @@ def _daily_narrative(grp):
     }
 
 
+def _hail_votes_by_datetime(fc_raw):
+    """Per-hour count of models explicitly diagnosing thunderstorm with hail
+    (WMO 96/99). Open-Meteo has no dedicated hail variable; these codes are
+    the direct signal, and only some models emit them (ICON does for Budva),
+    so a single vote already matters. Shifted -1 to the same start-of-hour
+    convention as precipitation (Open-Meteo labels the preceding hour)."""
+    if fc_raw is None:
+        return {}
+    cols = [f"{m}_weather_code_model" for m in MODELS
+            if f"{m}_weather_code_model" in fc_raw.columns]
+    if not cols:
+        return {}
+    vals = fc_raw[cols].apply(pd.to_numeric, errors='coerce')
+    votes = ((vals == 96) | (vals == 99)).sum(axis=1).shift(-1)
+    out = {}
+    for dt, v in zip(fc_raw['datetime'], votes):
+        if pd.notna(v) and v > 0:
+            out[dt] = int(v)
+    return out
+
+
 def _daily_model_rain_probability(raw_group):
     """Daily NWP rain consensus using only models with data for that day."""
     votes = []
@@ -7912,6 +7933,8 @@ def generate_output(corrected, trained, results, fc_raw=None, marine=None, onset
     now_ts = local_now().floor('h')
     cutoff_48h = now_ts + pd.Timedelta(hours=48)
 
+    hail_votes = _hail_votes_by_datetime(fc_raw)
+
     forecast_hours = []
     for _, row in corrected.iterrows():
         if row['datetime'] >= cutoff_48h:
@@ -7967,6 +7990,10 @@ def generate_output(corrected, trained, results, fc_raw=None, marine=None, onset
             v = row.get(pcol, None)
             if v is not None and pd.notna(v):
                 entry[pcol] = round(float(v), 3)
+
+        hv = hail_votes.get(row['datetime'])
+        if hv:
+            entry['hail_models'] = hv
 
         forecast_hours.append(entry)
 
