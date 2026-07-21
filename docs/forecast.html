@@ -1254,7 +1254,11 @@ function gateWeatherCode(code, cloud, bucket, isCurrentHour, rs) {
         if (dc >= 0.2) {                                     // dry at Budva, but a cell is NEARBY:
             if (dc >= STRONG_NEARBY_MMH)                     //   strong cell -> thunderstorm
                 return wcSeverity(code) >= 5 ? code : 95;
-            return escalateCloud(code);                      //   weaker -> just nudge cloudiness one step
+            // Weaker -> just nudge cloudiness one step. escalateCloud keeps rain codes,
+            // which is right for a future hour (rain lands within it), but the CURRENT
+            // hour's icon means NOW and it is dry at Budva at this moment — strip the
+            // model's rain code before the nudge.
+            return escalateCloud(isCurrentHour && isRainCode(code) ? cloudToCode(cloud) : code);
         }
         // Nothing near Budva. The nowcast may always UPGRADE (it sees rain the model
         // missed), but it may only CONTRADICT the model over an hour it really covers;
@@ -1281,6 +1285,15 @@ function gatedCode(code, cloud, datetime, isCurrentHour) {
     return gateWeatherCode(code, cloud, nowcastHour(nowcastState, datetime), isCurrentHour, radarState);
 }
 
+// "Is this cell the current clock hour" by the wall clock. render() runs once and
+// stamps the current hour then; after a rollover that stamp points at the PREVIOUS
+// hour, and the new hour's cell would be gated as a future one — keeping the model's
+// rain icon while it is still dry outside.
+function cellIsCurrentHour(datetime) {
+    const t = Date.parse(datetime);
+    return !isNaN(t) && Date.now() - t >= 0 && Date.now() - t < 3600000;
+}
+
 // Re-skin the current-weather icon + every hourly cell the nowcast horizon covers.
 function applyRadarGating() {
     const imminent = nowcastImminent();
@@ -1295,7 +1308,8 @@ function applyRadarGating() {
         box.innerHTML = weatherIcon(getWeatherIcon(code0, hour), 96);
     }
     document.querySelectorAll('.hourly-cell[data-code]').forEach(cell => {
-        const isNow = cell.dataset.now === '1';
+        const isNow = cellIsCurrentHour(cell.dataset.datetime);
+        cell.classList.toggle('is-now', isNow);
         const hour = +cell.dataset.hour;
         const code = +cell.dataset.code;
         const cloud = cell.dataset.cloud === '' ? null : +cell.dataset.cloud;
@@ -2825,7 +2839,7 @@ function render(data) {
         const cellCls = 'hourly-cell' + (isNight ? ' is-night' : '')
             + (isCurrentHour ? ' is-now' : '') + (dayBreak ? ' day-break' : '');
         // data-mm keeps the NWP number so applyRadarGating() can restore it after an override.
-        const gateAttr = ` data-hour="${h.hour}" data-code="${h.weather_code}" data-cloud="${h.cloud_cover != null ? h.cloud_cover : ''}" data-datetime="${h.datetime || ''}" data-now="${isCurrentHour ? '1' : '0'}" data-mm="${h.precipitation != null ? h.precipitation : ''}"`;
+        const gateAttr = ` data-hour="${h.hour}" data-code="${h.weather_code}" data-cloud="${h.cloud_cover != null ? h.cloud_cover : ''}" data-datetime="${h.datetime || ''}" data-mm="${h.precipitation != null ? h.precipitation : ''}"`;
         html += `
         <div class="${cellCls}"${gateAttr} data-uvkey="${(h.datetime || '').slice(0, 13)}">
             <span class="h-time">${dayLabel ? `<span class="h-day">${dayLabel}</span> ` : ''}${String(h.hour).padStart(2,'0')}h</span>

@@ -33,7 +33,7 @@ const src = html.slice(start, end);
 const api = new Function(src + `
     return { nowcastHour, nowcastCellMm, gateWeatherCode, nowcastFresh, nowcastIntensityCode,
              nowcastImminent, nowcastImminentCode, nowcastNowRate, escalateCloud, cloudToCode,
-             HOUR_COVER_MIN,
+             cellIsCurrentHour, HOUR_COVER_MIN,
              setState: (ns, rs) => { nowcastState = ns; radarState = rs; } };
 `)();
 
@@ -226,6 +226,39 @@ at(BASE + 30 * 60000, () => {
     api.setState(nsD, null);
     const b = api.nowcastHour(nsD, '2026-07-09T16:00:00');
     eq(api.gateWeatherCode(0, 5, b, true, null), 95, 'strong cell NEARBY RIGHT NOW -> thunderstorm icon');
+});
+
+// 7c. Hour rollover: render() runs once and stamps data-now, so applyRadarGating()
+// must take "is this the current hour" from the wall clock, not the stamp — otherwise
+// after midnight the new hour's cell is gated as a FUTURE hour and its bucket peak
+// keeps the model's rain icon while it is still dry outside.
+at(BASE + 25 * 60000, () => {   // 14:05Z = 16:05 local
+    eq(api.cellIsCurrentHour('2026-07-09T16:00:00'), true, 'wall clock 16:05 -> the 16:00 cell IS the current hour');
+    eq(api.cellIsCurrentHour('2026-07-09T15:00:00'), false, 'the 15:00 cell no longer is');
+    eq(api.cellIsCurrentHour('2026-07-09T17:00:00'), false, 'the 17:00 cell not yet');
+    eq(api.cellIsCurrentHour(''), false, 'no datetime -> not the current hour');
+});
+
+// 7d. CURRENT hour, dry at Budva but a WEAK cell nearby (disc): the cloud nudge must
+// not keep the model's rain code — it is not raining at Budva at this moment.
+const seriesN = [];
+for (let lead = 5; lead <= 80; lead += 5) {
+    seriesN.push({ lead_min: lead, point_mmh: 0.0, disc_max_mmh: 3.0 });
+}
+const nsN = {
+    ok: true, base_epoch_ms: BASE, horizon_min: 80, timestep_min: 5,
+    now: { point_mmh: 0.0, disc_max_mmh: 3.0 }, series: seriesN,
+    hourly_mm: [
+        { hour: '2026-07-09T13:00:00Z', mm: 0.0, covered_min: 20, peak_point_mmh: 0.0, peak_disc_mmh: 3.0 },
+    ],
+};
+at(BASE + 10 * 60000, () => {
+    api.setState(nsN, null);
+    const b = api.nowcastHour(nsN, '2026-07-09T15:00:00');
+    eq(api.gateWeatherCode(61, 80, b, true, null), 3, 'current hour: weak nearby cell strips model rain, keeps the cloud nudge');
+    eq(api.gateWeatherCode(61, 20, b, true, null), 2, 'stripped code still gets the one-step nudge (cloud 20 -> 1 -> 2)');
+    const bFut = { hour: '2026-07-09T14:00:00Z', mm: 0.5, covered_min: 60, peak_point_mmh: 0.0, peak_disc_mmh: 3.0 };
+    eq(api.gateWeatherCode(61, 80, bFut, false, null), 61, 'future hour: weak nearby cell keeps the model rain code');
 });
 
 // 8. Stale nowcast (base older than 90 min) -> no nowcast gating at all.
