@@ -2566,27 +2566,14 @@ function computeWarnings(hourly, currentHour, currentDate) {
         });
     });
 
-    // --- Hail ---
-    // hail_models = how many raw models explicitly diagnose WMO 96/99
-    // (thunderstorm with hail) that hour. Open-Meteo has no dedicated hail
-    // variable, so these codes are the direct signal; the corrected ensemble
-    // code rarely lands on 96/99 itself, hence the separate field.
-    const hailPred = h => (h.hail_models || 0) >= 1 || [96, 99].includes(h.weather_code);
-    findRuns(hailPred).forEach(r => {
-        const slice = hourly.slice(r.start, r.end + 1);
-        const maxVotes = Math.max(...slice.map(h => h.hail_models || 0));
-        const maxRain = Math.max(...slice.map(h => h.precipitation || 0));
-        let sev = maxVotes >= 2 ? 'extreme' : 'severe';
-        if (isImminent(r.start, r.end)) sev = 'extreme';
-        const who = maxVotes >= 2 ? `${maxVotes} modela prognoziraju` : 'Model prognozira';
-        warnings.push({
-            kind: 'hail', sev, title: 'Grad',
-            time: fmtSpan(r.start, r.end),
-            details: `${who} grmljavinu sa gradom; maks. kiša ${maxRain.toFixed(1)} mm/h`,
-            active: isCovered(r.start, r.end),
-            startIdx: r.start, endIdx: r.end,
-        });
-    });
+    // No hail warning. It used to fire on hail_models >= 1, which reads like
+    // a 1-of-10 consensus but isn't: of the ten models, only ICON_SEAMLESS
+    // ever emits WMO 96/99 at all (84 hours in 50,586; the other nine emit it
+    // zero times, ever). So the gate was really "ICON said hail", and it fired
+    // on convective days the rest of the ensemble had nothing to say about --
+    // e.g. 2026-07-24 09-10h, flagged while the same hours read "Pretezno
+    // vedro", 34% cloud, and 0.0 mm at the 95th percentile. hail_models is
+    // still published in the JSON as raw data; nothing in the UI reads it.
 
     // --- Heavy rain (3h sum gate) ---
     // Trigger only when next 3h cumulative precipitation > 6 mm. This
@@ -2683,7 +2670,6 @@ function warningIcon(kind) {
         rainHeavy: '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 16.58A5 5 0 0 0 18 7h-1.26A8 8 0 1 0 4 15.25M8 19v2M8 13v2M12 21v2M12 15v2M16 19v2M16 13v2"/></svg>',
         shower:    '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 16.58A5 5 0 0 0 18 7h-1.26A8 8 0 1 0 4 15.25M16 14l-2 4M9 14l-2 4"/></svg>',
         thunder:   '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 16.9A5 5 0 0 0 18 7h-1.26a8 8 0 1 0-11.62 9M13 11l-4 6h6l-4 6"/></svg>',
-        hail:      '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 16.58A5 5 0 0 0 18 7h-1.26A8 8 0 1 0 4 15.25M8 16v.01M8 20v.01M12 18v.01M12 22v.01M16 16v.01M16 20v.01"/></svg>',
     };
     return ICONS[kind] || ICONS.wind;
 }
@@ -2821,7 +2807,7 @@ function render(data) {
         if (warnings.length > 0) {
             html += '<div class="weather-warnings">';
             warnings.forEach(w => {
-                const badgeLabels = { wind: 'Moguće', rainHeavy: 'Moguće', shower: 'Moguće', thunder: 'Upozorenje', hail: 'Upozorenje' };
+                const badgeLabels = { wind: 'Moguće', rainHeavy: 'Moguće', shower: 'Moguće', thunder: 'Upozorenje' };
                 const badge = w.active ? '<span class="w-now-badge">' + (badgeLabels[w.kind] || 'Upozorenje') + '</span>' : '';
                 html += `
                 <div class="warning-row sev-${w.sev}">
