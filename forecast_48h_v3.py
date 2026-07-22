@@ -6170,6 +6170,19 @@ def persistent_daytime_gust(day_rows, gust_col='wind_gusts_10m_mean'):
     return float(daytime.nlargest(GUST_PERSIST_HOURS).iloc[-1])
 
 
+def direction_capped_height(height_m, direction_deg):
+    """Wave height clipped to what this bearing can actually deliver at
+    Bečići. The sea-state pill has always been capped this way; the score
+    must use the same number, or the card ends up printing "Blagi talasi"
+    and docking the day a rung for a 1 m wave in the same breath."""
+    if height_m is None or pd.isna(height_m):
+        return None
+    cap = sea_state_direction_cap(direction_deg)
+    if cap - 1 < len(_DOUGLAS_THRESHOLDS):
+        return min(float(height_m), _DOUGLAS_THRESHOLDS[cap - 1])
+    return float(height_m)
+
+
 def is_southern_direction(direction_deg):
     """True for the jugo-sirocco-lebić sector. Unknown direction counts as
     southern so a missing field can't silently mute a warning."""
@@ -6202,11 +6215,13 @@ def sailing_score(bft, wave_height, wave_direction=None,
     if bft is None or wave_height is None:
         return ("gray", "N/A")
 
-    # Baseline: the calm rungs, keyed off Bft + height as before. This also
-    # sets the ceiling for every day that fails both warning gates.
-    if bft <= 2 and wave_height <= 0.3:
+    # Baseline: the calm rungs, keyed off Bft + height. The height is the
+    # direction-capped one, so an off-the-land "wave" the card itself calls
+    # "Blagi talasi" can no longer cost the day a rung.
+    eff_height = direction_capped_height(wave_height, wave_direction)
+    if bft <= 2 and eff_height <= 0.3:
         label = "Idealno"
-    elif bft <= 3 and wave_height <= 0.6:
+    elif bft <= 3 and eff_height <= 0.6:
         label = "Dobro"
     else:
         label = "Prihvatljivo"

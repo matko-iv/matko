@@ -387,6 +387,48 @@ class MarineLogicTests(unittest.TestCase):
         self.assertEqual(fc.sailing_score(4, 0.8), ("yellow", "Prihvatljivo"))
         self.assertEqual(fc.sailing_score(None, 1.0), ("gray", "N/A"))
 
+    def test_direction_capped_height_matches_the_douglas_pill(self):
+        # West is capped at Douglas 2, whose upper bound is 0.5 m, so a 1.03 m
+        # "wave" from 277° is worth 0.5 m to the score — exactly what the sea
+        # state pill on the same card already claims.
+        self.assertAlmostEqual(fc.direction_capped_height(1.03, 277.0), 0.5)
+        self.assertAlmostEqual(fc.direction_capped_height(0.77, 275.0), 0.5)
+        # Bura (NE) is capped at Douglas 4 -> 2.5 m.
+        self.assertAlmostEqual(fc.direction_capped_height(3.0, 45.0), 2.5)
+        # Southern fetch is uncapped: the height stands.
+        self.assertAlmostEqual(fc.direction_capped_height(1.8, 178.0), 1.8)
+        # Below the ceiling, nothing changes; unknown direction is left alone.
+        self.assertAlmostEqual(fc.direction_capped_height(0.37, 290.0), 0.37)
+        self.assertAlmostEqual(fc.direction_capped_height(1.2, None), 1.2)
+        self.assertIsNone(fc.direction_capped_height(None, 180.0))
+
+    def test_offshore_waves_no_longer_cost_a_rung(self):
+        # Regression: 07-22 and 07-23 read "Prihvatljivo" purely because the
+        # raw westerly height cleared 0.6 m in the calm ladder, while the very
+        # same card called the sea "Blagi talasi".
+        self.assertEqual(
+            fc.sailing_score(3, 1.03, wave_direction=277.0,
+                             wind_direction=47.0, wind_gusts_ms=9.5 * fc.MS_PER_KNOT),
+            ("green", "Dobro"))
+        self.assertEqual(
+            fc.sailing_score(3, 0.77, wave_direction=275.0,
+                             wind_direction=49.0, wind_gusts_ms=12.2 * fc.MS_PER_KNOT),
+            ("green", "Dobro"))
+        # Wind still governs on its own: a real blow is not "Dobro".
+        self.assertEqual(
+            fc.sailing_score(3, 0.37, wave_direction=290.0,
+                             wind_direction=51.0, wind_gusts_ms=20.0 * fc.MS_PER_KNOT),
+            ("yellow", "Prihvatljivo"))
+        self.assertEqual(
+            fc.sailing_score(5, 0.77, wave_direction=275.0,
+                             wind_direction=49.0, wind_gusts_ms=8.0),
+            ("yellow", "Prihvatljivo"))
+        # Southern seas are untouched by the cap and still warn.
+        self.assertEqual(
+            fc.sailing_score(2, 1.74, wave_direction=178.0,
+                             wind_direction=114.0, wind_gusts_ms=10.1 * fc.MS_PER_KNOT),
+            ("orange", "Oprez"))
+
     def test_sailing_score_ignores_waves_off_the_land(self):
         # Regression: 2026-07-23 Bečići — 3 Bft Levanat, 4.3/7.9 m/s, and a
         # ~1 m "wave" out of 273°. The same page calls that wave "Blagi
@@ -396,9 +438,18 @@ class MarineLogicTests(unittest.TestCase):
             fc.sailing_score(3, 1.05, wave_direction=273.0,
                              wind_direction=50.0, wind_gusts_ms=7.9),
             ("yellow", "Prihvatljivo"))
-        # No westerly height can climb past Prihvatljivo, however absurd.
+        # An absurd westerly height is not merely capped, it is disregarded:
+        # clipped to the 0.5 m the direction can deliver, leaving the wind to
+        # decide the day on its own. 3 m out of the W with a light breeze is a
+        # grid artifact, and the card says "Blagi talasi" beside it.
         self.assertEqual(
             fc.sailing_score(3, 3.0, wave_direction=270.0,
+                             wind_direction=300.0, wind_gusts_ms=5.0),
+            ("green", "Dobro"))
+        # ...but the same absurd wave with real wind is still no better than
+        # Prihvatljivo, because Bft alone carries it there.
+        self.assertEqual(
+            fc.sailing_score(4, 3.0, wave_direction=270.0,
                              wind_direction=300.0, wind_gusts_ms=5.0),
             ("yellow", "Prihvatljivo"))
 
