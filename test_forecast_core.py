@@ -380,15 +380,123 @@ class MarineLogicTests(unittest.TestCase):
         self.assertEqual(fc.adriatic_sea_state(0.8, None), 3)
         self.assertIsNone(fc.adriatic_sea_state(None, 140.0))
 
-    def test_sailing_score_is_strict(self):
+    def test_sailing_score_calm_end_unchanged(self):
+        # The gentle rungs still key off Bft + height alone.
         self.assertEqual(fc.sailing_score(2, 0.2), ("green", "Idealno"))
         self.assertEqual(fc.sailing_score(3, 0.5), ("green", "Dobro"))
-        # Bft 4 or a metre of wave is no longer "Dobro".
         self.assertEqual(fc.sailing_score(4, 0.8), ("yellow", "Prihvatljivo"))
-        self.assertEqual(fc.sailing_score(5, 1.5), ("orange", "Oprez"))
-        self.assertEqual(fc.sailing_score(6, 1.0), ("red", "Opasno"))
-        self.assertEqual(fc.sailing_score(3, 2.0), ("red", "Opasno"))
         self.assertEqual(fc.sailing_score(None, 1.0), ("gray", "N/A"))
+
+    def test_sailing_score_ignores_waves_off_the_land(self):
+        # Regression: 2026-07-23 Bečići — 3 Bft Levanat, 4.3/7.9 m/s, and a
+        # ~1 m "wave" out of 273°. The same page calls that wave "Blagi
+        # talasi" (a 5.5 km-grid artifact off the land), so the badge must
+        # not call it Oprez. Gusts are 15.4 kn -> the >15 kn rung, Prihvatljivo.
+        self.assertEqual(
+            fc.sailing_score(3, 1.05, wave_direction=273.0,
+                             wind_direction=50.0, wind_gusts_ms=7.9),
+            ("yellow", "Prihvatljivo"))
+        # No westerly height can climb past Prihvatljivo, however absurd.
+        self.assertEqual(
+            fc.sailing_score(3, 3.0, wave_direction=270.0,
+                             wind_direction=300.0, wind_gusts_ms=5.0),
+            ("yellow", "Prihvatljivo"))
+
+    def test_sailing_score_southern_waves_fire_on_height_alone(self):
+        # Jugo/Sirocco/Lebić sector (112.5-247.5°) has the open-sea fetch, so
+        # height alone counts even once the wind that built it has dropped.
+        self.assertEqual(
+            fc.sailing_score(2, 1.2, wave_direction=184.0,
+                             wind_direction=50.0, wind_gusts_ms=5.0),
+            ("orange", "Oprez"))
+        self.assertEqual(
+            fc.sailing_score(2, 2.0, wave_direction=188.0,
+                             wind_direction=42.0, wind_gusts_ms=5.0),
+            ("red", "Opasno"))
+        # Just under the bar stays acceptable.
+        self.assertEqual(
+            fc.sailing_score(2, 0.95, wave_direction=184.0,
+                             wind_direction=50.0, wind_gusts_ms=5.0),
+            ("yellow", "Prihvatljivo"))
+
+    def test_sailing_score_southern_wind_lowers_the_wave_bar(self):
+        # A jugo still blowing at 3 Bft+ is actively building the sea, so the
+        # thresholds drop from 1.0/1.8 m to 0.8/1.5 m.
+        self.assertEqual(
+            fc.sailing_score(3, 0.9, wave_direction=140.0,
+                             wind_direction=140.0, wind_gusts_ms=6.0),
+            ("orange", "Oprez"))
+        self.assertEqual(
+            fc.sailing_score(4, 1.6, wave_direction=140.0,
+                             wind_direction=150.0, wind_gusts_ms=8.0),
+            ("red", "Opasno"))
+        # Same wave, but the wind is easterly: the higher bar applies.
+        self.assertEqual(
+            fc.sailing_score(3, 0.9, wave_direction=140.0,
+                             wind_direction=70.0, wind_gusts_ms=6.0),
+            ("yellow", "Prihvatljivo"))
+
+    def _wind_day(self, gusts_by_hour, speed=4.0, direction=50.0):
+        """One 24 h wind frame; gusts_by_hour maps hour -> gust m/s."""
+        dts = pd.date_range('2026-07-24 00:00', periods=24, freq='h')
+        return pd.DataFrame({
+            'datetime': dts,
+            'wind_speed_10m_mean': [speed] * 24,
+            'wind_gusts_10m_mean': [gusts_by_hour.get(h, 3.0) for h in range(24)],
+            'wind_direction_10m_mean': [direction] * 24,
+        })
+
+    def test_persistent_daytime_gust_ignores_isolated_hours(self):
+        kn = fc.MS_PER_KNOT
+        # Regression: 2026-07-24 Bečići peaked at 15.6 kn for exactly one hour,
+        # at 07h, and that single hour dragged the whole day down a rung.
+        one_spike = self._wind_day({7: 16.0 * kn, 14: 16.0 * kn})
+        self.assertLess(fc.persistent_daytime_gust(one_spike) / kn, 15.0)
+        # Night-long blow doesn't count: nobody is swimming at 02h.
+        night = self._wind_day({h: 20.0 * kn for h in (0, 1, 2, 3, 4, 23)})
+        self.assertLess(fc.persistent_daytime_gust(night) / kn, 15.0)
+        # Four daytime hours is the bar, and the 4th-strongest sets the level.
+        afternoon = self._wind_day({12: 24.0 * kn, 13: 22.0 * kn,
+                                    14: 20.0 * kn, 15: 18.0 * kn})
+        self.assertAlmostEqual(
+            fc.persistent_daytime_gust(afternoon) / kn, 18.0, places=4)
+        # A day with too few daytime rows can't establish persistence at all.
+        short = self._wind_day({}).head(10)
+        self.assertIsNone(fc.persistent_daytime_gust(short))
+
+    def test_daily_badge_survives_a_single_gusty_hour(self):
+        waves = {'2026-07-24': (0.37, 290.0)}  # westerly, cannot warn on its own
+        kn = fc.MS_PER_KNOT
+
+        spike = fc._build_wind_block(self._wind_day({7: 21.4 * kn}), {}, waves)
+        day = spike['daily_summary'][0]
+        self.assertEqual(day['sailing_score'], 'Dobro')
+        self.assertLess(day['wind_gusts_persistent'] / kn, 15.0)
+        # The card still reports the true peak; only the score ignores it.
+        self.assertAlmostEqual(day['wind_gusts_max'], round(21.4 * kn, 1))
+
+        blow = fc._build_wind_block(
+            self._wind_day({h: 17.0 * kn for h in (11, 12, 13, 14, 15)}), {}, waves)
+        self.assertEqual(blow['daily_summary'][0]['sailing_score'], 'Prihvatljivo')
+
+    def test_sailing_score_gust_rungs_stand_alone(self):
+        # Gusts are judged on their own, in knots, whatever the sea is doing.
+        self.assertEqual(  # 23.3 kn
+            fc.sailing_score(3, 0.2, wave_direction=270.0,
+                             wind_direction=300.0, wind_gusts_ms=12.0),
+            ("orange", "Oprez"))
+        self.assertEqual(  # 16.5 kn floors an otherwise ideal day
+            fc.sailing_score(2, 0.2, wave_direction=270.0,
+                             wind_direction=300.0, wind_gusts_ms=8.5),
+            ("yellow", "Prihvatljivo"))
+        self.assertEqual(  # 7.8 kn leaves it alone
+            fc.sailing_score(2, 0.2, wave_direction=270.0,
+                             wind_direction=300.0, wind_gusts_ms=4.0),
+            ("green", "Idealno"))
+        self.assertEqual(  # gale-force backstop
+            fc.sailing_score(3, 0.2, wave_direction=270.0,
+                             wind_direction=300.0, wind_gusts_ms=18.0),
+            ("red", "Opasno"))
 
     def test_hail_votes_from_model_codes(self):
         # WMO 96/99 votes per hour, shifted -1 to the start-of-hour convention

@@ -1428,13 +1428,57 @@ function seaStateLabel(heightM, dirDeg, fallbackLabel) {
 
 // Mirror of forecast_48h_v3.sailing_score — the strict Bečići criteria,
 // recomputed client-side so a stale JSON can't show the old lenient scores.
-function sailingScore(bft, waveHeight) {
+// "Oprez"/"Opasno" need either a southern sea (jugo-sirocco-lebić, the only
+// sector with fetch to Bečići) or real gusts. A tall wave out of the W or N
+// is the same grid artifact seaStateDirectionCap already flattens, so it
+// cannot raise a warning on its own.
+const MS_PER_KNOT = 0.514444;
+const SAILING_RANK = ['Idealno', 'Dobro', 'Prihvatljivo', 'Oprez', 'Opasno'];
+const SAILING_COLOR = {
+    'Idealno': 'green', 'Dobro': 'green', 'Prihvatljivo': 'yellow',
+    'Oprez': 'orange', 'Opasno': 'red'
+};
+
+// Unknown direction counts as southern, so a missing field can't mute a warning.
+function isSouthernDirection(deg) {
+    if (deg == null || isNaN(deg)) return true;
+    const d = ((deg % 360) + 360) % 360;
+    return d >= 112.5 && d < 247.5;
+}
+
+function sailingScore(bft, waveHeight, waveDir, windDir, windGustsMs) {
     if (bft == null || waveHeight == null) return { color: 'gray', label: 'N/A' };
-    if (bft <= 2 && waveHeight <= 0.3) return { color: 'green', label: 'Idealno' };
-    if (bft <= 3 && waveHeight <= 0.6) return { color: 'green', label: 'Dobro' };
-    if (bft <= 4 && waveHeight <= 1.0) return { color: 'yellow', label: 'Prihvatljivo' };
-    if (bft <= 5 && waveHeight <= 1.8) return { color: 'orange', label: 'Oprez' };
-    return { color: 'red', label: 'Opasno' };
+
+    let label;
+    if (bft <= 2 && waveHeight <= 0.3) label = 'Idealno';
+    else if (bft <= 3 && waveHeight <= 0.6) label = 'Dobro';
+    else label = 'Prihvatljivo';
+
+    const worst = (other) => {
+        if (SAILING_RANK.indexOf(other) > SAILING_RANK.indexOf(label)) label = other;
+    };
+
+    if (isSouthernDirection(waveDir)) {
+        // A southern wind of 3 Bft+ is still building the sea: lower the bar.
+        const windKnown = windDir != null && !isNaN(windDir);
+        const building = windKnown && isSouthernDirection(windDir) && bft >= 3;
+        const oprezAt = building ? 0.8 : 1.0;
+        const opasnoAt = building ? 1.5 : 1.8;
+        if (waveHeight >= opasnoAt) worst('Opasno');
+        else if (waveHeight >= oprezAt) worst('Oprez');
+    }
+
+    // Gusts judged on their own terms, in knots. For daily cards the caller
+    // passes wind_gusts_persistent (the level held 4+ daytime hours), never
+    // the raw peak, so a single gusty hour can't cost the day a rung.
+    if (windGustsMs != null && !isNaN(windGustsMs)) {
+        const gustKn = windGustsMs / MS_PER_KNOT;
+        if (gustKn > 34) worst('Opasno');
+        else if (gustKn > 22) worst('Oprez');
+        else if (gustKn > 15) worst('Prihvatljivo');
+    }
+
+    return { color: SAILING_COLOR[label], label: label };
 }
 
 function douglasPill(label) {
@@ -2949,9 +2993,11 @@ function render(data) {
             // Sailing score on the wave cards pairs the shared wave height
             // with the Bečići bay wind (first wind location) for that date.
             const bftByDate = {};
+            const windByDate = {};
             if (winds.length > 0 && winds[0].daily_summary) {
                 winds[0].daily_summary.forEach(w => {
                     if (w.beaufort_max != null) bftByDate[w.date] = w.beaufort_max;
+                    windByDate[w.date] = { dir: w.wind_direction_peak, gust: w.wind_gusts_persistent };
                 });
             }
             html += '<h3 class="marine-subhead">Talasi</h3>';
@@ -2965,8 +3011,10 @@ function render(data) {
                     : (dirAtMaxByDate[d.date] ? dirAtMaxByDate[d.date].d : null);
                 const seaLabel = seaStateLabel(d.wave_height_max, wdir, d.sea_state_label);
                 const sst = d.sst_avg != null ? d.sst_avg.toFixed(1) + '°C' : '';
+                const wmeta = windByDate[d.date] || {};
                 const wsc = sailingScore(
-                    bftByDate[d.date] != null ? bftByDate[d.date] : null, d.wave_height_max);
+                    bftByDate[d.date] != null ? bftByDate[d.date] : null,
+                    d.wave_height_max, wdir, wmeta.dir, wmeta.gust);
                 html += `
                 <div class="m-day">
                     <div class="m-day-name">${dn}</div>
@@ -3023,9 +3071,11 @@ function render(data) {
                 }
                 if (loc.daily_summary && loc.daily_summary.length > 0) {
                     const whByDate = {};
+                    const waveDirByDate = {};
                     if (waves && waves.daily_summary) {
                         waves.daily_summary.forEach(w => {
                             if (w.wave_height_max != null) whByDate[w.date] = w.wave_height_max;
+                            waveDirByDate[w.date] = w.wave_dir_at_max;
                         });
                     }
                     html += '<div class="marine-daily-grid">';
@@ -3033,7 +3083,8 @@ function render(data) {
                         const dn = DAY_NAMES_SR[d.day_name] || d.day_name;
                         const dateShort = (d.date || '').slice(5).replace('-', '.');
                         const sc = sailingScore(d.beaufort_max,
-                            whByDate[d.date] != null ? whByDate[d.date] : null);
+                            whByDate[d.date] != null ? whByDate[d.date] : null,
+                            waveDirByDate[d.date], d.wind_direction_peak, d.wind_gusts_persistent);
                         const scoreLabel = sc.label !== 'N/A' ? sc.label : (d.sailing_score || 'N/A');
                         const pillCls = 'm-score-' + (sc.label !== 'N/A' ? sc.color : (d.sailing_color || 'gray'));
                         const bft = d.beaufort_max != null ? d.beaufort_max + ' Bft' : '–';

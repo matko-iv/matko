@@ -6134,22 +6134,105 @@ def cg_wind_name(direction_deg, speed_ms):
     return ""
 
 
-def sailing_score(bft, wave_height):
-    """Traffic-light + label for sailing comfort. Deliberately strict: the
-    audience is small boats and swimmers at Bečići, not offshore keelboats,
-    so Bft 4 already drops to "Prihvatljivo" and Bft 6+ or >1.8 m is
-    "Opasno"."""
+MS_PER_KNOT = 0.514444
+
+# Jugo (JI) - Sirocco (J) - Lebić (JZ). The sector with open-sea fetch to
+# Bečići, and the only one whose waves are allowed to raise a warning badge.
+SOUTHERN_SECTOR = (112.5, 247.5)
+
+_SAILING_RANK = ["Idealno", "Dobro", "Prihvatljivo", "Oprez", "Opasno"]
+_SAILING_COLOR = {
+    "Idealno": "green", "Dobro": "green", "Prihvatljivo": "yellow",
+    "Oprez": "orange", "Opasno": "red",
+}
+
+
+# A daily badge must not turn on one gusty hour, least of all a nocturnal
+# one: the audience is swimmers and small boats, so only 08-20 counts, and
+# the gust level has to hold for GUST_PERSIST_HOURS of them.
+GUST_PERSIST_HOURS = 4
+GUST_DAY_WINDOW = (8, 20)
+
+
+def persistent_daytime_gust(day_rows, gust_col='wind_gusts_10m_mean'):
+    """Gust level (m/s) sustained for GUST_PERSIST_HOURS daytime hours, i.e.
+    the Nth strongest such hour. None when the day can't clear that bar —
+    which correctly leaves the gust rungs unfired rather than guessing."""
+    if day_rows is None or len(day_rows) == 0 or gust_col not in day_rows:
+        return None
+    hours = day_rows['datetime'].dt.hour
+    lo, hi = GUST_DAY_WINDOW
+    daytime = pd.to_numeric(
+        day_rows.loc[(hours >= lo) & (hours <= hi), gust_col],
+        errors='coerce').dropna()
+    if len(daytime) < GUST_PERSIST_HOURS:
+        return None
+    return float(daytime.nlargest(GUST_PERSIST_HOURS).iloc[-1])
+
+
+def is_southern_direction(direction_deg):
+    """True for the jugo-sirocco-lebić sector. Unknown direction counts as
+    southern so a missing field can't silently mute a warning."""
+    if direction_deg is None or pd.isna(direction_deg):
+        return True
+    lo, hi = SOUTHERN_SECTOR
+    return lo <= (float(direction_deg) % 360) < hi
+
+
+def sailing_score(bft, wave_height, wave_direction=None,
+                  wind_direction=None, wind_gusts_ms=None):
+    """Traffic-light + label for sailing comfort at Bečići. Strict, because
+    the audience is small boats and swimmers rather than offshore keelboats.
+
+    "Oprez"/"Opasno" are reserved for two situations, judged independently
+    and combined worst-case:
+
+    * Southern waves. Only the jugo-sirocco-lebić sector has the fetch to
+      build a real sea here; N and W "waves" are 5.5 km-grid artifacts off
+      the land, which is why sea_state_direction_cap already flattens them.
+      Height alone is enough once the sea is up, since a jugo swell outlives
+      the wind that raised it. A southern wind of 3 Bft+ is still building,
+      so it drops the bar from 1.0/1.8 m to 0.8/1.5 m.
+    * Gusts, in knots, on their own terms: >15 kn caps the day at
+      "Prihvatljivo", >22 kn makes it "Oprez", gale-force >34 kn "Opasno".
+
+    Anything else tops out at "Prihvatljivo" no matter how tall the model
+    says the waves are. Mirrored client-side in docs/forecast.html
+    (sailingScore)."""
     if bft is None or wave_height is None:
         return ("gray", "N/A")
+
+    # Baseline: the calm rungs, keyed off Bft + height as before. This also
+    # sets the ceiling for every day that fails both warning gates.
     if bft <= 2 and wave_height <= 0.3:
-        return ("green", "Idealno")
-    if bft <= 3 and wave_height <= 0.6:
-        return ("green", "Dobro")
-    if bft <= 4 and wave_height <= 1.0:
-        return ("yellow", "Prihvatljivo")
-    if bft <= 5 and wave_height <= 1.8:
-        return ("orange", "Oprez")
-    return ("red", "Opasno")
+        label = "Idealno"
+    elif bft <= 3 and wave_height <= 0.6:
+        label = "Dobro"
+    else:
+        label = "Prihvatljivo"
+
+    def _worst(other):
+        return other if _SAILING_RANK.index(other) > _SAILING_RANK.index(label) else label
+
+    if is_southern_direction(wave_direction):
+        wind_known = wind_direction is not None and pd.notna(wind_direction)
+        wind_building = wind_known and is_southern_direction(wind_direction) and bft >= 3
+        oprez_at, opasno_at = (0.8, 1.5) if wind_building else (1.0, 1.8)
+        if wave_height >= opasno_at:
+            label = _worst("Opasno")
+        elif wave_height >= oprez_at:
+            label = _worst("Oprez")
+
+    if wind_gusts_ms is not None and pd.notna(wind_gusts_ms):
+        gust_kn = float(wind_gusts_ms) / MS_PER_KNOT
+        if gust_kn > 34:
+            label = _worst("Opasno")
+        elif gust_kn > 22:
+            label = _worst("Oprez")
+        elif gust_kn > 15:
+            label = _worst("Prihvatljivo")
+
+    return (_SAILING_COLOR[label], label)
 
 
 def _fetch_marine_waves(lat, lon, label):
@@ -6449,10 +6532,12 @@ def _build_wind_block(wind_df, shared_waves_by_dt, shared_waves_daily_by_date):
         wdir = row.get('wind_direction_10m_mean')
         bft = beaufort_from_wind(ws)
         wind_name = cg_wind_name(wdir, ws)
-        # Pair with shared wave height at the same hour for sailing score.
+        # Pair with shared wave height + direction at the same hour.
         dt_key = row['datetime']
-        wh_here = shared_waves_by_dt.get(dt_key)
-        score_color, score_label = sailing_score(bft, wh_here)
+        wh_here, wd_here = shared_waves_by_dt.get(dt_key, (None, None))
+        score_color, score_label = sailing_score(
+            bft, wh_here, wave_direction=wd_here,
+            wind_direction=wdir, wind_gusts_ms=wg)
         hourly.append({
             "datetime": dt_key.isoformat(),
             "hour": int(dt_key.hour),
@@ -6479,13 +6564,19 @@ def _build_wind_block(wind_df, shared_waves_by_dt, shared_waves_daily_by_date):
             peak_dir = grp.loc[idx, 'wind_direction_10m_mean'] if 'wind_direction_10m_mean' in grp.columns else None
         bft_max = beaufort_from_wind(ws_max) if pd.notna(ws_max) else None
         wind_name = cg_wind_name(peak_dir, ws_max)
-        wh_here = shared_waves_daily_by_date.get(date_str)
-        score_color, score_label = sailing_score(bft_max, wh_here)
+        wh_here, wd_here = shared_waves_daily_by_date.get(date_str, (None, None))
+        # Score off the sustained gust, not the daily peak: one spike at 23h
+        # must not cost the whole day a rung. The card still shows the peak.
+        wg_persist = persistent_daytime_gust(grp)
+        score_color, score_label = sailing_score(
+            bft_max, wh_here, wave_direction=wd_here,
+            wind_direction=peak_dir, wind_gusts_ms=wg_persist)
         daily.append({
             "date": date_str,
             "day_name": pd.Timestamp(date_str).strftime('%A'),
             "wind_speed_max": round(float(ws_max), 1) if pd.notna(ws_max) else None,
             "wind_gusts_max": round(float(wg_max), 1) if pd.notna(wg_max) else None,
+            "wind_gusts_persistent": round(wg_persist, 1) if wg_persist is not None else None,
             "wind_direction_peak": round(float(peak_dir), 0) if peak_dir is not None and pd.notna(peak_dir) else None,
             "beaufort_max": bft_max,
             "wind_name": wind_name,
@@ -6505,18 +6596,20 @@ def build_marine_output(marine_results):
     waves_block = _build_wave_block(marine_results.get('waves'))
 
     # Build lookups so wind locations can pair their sailing score with the
-    # shared wave height at the matching hour/day.
+    # shared wave height AND direction at the matching hour/day — the score
+    # needs the bearing to tell a jugo sea from an off-the-land artifact.
     shared_waves_by_dt = {}
     shared_waves_daily = {}
     if waves_block:
         for h in waves_block['hourly']:
             wh = h.get('wave_height')
             if wh is not None:
-                shared_waves_by_dt[pd.Timestamp(h['datetime'])] = wh
+                shared_waves_by_dt[pd.Timestamp(h['datetime'])] = (
+                    wh, h.get('wave_direction'))
         for d in waves_block['daily_summary']:
             wh = d.get('wave_height_max')
             if wh is not None:
-                shared_waves_daily[d['date']] = wh
+                shared_waves_daily[d['date']] = (wh, d.get('wave_dir_at_max'))
 
     wind_locations = []
     for loc in marine_results.get('winds', []):
