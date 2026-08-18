@@ -1,0 +1,109 @@
+{
+  "generated_utc": "2026-08-14T11:52:59+00:00",
+  "partial": false,
+  "processed_shards": [
+    "budva-000000.tar",
+    "budva-000001.tar",
+    "budva-000002.tar",
+    "budva-000003.tar",
+    "budva-000004.tar",
+    "budva-000005.tar",
+    "budva-000006.tar",
+    "budva-000007.tar",
+    "budva-000008.tar",
+    "budva-000009.tar",
+    "budva-000010.tar",
+    "budva-000011.tar",
+    "budva-000012.tar",
+    "budva-000013.tar",
+    "budva-000014.tar",
+    "budva-000015.tar",
+    "budva-000016.tar",
+    "budva-000017.tar",
+    "budva-000018.tar",
+    "budva-000019.tar",
+    "budva-000020.tar",
+    "budva-000021.tar"
+  ],
+  "elapsed_seconds": 2911.06,
+  "sample_errors": 0,
+  "cases_total": 10612,
+  "dry_origin_cases": 8776,
+  "head_to_head_cases": 3590,
+  "assumptions": {
+    "radar_truth": "any >=20 dBZ-equivalent echo within 5 km during next 60 minutes",
+    "dry_origin_only": true,
+    "dry_window_inverse_weight": 20.0,
+    "italiameteo_threshold_mm": 0.1,
+    "skala_replay": "2-D object tracking; no live RHOHV, Doppler, volume products, or scene-motion fallback"
+  },
+  "SKALA_all_archive": {
+    "weighted_n": 24071.0,
+    "hits": 535.0,
+    "misses": 963.0,
+    "false_alarms": 419.0,
+    "correct_rejections": 22154.0,
+    "POD": 0.35714,
+    "FAR": 0.4392,
+    "CSI": 0.27908,
+    "HSS": 0.4077
+  },
+  "SKALA_probability_all_archive": {
+    "n_unweighted": 8776,
+    "ROC_AUC": 0.80738,
+    "average_precision": 0.41098,
+    "Brier": 0.04721
+  },
+  "head_to_head": {
+    "SKALA": {
+      "weighted_n": 9898.0,
+      "hits": 239.0,
+      "misses": 411.0,
+      "false_alarms": 154.0,
+      "correct_rejections": 9094.0,
+      "POD": 0.36769,
+      "FAR": 0.39186,
+      "CSI": 0.29726,
+      "HSS": 0.43009
+    },
+    "ITALIAMETEO": {
+      "weighted_n": 9898.0,
+      "hits": 271.0,
+      "misses": 379.0,
+      "false_alarms": 413.0,
+      "correct_rejections": 8835.0,
+      "POD": 0.41692,
+      "FAR": 0.6038,
+      "CSI": 0.25494,
+      "HSS": 0.36343
+    },
+    "AND": {
+      "weighted_n": 9898.0,
+      "hits": 108.0,
+      "misses": 542.0,
+      "false_alarms": 32.0,
+      "correct_rejections": 9216.0,
+      "POD": 0.16615,
+      "FAR": 0.22857,
+      "CSI": 0.15836,
+      "HSS": 0.2561
+    },
+    "OR": {
+      "weighted_n": 9898.0,
+      "hits": 402.0,
+      "misses": 248.0,
+      "false_alarms": 535.0,
+      "correct_rejections": 8713.0,
+      "POD": 0.61846,
+      "FAR": 0.57097,
+      "CSI": 0.33924,
+      "HSS": 0.46514
+    },
+    "SKALA_probability": {
+      "n_unweighted": 3590,
+      "ROC_AUC": 0.80409,
+      "average_precision": 0.42214,
+      "Brier": 0.04886
+    }
+  }
+}

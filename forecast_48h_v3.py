@@ -715,6 +715,9 @@ FEATURE_MODEL_SUBSET = {
     "wind_gusts_10m":  ["GFS_SEAMLESS", "KNMI_SEAMLESS", "DMI_SEAMLESS", "ICON_SEAMLESS", "ECMWF_IFS025"],
 }
 TRUSTED_RAIN_MODEL = "ITALIAMETEO_ICON2I"
+TRUSTED_CONVECTIVE_VARS = (
+    'showers', 'cape', 'convective_inhibition', 'lightning_potential'
+)
 CORRECTED_RAIN_THRESHOLD_MM = 0.2
 # Sustained wind (m/s) above which RAIN is shown as a gusty/stormy code instead
 # of "light/drizzle": in Budva a few mm with strong wind (or thunder) reads as a
@@ -723,6 +726,16 @@ STORM_WIND_MS = 5.0
 TRUSTED_RAIN_THRESHOLD = 0.1
 LOCAL_DRY_NOWCAST_HOURS = 4
 LOCAL_DRY_LIGHT_RAIN_MAX_MM = 0.7
+
+# Isolated warm-season ICON-2I rain is normally precision-filtered, but native
+# convective diagnostics can rescue a real cell.  These are deliberately
+# conservative: CAPE alone never opens the gate; it must pair with weak CIN and
+# either native showers or wet neighborhood support.  Native lightning/thunder
+# is direct evidence and can rescue without the thermodynamic pair.
+CONVECTIVE_CAPE_MIN_JKG = 500.0
+CONVECTIVE_CIN_MAX_JKG = 75.0
+CONVECTIVE_SHOWER_MIN_MM = 0.2
+CONVECTIVE_NBR_WET_MIN = 0.12
 
 # Short-burst wind boost (microcellular convection signature in trusted model).
 # A "burst" is a contiguous wet run in the trusted model (>= TRUSTED_RAIN_THRESHOLD).
@@ -1037,11 +1050,12 @@ def local_now():
 
 HOURLY_VARS = [
     "temperature_2m", "relative_humidity_2m", "dew_point_2m",
-    "apparent_temperature", "precipitation", "rain", "snowfall",
+    "apparent_temperature", "precipitation", "rain", "showers", "snowfall",
     "weather_code", "pressure_msl", "surface_pressure",
     "cloud_cover", "cloud_cover_low", "cloud_cover_mid", "cloud_cover_high",
     "wind_speed_10m", "wind_speed_100m", "wind_direction_10m", "wind_gusts_10m",
-    "shortwave_radiation", "direct_radiation", "diffuse_radiation"
+    "shortwave_radiation", "direct_radiation", "diffuse_radiation",
+    "cape", "convective_inhibition", "lightning_potential"
 ]
 
 TARGET_PARAMS = {
@@ -1069,14 +1083,102 @@ print("=" * 72)
 
 
 def compute_clear_sky(dt_series):
-    doy = dt_series.dt.dayofyear
-    hour = dt_series.dt.hour + dt_series.dt.minute / 60.0
+    """Approximate clear-sky GHI using *local solar time* for Budva.
+
+    The old curve assumed that the Sun crossed the meridian at 12:00 wall
+    time.  In Budva solar noon is later, especially during daylight-saving
+    time.  That phase error made the station look artificially dim in the
+    afternoon and taught the cloud model a false 17-18h cloud signal.
+    """
+    dt = pd.to_datetime(dt_series)
+    doy = dt.dt.dayofyear
+    wall_hour = dt.dt.hour + dt.dt.minute / 60.0
+
+    # NOAA equation-of-time approximation.  The longitude correction uses the
+    # local standard meridian (15 degrees per UTC-offset hour), so DST is
+    # handled explicitly rather than being baked into an hour-of-day rule.
+    b = 2 * np.pi * (doy - 81) / 364.0
+    equation_of_time_min = (
+        9.87 * np.sin(2 * b) - 7.53 * np.cos(b) - 1.5 * np.sin(b)
+    )
+    try:
+        localized = pd.DatetimeIndex(dt).tz_localize(
+            FORECAST_TIMEZONE, ambiguous='NaT', nonexistent='shift_forward'
+        )
+        utc_offset_h = pd.Series(
+            [x.utcoffset().total_seconds() / 3600.0 if not pd.isna(x) else 1.0
+             for x in localized],
+            index=dt.index,
+        )
+    except Exception:
+        utc_offset_h = pd.Series(1.0, index=dt.index)
+    standard_meridian = 15.0 * utc_offset_h
+    time_correction_min = 4.0 * (LON - standard_meridian) + equation_of_time_min
+    solar_hour = wall_hour + time_correction_min / 60.0
+
     lat_rad = np.radians(LAT)
     dec = np.radians(23.45 * np.sin(np.radians(360 / 365.25 * (doy - 81))))
-    ha = np.radians(15 * (hour - 12))
+    ha = np.radians(15 * (solar_hour - 12))
     sin_e = (np.sin(lat_rad) * np.sin(dec) +
              np.cos(lat_rad) * np.cos(dec) * np.cos(ha)).clip(lower=0)
     return (1361 * sin_e * 0.75).clip(lower=0)
+
+
+def derive_cloud_cover_from_station_solar(datetimes, solar_wm2, fit_mask=None,
+                                          clear_quantile=0.95,
+                                          min_clear_envelope_wm2=75.0,
+                                          min_station_transmission=0.70):
+    """Create a station-calibrated daytime cloud proxy from solar radiation.
+
+    IBUDVA5 is terrain/sensor shaded, most visibly late in the day.  Comparing
+    it directly with an unobstructed theoretical or NWP irradiance curve makes
+    clear afternoons look cloudy.  A pre-test-period monthly/hourly upper
+    envelope represents what *this station* measures on a clear day.  The
+    envelope is fit only on ``fit_mask`` rows to avoid test-set leakage.
+
+    Returns ``(cloud_percent, envelope_wm2)``.  Hours with too little usable
+    irradiance remain NaN because a pyranometer is not a trustworthy cloud
+    sensor close to sunrise/sunset.
+    """
+    dt = pd.to_datetime(datetimes)
+    solar = pd.to_numeric(solar_wm2, errors='coerce')
+    if fit_mask is None:
+        fit_mask = pd.Series(True, index=dt.index)
+    else:
+        fit_mask = pd.Series(fit_mask, index=dt.index).fillna(False).astype(bool)
+
+    theoretical_clear = compute_clear_sky(dt)
+    work = pd.DataFrame({
+        'month': dt.dt.month,
+        'hour': dt.dt.hour,
+        'solar': solar,
+        'theoretical_clear': theoretical_clear,
+    }, index=dt.index)
+    # Fit station transmission rather than raw W/m2.  Solar geometry then
+    # supplies the within-month change in day length/elevation, avoiding a new
+    # edge-of-month bias at 10-12h and 17-18h.
+    work['station_transmission'] = (
+        work['solar'] / work['theoretical_clear'].clip(lower=1.0)
+    ).clip(0.0, 2.0)
+    fit = work.loc[
+        fit_mask & work['solar'].notna() & (work['theoretical_clear'] >= 20.0)
+    ]
+    transmission_table = fit.groupby(['month', 'hour'])[
+        'station_transmission'
+    ].quantile(clear_quantile)
+    keys = pd.MultiIndex.from_arrays([work['month'], work['hour']])
+    transmission = pd.Series(
+        transmission_table.reindex(keys).to_numpy(), index=dt.index, dtype=float
+    )
+    envelope = theoretical_clear * transmission
+
+    reliable = (
+        (envelope >= min_clear_envelope_wm2)
+        & (transmission >= min_station_transmission)
+    )
+    cloud = ((1.0 - solar / envelope.clip(lower=1.0)).clip(0.0, 1.0) * 100.0)
+    cloud.loc[~reliable | solar.isna()] = np.nan
+    return cloud, envelope
 
 
 def fetch_sst_data(start_date, end_date):
@@ -1382,27 +1484,20 @@ def load_historical_data():
             f"Ne mogu ucitati canonical WU observations: {exc}"
         ) from exc
 
-    solar = pd.to_numeric(base.get('shortwave_radiation_obs', pd.Series(dtype=float)), errors='coerce')
-    clear = compute_clear_sky(base['datetime'])
-    clarity = (solar / clear.clip(lower=1)).clip(0, 1.5)
-    cloud = (1 - clarity).clip(0, 1) * 100
-    # Per-season hour window (user-specified; replaces the old clear_sky threshold).
-    # Before sunrise+~1h and after sunset-~1h, the math `1 - solar/clear_sky` is
-    # unstable: tiny clear_sky changes amplify into 30-70% swings in derived
-    # cloud cover, plus terrain shading (Lovcen) makes solar=0 while the
-    # clear_sky model still predicts a few hundred W/m^2.
-    #   Apr-Sep (warm half): keep hours 7-18 inclusive
-    #   Oct-Mar (cold half): keep hours 9-15 inclusive
-    _month = base['datetime'].dt.month
-    _hour = base['datetime'].dt.hour
-    _warm = _month.isin([4, 5, 6, 7, 8, 9])
-    _warm_ok = _warm & (_hour >= 7) & (_hour <= 18)
-    _cold_ok = (~_warm) & (_hour >= 9) & (_hour <= 15)
-    _in_window = _warm_ok | _cold_ok
-    cloud[~_in_window] = np.nan
+    solar = pd.to_numeric(
+        base.get('shortwave_radiation_obs', pd.Series(dtype=float)),
+        errors='coerce',
+    )
+    # Fit the clear-day envelope strictly before the untouched report period.
+    # This removes IBUDVA5's hour-specific terrain/sensor attenuation without
+    # learning anything from the held-out target rows.
+    cloud, station_clear_envelope = derive_cloud_cover_from_station_solar(
+        base['datetime'], solar, fit_mask=base['datetime'] < SPLIT_DATE,
+    )
     base['_derived_cloud_obs'] = cloud
     print(f"  Cloud cover derived: {cloud.notna().sum()} valid "
-          f"(Apr-Sep 7-18h, Oct-Mar 9-15h)")
+          f"(station-calibrated monthly/hourly clear envelope; "
+          f"median={station_clear_envelope.dropna().median():.0f} W/m2)")
 
     # Use canonical precipitation RATE (mm/hr), not accumulated precipitation.
     vals = pd.to_numeric(base['_canonical_precip_rate_mm'], errors='coerce')
@@ -1586,11 +1681,55 @@ def _rain_consensus_stats(rain_values, wet_threshold=0.1,
     """
     values = rain_values.apply(pd.to_numeric, errors='coerce')
     available_count = values.notna().sum(axis=1)
-    wet_count = (values > wet_threshold).sum(axis=1)
+    wet_count = (values >= wet_threshold).sum(axis=1)
     agreement = wet_count.div(available_count.where(available_count > 0))
     wet_hour = (agreement >= consensus_fraction).astype(float)
     wet_hour.loc[available_count == 0] = np.nan
     return wet_count, available_count, agreement, wet_hour
+
+
+def _convective_rescue_mask(frame, isolated_signal):
+    """Return isolated ICON-2I hours with independent convective support.
+
+    The rescue is intentionally precision-first.  CAPE by itself is common on
+    false-alarm summer days, so it only counts with weak inhibition plus native
+    ICON-2I showers or a spatially wet neighborhood.  Native lightning or an
+    explicit thunderstorm weather code is already direct convective evidence.
+    Missing diagnostics never become positive evidence.
+    """
+    idx = frame.index
+
+    def _series(name):
+        return pd.to_numeric(
+            frame.get(name, pd.Series(np.nan, index=idx)), errors='coerce'
+        )
+
+    model = TRUSTED_RAIN_MODEL
+    cape = _series(f'{model}_cape_model').combine_first(
+        _series('cape_ens_max')
+    )
+    cin_strength = _series(f'{model}_convective_inhibition_model').abs()
+    cin_strength = cin_strength.combine_first(_series('cin_ens_mean').abs())
+    showers = _series(f'{model}_showers_model')
+    lightning = _series(f'{model}_lightning_potential_model')
+    neighborhood = _series(f'{model}_nbr_fwet').combine_first(
+        _series('nbr_ens_fwet')
+    )
+    thunder_votes = _series('storm_wc_count').fillna(0.0)
+
+    thermodynamic_support = (
+        (cape >= CONVECTIVE_CAPE_MIN_JKG)
+        & (cin_strength <= CONVECTIVE_CIN_MAX_JKG)
+    )
+    direct_support = (lightning > 0.0) | (thunder_votes >= 1.0)
+    shower_support = (
+        (showers >= CONVECTIVE_SHOWER_MIN_MM) & thermodynamic_support
+    )
+    neighborhood_support = (
+        (neighborhood >= CONVECTIVE_NBR_WET_MIN) & thermodynamic_support
+    )
+    isolated = pd.Series(np.asarray(isolated_signal, dtype=bool), index=idx)
+    return (isolated & (direct_support | shower_support | neighborhood_support)).values
 
 
 def engineer_features(df):
@@ -1656,7 +1795,8 @@ def engineer_features(df):
                        'wind_direction_10m', 'pressure_msl', 'surface_pressure',
                        'cloud_cover', 'cloud_cover_low', 'cloud_cover_mid',
                        'cloud_cover_high', 'precipitation', 'shortwave_radiation',
-                       'direct_radiation', 'diffuse_radiation', 'rain']
+                       'direct_radiation', 'diffuse_radiation', 'rain', 'showers',
+                       'lightning_potential']
 
     for param in ensemble_params:
         mcols = [f"{m}_{param}_model" for m in MODELS if f"{m}_{param}_model" in out.columns]
@@ -1732,8 +1872,27 @@ def engineer_features(df):
         # Direct false-alarm fingerprint per NOT a gate, just a feature.
         icon2i_col = "ITALIAMETEO_ICON2I_precipitation_model"
         if icon2i_col in out.columns:
-            icon2i_wet = (pd.to_numeric(out[icon2i_col], errors='coerce') >= 0.1)
+            icon2i_amount = pd.to_numeric(out[icon2i_col], errors='coerce')
+            icon2i_wet = icon2i_amount >= TRUSTED_RAIN_THRESHOLD
+            # Dedicated trusted-rain features.  Keeping these explicit lets the
+            # classifier learn ICON-2I intensity, onset, persistence, and
+            # isolation differently instead of relying on deep splits over the
+            # raw amount plus generic ensemble statistics.
+            out['italiameteo_rain_amount'] = icon2i_amount
+            out['italiameteo_rain_log_amount'] = np.log1p(icon2i_amount.clip(lower=0))
+            out['italiameteo_rain_signal'] = icon2i_wet.astype(float)
+            out.loc[icon2i_amount.isna(), 'italiameteo_rain_signal'] = np.nan
+            prev_wet = icon2i_wet.shift(1, fill_value=False)
+            out['italiameteo_rain_onset'] = (icon2i_wet & ~prev_wet).astype(float)
+            out.loc[icon2i_amount.isna(), 'italiameteo_rain_onset'] = np.nan
+            out['italiameteo_rain_3h_max'] = icon2i_amount.rolling(
+                3, min_periods=1, center=True
+            ).max()
+            out['italiameteo_rain_3h_sum'] = icon2i_amount.rolling(
+                3, min_periods=1, center=True
+            ).sum()
             out['italiameteo_isolated'] = (icon2i_wet & (out['rain_agreement'] <= 0.30)).astype(float)
+            out.loc[icon2i_amount.isna(), 'italiameteo_isolated'] = np.nan
 
         # Precipitation quantile features — tails matter more than mean for intermittent precip
         if len(rain_mcols) >= 4:
@@ -1923,11 +2082,14 @@ def engineer_features(df):
                 if f"{m}_convective_inhibition_model" in out.columns]
     if cin_cols:
         cin_vals = out[cin_cols].apply(pd.to_numeric, errors='coerce')
-        out['cin_ens_mean'] = cin_vals.mean(axis=1)
-        # CIN is typically negative (energy needed to overcome capping).
-        # Per high CIN suppresses convection despite high CAPE.
-        # low_cin_indicator: 1 if mean CIN > -50 J/kg (= little/no inhibition)
-        out['low_cin_indicator'] = (out['cin_ens_mean'] > -50).astype(float)
+        # APIs/models differ on CIN sign convention.  Inhibition strength is a
+        # magnitude, so normalize with abs() before comparing thresholds.
+        cin_strength = cin_vals.abs()
+        out['cin_ens_mean'] = cin_strength.mean(axis=1)
+        # Low CIN means little cap despite high CAPE.
+        out['low_cin_indicator'] = (
+            out['cin_ens_mean'] <= CONVECTIVE_CIN_MAX_JKG
+        ).astype(float)
         if 'cape_ens_mean' in out.columns:
             # CAPE × low_CIN_indicator = genuine triggering potential
             out['cape_x_low_cin'] = out['cape_ens_mean'] * out['low_cin_indicator']
@@ -1977,10 +2139,10 @@ def engineer_features(df):
     # the storm never fires. Complementary to weakly_forced_regime which
     # captures lack of synoptic forcing rather than thermodynamic capping.
     if 'cape_ens_mean' in out.columns and 'cin_ens_mean' in out.columns:
-        out['high_cin_indicator'] = (out['cin_ens_mean'] < -100).astype(float)
+        out['high_cin_indicator'] = (out['cin_ens_mean'] > 100).astype(float)
         out['hallucination_via_cin_flag'] = (
             (out['cape_ens_mean'] > 500) &
-            (out['cin_ens_mean'] < -100) &
+            (out['cin_ens_mean'] > 100) &
             (out.get('rain_agreement', pd.Series(0, index=out.index)) < 0.30)
         ).astype(float)
 
@@ -3224,7 +3386,7 @@ def _predict_nonprecip_bundle(bundle, X, frame, ens_col):
     return bundle['model'].predict(X)
 
 
-def _postprocess_cloud_prediction(prediction, frame):
+def _postprocess_cloud_prediction(prediction, frame, station_target_version=2):
     """Cloud constraints shared by untouched-report and live inference."""
     pred = np.clip(np.asarray(prediction, dtype=float).copy(), 0, 100)
     ens_col = 'cloud_cover_ens_mean'
@@ -3236,14 +3398,29 @@ def _postprocess_cloud_prediction(prediction, frame):
     pred[low] = np.minimum(pred[low], ensemble[low] + 30)
     pred[high] = np.maximum(pred[high], ensemble[high] - 30)
 
-    hours = pd.to_datetime(frame['datetime']).dt.hour
-    months = pd.to_datetime(frame['datetime']).dt.month
-    warm = months.isin([4, 5, 6, 7, 8, 9])
-    in_window = (
-        (warm & hours.between(10, 18)) |
-        (~warm & hours.between(10, 15))
-    ).values
+    # IBUDVA5's western terrain/sensor obstruction becomes too strong after
+    # 16h in the warm season.  Those 17-18h cloud labels are intentionally not
+    # learned; use the direct cloud ensemble there.  The calibrated station
+    # proxy remains useful through 10-12h and the rest of the reliable window.
+    dt = pd.to_datetime(frame['datetime'])
+    hours = dt.dt.hour
+    warm = dt.dt.month.isin([4, 5, 6, 7, 8, 9])
+    solar_high_enough = compute_clear_sky(dt) >= 75
+    station_unshaded = (
+        (warm & hours.between(8, 16)) |
+        (~warm & hours.between(9, 15))
+    )
+    in_window = (solar_high_enough & station_unshaded).values
     pred[~in_window] = ensemble[~in_window]
+
+    # Existing artifacts were trained on the uncalibrated station-radiation
+    # proxy.  Until a future scheduled retrain produces target version 2, do
+    # not let that known bias drive the exact hours reported by the user.
+    # This compatibility guard is deliberately absent from v2 evaluation and
+    # future v2 artifacts, where the corrected labels are used directly.
+    if int(station_target_version or 1) < 2:
+        legacy_bad_hours = hours.isin([10, 11, 12, 17, 18]).values
+        pred[legacy_bad_hours] = ensemble[legacy_bad_hours]
     return np.clip(pred, 0, 100)
 
 
@@ -3833,6 +4010,56 @@ ONSET_HAZARD_DECLARE = 0.10     # per-hour hazard for a confident onset hour
 ONSET_HAZARD_BAND = 0.05        # lower hazard bounding the earliest/latest window
 
 
+def _score_onset_threshold(hazard, observed_onset, dry_age, datetimes,
+                           threshold):
+    """Score one onset threshold at event level, including false alarms."""
+    pred, obs = _onset_event_hours(
+        hazard, observed_onset, dry_age, datetimes, threshold=threshold,
+    )
+    pred = np.asarray(pred, dtype=float)
+    obs = np.asarray(obs, dtype=float)
+    has_pred = np.isfinite(pred)
+    has_obs = np.isfinite(obs)
+    tp = int((has_pred & has_obs).sum())
+    fp = int((has_pred & ~has_obs).sum())
+    fn = int((~has_pred & has_obs).sum())
+    metrics = onset_timing_metrics(pred, obs)
+    metrics.update({
+        'threshold': float(threshold),
+        'csi': float(tp / max(tp + fp + fn, 1)),
+        'tp': tp, 'fp': fp, 'fn': fn,
+    })
+    return metrics
+
+
+def _select_onset_hazard_threshold(hazard, observed_onset, dry_age, datetimes,
+                                   min_pod=0.50):
+    """Choose the precision-first onset threshold on validation spells.
+
+    The threshold is selected by event CSI, subject to retaining at least 50%
+    onset POD. This makes the production decision an explicit result of onset
+    scores (including false alarms), rather than a hand-written probability.
+    The untouched test period is used only after this selection.
+    """
+    candidates = np.round(np.arange(0.03, 0.305, 0.005), 3)
+    scored = [
+        _score_onset_threshold(
+            hazard, observed_onset, dry_age, datetimes, float(threshold),
+        )
+        for threshold in candidates
+    ]
+    feasible = [m for m in scored if m['onset_pod'] >= min_pod]
+    pool = feasible or scored
+    best = max(
+        pool,
+        key=lambda m: (
+            m['csi'], -m['onset_far'], m.get('hit_within_3h', float('-inf')),
+            m['threshold'],
+        ),
+    )
+    return float(best['threshold']), best
+
+
 def build_onset_person_period(df, feature_cols):
     """Build the dry-spell person-period table (report B1).
     Returns (X with dry_age column, y onset 0/1, datetimes) over period rows
@@ -4014,6 +4241,12 @@ def train_onset_model(df):
         iso = IsotonicRegression(out_of_bounds='clip')
         iso.fit(proba_val, y_val.astype(float))
 
+    calibrated_val = iso.transform(proba_val) if iso is not None else proba_val
+    dt_val = dt[tr].iloc[vcut:].reset_index(drop=True)
+    declare_threshold, threshold_selection = _select_onset_hazard_threshold(
+        calibrated_val, y_val.values, X_val['dry_age'].values, dt_val,
+    )
+
     # Verify on the test period
     proba_te = clf.predict_proba(X_te)[:, 1]
     if iso is not None:
@@ -4025,15 +4258,19 @@ def train_onset_model(df):
     # (>= ONSET_HAZARD_DECLARE), mirroring the precision-first inference rule.
     da = X_te['dry_age'].values
     pred_onset, obs_onset = _onset_event_hours(
-        proba_te, y_te.values, da, dt_te, ONSET_HAZARD_DECLARE
+        proba_te, y_te.values, da, dt_te, declare_threshold
     )
     ometrics = onset_timing_metrics(pred_onset, obs_onset)
+    test_threshold_metrics = _score_onset_threshold(
+        proba_te, y_te.values, da, dt_te, declare_threshold,
+    )
 
     # Baseline: fraction-of-models-wet crossing 0.5 as the onset anchor
     print(f"  [Onset] test Brier={brier:.4f} | onsets(test)={int(y_te.sum())} | "
           f"MAE={ometrics['mae_hours']:.2f}h | hit±1h={ometrics['hit_within_1h']:.2f} "
           f"hit±2h={ometrics['hit_within_2h']:.2f} hit±3h={ometrics['hit_within_3h']:.2f} | "
-          f"onset POD={ometrics['onset_pod']:.2f} FAR={ometrics['onset_far']:.2f}")
+          f"onset POD={ometrics['onset_pod']:.2f} FAR={ometrics['onset_far']:.2f} | "
+          f"threshold={declare_threshold:.3f} CSI={test_threshold_metrics['csi']:.2f}")
 
     # Keep the exact classifier whose validation scores were isotonic-calibrated.
     # Refitting across that calibration tail would invalidate the saved map.
@@ -4044,7 +4281,10 @@ def train_onset_model(df):
         os.path.join(MODEL_DIR, 'onset_meta.json'),
         {'features': feats, 'best_iteration': best_n,
          'threshold_mm': ONSET_THRESHOLD_MM, 'dry_gap': ONSET_DRY_GAP_HOURS,
-         'metrics': ometrics, 'brier': brier},
+         'declare_threshold': declare_threshold,
+         'band_threshold': min(ONSET_HAZARD_BAND, declare_threshold / 2.0),
+         'threshold_selection': threshold_selection,
+         'metrics': test_threshold_metrics, 'brier': brier},
         ensure_ascii=False, indent=2,
     )
     if iso is not None:
@@ -4053,7 +4293,11 @@ def train_onset_model(df):
     else:
         _remove_if_exists(os.path.join(MODEL_DIR, 'onset_iso.joblib'))
     print(f"  [Onset] sačuvan kalibrisani bundle (features={len(feats)}, best_n={best_n}).")
-    return {'model': clf_prod, 'calibrator': iso, 'features': feats, 'metrics': ometrics}
+    return {'model': clf_prod, 'calibrator': iso, 'features': feats,
+            'metrics': test_threshold_metrics,
+            'declare_threshold': declare_threshold,
+            'band_threshold': min(ONSET_HAZARD_BAND, declare_threshold / 2.0),
+            'threshold_source': 'validation_event_scores'}
 
 
 def load_onset_model():
@@ -4074,7 +4318,14 @@ def load_onset_model():
             import joblib
             iso = joblib.load(ipath)
         return {'model': clf, 'calibrator': iso, 'features': meta.get('features', []),
-                'metrics': meta.get('metrics', {})}
+                'metrics': meta.get('metrics', {}),
+                'declare_threshold': float(meta.get(
+                    'declare_threshold', ONSET_HAZARD_DECLARE)),
+                'band_threshold': float(meta.get(
+                    'band_threshold', ONSET_HAZARD_BAND)),
+                'threshold_source': ('validation_event_scores'
+                                     if 'declare_threshold' in meta
+                                     else 'heldout_report_legacy')}
     except Exception as e:
         if _DEVICE_REQUEST == 'cuda':
             raise RuntimeError(f'Onset GPU reload failed: {e}') from e
@@ -4122,16 +4373,25 @@ def _align_onset_features_to_display(fc_features):
 
 
 def predict_onset_timing(fc, bundle):
-    """Walk the live forecast hour-by-hour, accumulate the onset CDF from now
-    forward, and return earliest/likely/latest onset (report B5). Returns None
-    if no bundle or no onset reaches the declaration probability within 48h.
-    Defensive: never raises into the main pipeline."""
+    """Return a scored onset decision for every hour of the +48h horizon.
+
+    The saved validation-selected hazard threshold drives all 48 hours. SKALA
+    is intentionally not baked into that long-range threshold: its support is
+    added later only to the short hours where radar nowcasting exists.
+    Defensive: never raises into the main pipeline.
+    """
     if not bundle:
         return None
     try:
         feats = bundle['features']
         model = bundle['model']
         iso = bundle.get('calibrator')
+        declare_threshold = float(bundle.get(
+            'declare_threshold', ONSET_HAZARD_DECLARE))
+        band_threshold = float(bundle.get(
+            'band_threshold', ONSET_HAZARD_BAND))
+        threshold_source = bundle.get(
+            'threshold_source', 'heldout_report_legacy')
 
         # Prefer the same gated/corrected precipitation that is displayed to
         # users. Fall back to the raw ensemble only for older callers.
@@ -4161,43 +4421,77 @@ def predict_onset_timing(fc, bundle):
             return None
         idx = idx[:48]  # 48h horizon
 
-        # Already raining at the first future hour?
-        if ens_precip[idx[0]] >= ONSET_THRESHOLD_MM:
-            return {'already_raining': True, 'declared': True,
-                    'likely_datetime': dts.iloc[idx[0]].isoformat()}
-
+        already_raining = bool(
+            np.isfinite(ens_precip[idx[0]])
+            and ens_precip[idx[0]] >= ONSET_THRESHOLD_MM
+        )
         S = 1.0
         prob_by_hour = []
-        hz = np.zeros(len(idx))
+        scored_hazard = np.full(len(idx), np.nan)
+        cumulative = np.zeros(len(idx), dtype=float)
         for j, i in enumerate(idx):
-            h = float(np.clip(hazard[i], 0, 0.999))
-            hz[j] = h
-            S *= (1.0 - h)
+            amount = ens_precip[i]
+            eligible = bool(
+                np.isfinite(amount) and np.isfinite(dry_age[i])
+                and dry_age[i] >= ONSET_DRY_GAP_HOURS
+            )
+            if not eligible:
+                # A wet/unknown hour or the start of a new dry spell cannot be
+                # an onset-after-3h-dry decision. Reset the spell CDF.
+                S = 1.0
+                h = None
+                p_by_then = 0.0
+            else:
+                h = float(np.clip(hazard[i], 0, 0.999))
+                scored_hazard[j] = h
+                S *= (1.0 - h)
+                p_by_then = float(1.0 - S)
+            cumulative[j] = p_by_then
             ts = dts.iloc[i]
-            prob_by_hour.append({'datetime': ts.isoformat(), 'hour': int(ts.hour),
-                                 'lead_h': j + 1, 'hazard': round(h, 3),
-                                 'p_by_then': round(float(1.0 - S), 3)})
-        max_prob = round(float(1.0 - S), 3)
-        peak = float(hz.max())
+            signal = bool(h is not None and h >= declare_threshold)
+            prob_by_hour.append({
+                'datetime': ts.isoformat(), 'hour': int(ts.hour),
+                'lead_h': j + 1, 'eligible': eligible,
+                'hazard': round(h, 3) if h is not None else None,
+                'p_by_then': round(p_by_then, 3),
+                'threshold': round(declare_threshold, 3),
+                'signal': signal,
+            })
+        finite_hazard = np.where(np.isfinite(scored_hazard))[0]
+        peak = (float(np.nanmax(scored_hazard)) if finite_hazard.size else 0.0)
+        max_prob = round(float(cumulative.max()), 3)
+        signal_hours = np.where(
+            np.isfinite(scored_hazard) & (scored_hazard >= declare_threshold)
+        )[0]
 
         # Precision-first: declare only when a specific hour's hazard is elevated
         # (avoids declaring from base-rate CDF accumulation over long dry spells).
-        if peak < ONSET_HAZARD_DECLARE:
-            return {'already_raining': False, 'declared': False,
+        if signal_hours.size == 0:
+            return {'already_raining': already_raining,
+                    'declared': already_raining,
+                    'likely_datetime': (dts.iloc[idx[0]].isoformat()
+                                        if already_raining else None),
                     'max_prob': max_prob, 'peak_hazard': round(peak, 3),
+                    'declare_threshold': round(declare_threshold, 3),
+                    'threshold_source': threshold_source,
                     'prob_by_hour': prob_by_hour}
-        likely_j = int(np.argmax(hz >= ONSET_HAZARD_DECLARE))   # first elevated hour
-        band = np.where(hz >= ONSET_HAZARD_BAND)[0]
+        likely_j = int(signal_hours[0])
+        band = np.where(
+            np.isfinite(scored_hazard) & (scored_hazard >= band_threshold)
+        )[0]
         early_j = int(band.min()) if band.size else likely_j
         late_j = int(band.max()) if band.size else likely_j
         return {
-            'already_raining': False,
+            'already_raining': already_raining,
             'declared': True,
-            'likely_datetime': dts.iloc[idx[likely_j]].isoformat(),
+            'likely_datetime': (dts.iloc[idx[0]].isoformat() if already_raining
+                                else dts.iloc[idx[likely_j]].isoformat()),
             'earliest_datetime': dts.iloc[idx[early_j]].isoformat(),
             'latest_datetime': dts.iloc[idx[late_j]].isoformat(),
             'peak_hazard': round(peak, 3),
             'max_prob': max_prob,
+            'declare_threshold': round(declare_threshold, 3),
+            'threshold_source': threshold_source,
             'prob_by_hour': prob_by_hour,
         }
     except Exception as e:
@@ -4205,6 +4499,77 @@ def predict_onset_timing(fc, bundle):
             raise RuntimeError(f'Onset GPU inference failed: {e}') from e
         print(f"  [Onset] inference failed ({e}); bez onset bloka.")
         return None
+
+
+def attach_hourly_onset_signal(corrected, onset_info):
+    """Attach the dedicated +48h onset contract to corrected hourly rows.
+
+    The hazard model supplies the full horizon. SKALA can only corroborate a
+    short-lead signal already present in the radar-corrected hourly forecast;
+    it is never carried forward into hours where radar has no skill window.
+    """
+    if not onset_info or not onset_info.get('prob_by_hour'):
+        return corrected
+    out = corrected.copy()
+    hourly = {}
+    for item in onset_info['prob_by_hour']:
+        try:
+            hourly[pd.Timestamp(item['datetime'])] = item
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    hazard_values = []
+    cumulative_values = []
+    threshold_values = []
+    eligible_values = []
+    signal_values = []
+    skala_values = []
+    source_values = []
+    for _, row in out.iterrows():
+        item = hourly.get(pd.Timestamp(row['datetime']))
+        if item is None:
+            hazard_values.append(np.nan)
+            cumulative_values.append(np.nan)
+            threshold_values.append(np.nan)
+            eligible_values.append(np.nan)
+            signal_values.append(np.nan)
+            skala_values.append(np.nan)
+            source_values.append(None)
+            continue
+
+        eligible = bool(item.get('eligible', False))
+        signal = bool(item.get('signal', False))
+        lead_h = int(item.get('lead_h', 999))
+        skala_raw = row.get('rain_signal_skala_support', 0)
+        rain_raw = row.get('rain_signal', 0)
+        skala_support = bool(
+            lead_h <= 2
+            and pd.notna(skala_raw) and bool(skala_raw)
+            and pd.notna(rain_raw) and bool(rain_raw)
+        )
+        # The replay supports SKALA as short-range corroboration. It can open
+        # the onset signal only for an eligible dry-spell hour, never at +3h+.
+        signal = signal or (eligible and skala_support)
+        source = 'ITALIAMETEO_XGB_ONSET'
+        if skala_support:
+            source += '+SKALA'
+
+        hazard_values.append(item.get('hazard'))
+        cumulative_values.append(item.get('p_by_then'))
+        threshold_values.append(item.get('threshold'))
+        eligible_values.append(float(eligible))
+        signal_values.append(float(signal))
+        skala_values.append(float(skala_support))
+        source_values.append(source)
+
+    out['rain_onset_hazard'] = hazard_values
+    out['rain_onset_probability_by_then'] = cumulative_values
+    out['rain_onset_threshold'] = threshold_values
+    out['rain_onset_eligible'] = eligible_values
+    out['rain_onset_signal'] = signal_values
+    out['rain_onset_skala_support'] = skala_values
+    out['rain_onset_source'] = source_values
+    return out
 
 
 def compute_bias_drift(df, out_path=None):
@@ -4975,6 +5340,41 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
                     print(f"    Blend improved (selection half): alpha={b_alpha:.3f}, "
                           f"MAE {base_mae_sel:.3f}->{b_mae_sel:.3f}")
 
+            # A second, dedicated amount blend cooperates with the trusted
+            # ICON-2I signal.  It is accepted only when it lowers MAE on the
+            # selection half; otherwise alpha remains 1 and behavior is
+            # unchanged.  The hard rain/no-rain policy is evaluated separately.
+            trusted_amount_alpha = 1.0
+            trusted_col = f'{TRUSTED_RAIN_MODEL}_precipitation_model'
+            if trusted_col in X_te_sel.columns:
+                amount_sel = xgb_sel.copy()
+                if blend_alpha < 1.0 and ens_col in df_v.columns:
+                    amount_sel = _clamp_precip_prediction(
+                        blend_alpha * xgb_sel + (1 - blend_alpha) * ens_sel,
+                        X_te_sel,
+                    )
+                trusted_sel = pd.to_numeric(
+                    X_te_sel[trusted_col], errors='coerce'
+                ).to_numpy(dtype=float)
+                valid_trusted = np.isfinite(trusted_sel)
+                best_amount_mae = mean_absolute_error(y_te_sel, amount_sel)
+                for candidate_alpha in np.arange(0.50, 1.01, 0.025):
+                    candidate = amount_sel.copy()
+                    candidate[valid_trusted] = (
+                        candidate_alpha * amount_sel[valid_trusted]
+                        + (1 - candidate_alpha) * trusted_sel[valid_trusted]
+                    )
+                    candidate = _clamp_precip_prediction(candidate, X_te_sel)
+                    candidate_mae = mean_absolute_error(y_te_sel, candidate)
+                    if candidate_mae < best_amount_mae:
+                        trusted_amount_alpha = float(candidate_alpha)
+                        best_amount_mae = candidate_mae
+                precip_result['trusted_amount_alpha'] = trusted_amount_alpha
+                if trusted_amount_alpha < 1.0:
+                    print(f"    Trusted amount blend improved (selection half): "
+                          f"alpha={trusted_amount_alpha:.3f}, "
+                          f"MAE={best_amount_mae:.3f}")
+
             # Report on the REPORT half with the chosen method + alpha (no further choice).
             xgb_rep = _precip_xgb_pred(X_te_rep)
             cls_rep_raw = precip_result['cls_model'].predict_proba(X_te_rep)[:, 1]
@@ -5006,6 +5406,16 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
                 )
             else:
                 final_rep = xgb_rep
+            if trusted_amount_alpha < 1.0 and trusted_col in X_te_rep.columns:
+                trusted_rep = pd.to_numeric(
+                    X_te_rep[trusted_col], errors='coerce'
+                ).to_numpy(dtype=float)
+                valid_trusted = np.isfinite(trusted_rep)
+                final_rep[valid_trusted] = (
+                    trusted_amount_alpha * final_rep[valid_trusted]
+                    + (1 - trusted_amount_alpha) * trusted_rep[valid_trusted]
+                )
+                final_rep = _clamp_precip_prediction(final_rep, X_te_rep)
             mae = mean_absolute_error(y_te_rep, final_rep)
             rmse = np.sqrt(mean_squared_error(y_te_rep, final_rep))
 
@@ -5130,6 +5540,9 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
                 'method': precip_result['best_method'],
                 'is_residual': False,
                 'blend_alpha': float(precip_result.get('blend_alpha', 1.0)),
+                'trusted_amount_alpha': float(
+                    precip_result.get('trusted_amount_alpha', 1.0)
+                ),
                 'threshold': float(precip_result['threshold']),
                 'use_sqrt': bool(precip_result.get('use_sqrt', False)),
                 'is_precip': True,
@@ -5402,6 +5815,7 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
             'features': effective_features,
             'csi_mode': csi_mode,
             'dew_deficit_mode': dew_deficit_mode,
+            'cloud_target_version': 2 if param == 'cloud_cover' else None,
             'mae': mae, 'rmse': rmse,
             'best_model': best_m, 'best_model_mae': best_mae,
             'ensemble_mae': ens_mae, 'improvement': impr,
@@ -5423,6 +5837,7 @@ def train_all_models(df, lead_frames=None, only_targets=None, snapshot=True):
             # --skip-training reload reproduces the exact training-time path.
             'csi_mode': bool(csi_mode),
             'dew_deficit_mode': bool(dew_deficit_mode),
+            'cloud_target_version': 2 if param == 'cloud_cover' else None,
             'has_catboost': bool(_deploy_ridge_meta and rb_result.get('has_catboost', False)),
             'has_lightgbm': bool(_deploy_ridge_meta and rb_result.get('has_lightgbm', False)),
             'is_precip': False,
@@ -5555,6 +5970,9 @@ def load_trained_models():
                     'threshold': rinfo.get('threshold', 0.35),
                     'use_sqrt': rinfo.get('use_sqrt', False),
                     'blend_alpha': rinfo.get('blend_alpha', 1.0),
+                    'trusted_amount_alpha': rinfo.get(
+                        'trusted_amount_alpha', 1.0
+                    ),
             }
             if tweedie_model is not None:
                 precip_info['tweedie_model'] = tweedie_model
@@ -5668,6 +6086,9 @@ def load_trained_models():
                 'model_ens_col': rinfo.get('model_ens_col', f'{param}_ens_mean'),
                 'csi_mode': bool(rinfo.get('csi_mode', False)),
                 'dew_deficit_mode': bool(rinfo.get('dew_deficit_mode', False)),
+                'cloud_target_version': int(
+                    rinfo.get('cloud_target_version', 1)
+                ) if param == 'cloud_cover' else None,
                 'features': features,
                 'mae': rinfo['mae'], 'rmse': rinfo['rmse'],
                 'best_model': rinfo.get('best_model', ''),
@@ -5819,7 +6240,12 @@ def fetch_live_forecasts():
             cached = _load_stale_cache(cache_path)[0]  # load regardless of age now
             if cached is not None:
                 h = cached.get('hourly', {})
-                if (not is_trusted) or (h and 'precipitation' in h and h.get('precipitation')):
+                trusted_base_ok = h and 'precipitation' in h and h.get('precipitation')
+                trusted_diag_ok = all(
+                    name in h and h.get(name) for name in TRUSTED_CONVECTIVE_VARS
+                )
+                if ((not is_trusted)
+                        or (trusted_base_ok and trusted_diag_ok)):
                     d = pd.DataFrame({'datetime': pd.to_datetime(h.get('time', []))})
                     for v in HOURLY_VARS:
                         if v in h:
@@ -5828,6 +6254,8 @@ def fetch_live_forecasts():
                     age_h = _cache_age_hours(cache_path)
                     print(f"CACHE ({len(d)}h, {(age_h or 0):.1f}h, {cache_reason})")
                     continue
+                if is_trusted and trusted_base_ok and not trusted_diag_ok:
+                    print("CACHE bez convective dijagnostike; refetch", end=" ")
 
         params = {
             "latitude": LAT, "longitude": LON,
@@ -7004,6 +7432,19 @@ def apply_correction(fc_df, trained, bias_tables, local_dry_nowcast=False):
             # "trusted model has no data" can never become a dry forecast.
             trusted_vals_filled = np.where(trusted_nan, 0.0, trusted_vals)
             trusted_signal = trusted_vals_filled >= TRUSTED_RAIN_THRESHOLD
+            italiameteo_raw_signal = trusted_signal.copy()
+
+            trusted_amount_alpha = float(
+                pinfo.get('trusted_amount_alpha', 1.0)
+            )
+            if trusted_amount_alpha < 1.0:
+                valid_trusted_amount = ~trusted_nan
+                pred[valid_trusted_amount] = (
+                    trusted_amount_alpha * pred[valid_trusted_amount]
+                    + (1.0 - trusted_amount_alpha)
+                    * trusted_vals_filled[valid_trusted_amount]
+                )
+                pred = np.clip(pred, 0.0, 50.0)
 
             # Hard trusted rain gate:
             # - ItaliaMeteo can trigger rain alone at 0.1mm.
@@ -7016,6 +7457,7 @@ def apply_correction(fc_df, trained, bias_tables, local_dry_nowcast=False):
             # predicts weakly-forced summer convection. When in summer AND only
             # high-res LAMs see rain (low global agreement), DON'T let ICON-2I
             # alone open the gate. Suppress the false-alarm fingerprint.
+            convective_rescue = np.zeros(len(fc), dtype=bool)
             try:
                 hours_dt = pd.to_datetime(fc['datetime'])
                 month_arr = hours_dt.dt.month.values
@@ -7026,16 +7468,33 @@ def apply_correction(fc_df, trained, bias_tables, local_dry_nowcast=False):
                 italiameteo_isolated_signal = (
                     is_warm_season & trusted_signal & (rain_agree <= 0.30)
                 )
-                n_suppressed = int(italiameteo_isolated_signal.sum())
+                convective_rescue = _convective_rescue_mask(
+                    fc, italiameteo_isolated_signal
+                )
+                suppress_signal = (
+                    italiameteo_isolated_signal & ~convective_rescue
+                )
+                n_rescued = int(convective_rescue.sum())
+                n_suppressed = int(suppress_signal.sum())
                 if n_suppressed > 0:
-                    # Treat as no_signal: do not let ICON-2I alone trigger summer rain
-                    trusted_signal = trusted_signal & ~italiameteo_isolated_signal
+                    # Treat as no_signal unless native/spatial convective
+                    # diagnostics independently support the isolated cell.
+                    trusted_signal = trusted_signal & ~suppress_signal
                     no_signal = ~trusted_signal
                     trusted_signal_amount = np.where(trusted_signal, trusted_vals_filled, 0)
                     print(f"  Abstention: {n_suppressed} summer hour(s) with isolated "
                           f"ICON-2I rain signal SUPPRESSED (weakly-forced convection regime)")
+                if n_rescued > 0:
+                    print(f"  Convective rescue: {n_rescued} isolated ICON-2I "
+                          f"hour(s) retained by lightning/showers/neighborhood + CAPE/CIN")
             except Exception as _e:
                 pass  # be defensive; don't break inference if any field missing
+
+            # Preserve the dedicated ICON-2I support signal separately from the
+            # final gate.  The latter may later be replaced by a validated PoP
+            # blend or adjusted by SKALA; this field always answers the useful
+            # diagnostic question "did the trusted LAM support rain here?".
+            italiameteo_signal = trusted_signal.copy()
 
             # --- calibrated PoP-blend gate (only when it beat the
             # single-LAM veto in the regime-conditional eval). The fetch-level
@@ -7094,12 +7553,15 @@ def apply_correction(fc_df, trained, bias_tables, local_dry_nowcast=False):
             # abstention), the system asserts dry, so PoP -> 0. Set BEFORE the
             # radar block so the radar nowcast can blend it.
             corrected['precipitation_pop'] = np.clip(
-                np.where(no_signal, 0.0, cls_proba), 0.0, 1.0)
+                np.where(no_signal, 0.0, np.maximum(cls_proba, thresh)),
+                0.0, 1.0,
+            )
 
             # --- SKALA radar nowcast as a WEIGHTED 0-6h member ---
             # Replaces "hard override" thinking: weight w(lead) falls linearly
             # from 1 (now) to 0 (+6h); PoP is blended, amounts are only nudged
             # (dry-suppressed or wet-floored) when the radar is confident.
+            skala_rain_support = np.zeros(len(fc), dtype=bool)
             radar_nc = read_radar_nowcast()
             if radar_nc is not None:
                 _now_b = local_now().floor('h')
@@ -7114,6 +7576,7 @@ def apply_correction(fc_df, trained, bias_tables, local_dry_nowcast=False):
                     # cell already passed Budva — don't let the 120-min bucket
                     # keep the next hours wet
                     p_radar = np.minimum(p_radar, 0.2)
+                skala_rain_support = (w_radar > 0.0) & (p_radar >= 0.5)
                 if 'precipitation_pop' in corrected.columns:
                     _pop = corrected['precipitation_pop'].values.astype(float)
                     corrected['precipitation_pop'] = np.clip(
@@ -7154,6 +7617,32 @@ def apply_correction(fc_df, trained, bias_tables, local_dry_nowcast=False):
                 pred[dry_now_mask] = 0.0
 
             pred[pred < CORRECTED_RAIN_THRESHOLD_MM] = 0.0
+
+            # Explicit rain-signal contract for downstream consumers.  This is
+            # intentionally distinct from precipitation amount: it exposes the
+            # trusted-model support, the final ITALIAMETEO/XGB/SKALA decision,
+            # and its calibrated probability without making clients reverse-
+            # engineer those semantics from a rounded mm value.
+            corrected['italiameteo_precipitation'] = np.where(
+                trusted_nan, np.nan, trusted_vals_filled
+            )
+            corrected['italiameteo_rain_signal'] = np.where(
+                trusted_nan, np.nan, italiameteo_raw_signal.astype(float)
+            )
+            corrected['italiameteo_rain_accepted'] = np.where(
+                trusted_nan, np.nan, italiameteo_signal.astype(float)
+            )
+            corrected['rain_signal_convective_rescue'] = np.where(
+                trusted_nan, np.nan, convective_rescue.astype(float)
+            )
+            corrected['rain_signal_skala_support'] = skala_rain_support.astype(float)
+            corrected['rain_signal'] = np.where(
+                trusted_nan, np.nan,
+                (pred >= CORRECTED_RAIN_THRESHOLD_MM).astype(float),
+            )
+            corrected['rain_signal_confidence'] = corrected[
+                'precipitation_pop'
+            ].values
 
             # A missing trusted-gate value is unknown, not evidence of dry
             # weather. Other global models may still extend farther, but this
@@ -7220,7 +7709,9 @@ def apply_correction(fc_df, trained, bias_tables, local_dry_nowcast=False):
         if param == 'relative_humidity_2m':
             pred = np.clip(pred, 0, 100)
         elif param == 'cloud_cover':
-            pred = _postprocess_cloud_prediction(pred, fc)
+            pred = _postprocess_cloud_prediction(
+                pred, fc, minfo.get('cloud_target_version', 1)
+            )
         elif param in ['wind_speed_10m', 'wind_gusts_10m', 'shortwave_radiation']:
             pred = np.clip(pred, 0, None)
 
@@ -7368,6 +7859,9 @@ def apply_correction(fc_df, trained, bias_tables, local_dry_nowcast=False):
         # distributional columns of end-of-hour-labelled quantities
         # follow their point forecasts (precip + wind; temp stays instantaneous).
         'precipitation_pop', 'p_precip_gt1', 'p_precip_gt5',
+        'italiameteo_precipitation', 'italiameteo_rain_signal',
+        'italiameteo_rain_accepted', 'rain_signal_convective_rescue',
+        'rain_signal_skala_support', 'rain_signal', 'rain_signal_confidence',
         'p_gust_gt10', 'p_gust_gt17',
     ] + [c for c in corrected.columns
          if (c.startswith('precipitation_q') or c.startswith('wind_gusts_10m_q'))]
@@ -8094,10 +8588,36 @@ def generate_output(corrected, trained, results, fc_raw=None, marine=None, onset
             if v is not None and pd.notna(v):
                 entry[qcol] = round(float(v), 2)
         for pcol in ['precipitation_pop', 'p_precip_gt1', 'p_precip_gt5',
-                     'p_gust_gt10', 'p_gust_gt17']:
+                      'p_gust_gt10', 'p_gust_gt17',
+                     'rain_signal_confidence', 'rain_onset_hazard',
+                     'rain_onset_probability_by_then', 'rain_onset_threshold']:
             v = row.get(pcol, None)
             if v is not None and pd.notna(v):
                 entry[pcol] = round(float(v), 3)
+
+        trusted_amount = row.get('italiameteo_precipitation', None)
+        if trusted_amount is not None and pd.notna(trusted_amount):
+            entry['italiameteo_precipitation'] = round(float(trusted_amount), 2)
+        for signal_col in [
+                'italiameteo_rain_signal', 'italiameteo_rain_accepted',
+                'rain_signal_convective_rescue', 'rain_signal_skala_support',
+                'rain_signal', 'rain_onset_eligible', 'rain_onset_signal',
+                'rain_onset_skala_support']:
+            signal = row.get(signal_col, None)
+            if signal is not None and pd.notna(signal):
+                entry[signal_col] = bool(signal)
+        if entry.get('rain_signal'):
+            sources = ['XGB']
+            if entry.get('italiameteo_rain_accepted'):
+                sources.insert(0, 'ITALIAMETEO_ICON2I')
+            if entry.get('rain_signal_convective_rescue'):
+                sources.append('CONVECTIVE_DIAGNOSTICS')
+            if entry.get('rain_signal_skala_support'):
+                sources.append('SKALA')
+            entry['rain_signal_source'] = '+'.join(sources)
+        onset_source = row.get('rain_onset_source', None)
+        if onset_source and entry.get('rain_onset_signal'):
+            entry['rain_onset_source'] = str(onset_source)
 
         hv = hail_votes.get(row['datetime'])
         if hv:
@@ -8444,6 +8964,7 @@ if __name__ == "__main__":
                     _fc_feat['datetime']
                 ).map(_state_by_time)
             onset_info = predict_onset_timing(_fc_feat, onset_bundle)
+            corrected = attach_hourly_onset_signal(corrected, onset_info)
             if onset_info and onset_info.get('declared'):
                 if onset_info.get('already_raining'):
                     print("  [Onset] kiša već pada na početku horizonta.")

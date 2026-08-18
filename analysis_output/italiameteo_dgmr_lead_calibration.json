@@ -1,0 +1,181 @@
+{
+  "artifact_version": 1,
+  "generated_utc": "2026-08-14T12:22:18+00:00",
+  "target": "any >=20 dBZ-equivalent DGMR echo within 5 km in next 60 minutes",
+  "population": "dry-origin replay cases with inverse-probability dry weights",
+  "model": "italia_meteo_arpae_icon_2i",
+  "anchors": {
+    "lead_0h": {
+      "coverage": {
+        "usable": 3590,
+        "fit": 1483,
+        "calibration": 495,
+        "test": 1612,
+        "test_start": "2026-01-01T11:40:05+00:00",
+        "test_end": "2026-06-16T17:10:05+00:00"
+      },
+      "model": {
+        "transform": "log1p_mm",
+        "coef": 1.4676478561055522,
+        "intercept": -3.0427852242739095,
+        "probability_threshold": 0.04981897826643105,
+        "equivalent_amount_threshold_mm": 0.06652777777777771
+      },
+      "selection_2025_tail": {
+        "weighted_n": 1312.0,
+        "hits": 69.0,
+        "misses": 82.0,
+        "false_alarms": 102.0,
+        "correct_rejections": 1059.0,
+        "POD": 0.45695,
+        "FAR": 0.59649,
+        "CSI": 0.27273,
+        "threshold": 0.04981897826643105
+      },
+      "test_2026": {
+        "calibrated_probability": {
+          "ROC_AUC": 0.78159,
+          "average_precision": 0.32283,
+          "Brier": 0.05906
+        },
+        "calibrated_signal": {
+          "weighted_n": 4025.0,
+          "hits": 153.0,
+          "misses": 121.0,
+          "false_alarms": 285.0,
+          "correct_rejections": 3466.0,
+          "POD": 0.55839,
+          "FAR": 0.65068,
+          "CSI": 0.2737
+        },
+        "raw_amount_ge_0_1mm": {
+          "weighted_n": 4025.0,
+          "hits": 149.0,
+          "misses": 125.0,
+          "false_alarms": 251.0,
+          "correct_rejections": 3500.0,
+          "POD": 0.5438,
+          "FAR": 0.6275,
+          "CSI": 0.28381
+        },
+        "calibrated_minus_raw_CSI": -0.01011
+      },
+      "deployment_recommendation": "do_not_deploy"
+    },
+    "lead_24h": {
+      "coverage": {
+        "usable": 3382,
+        "fit": 1475,
+        "calibration": 492,
+        "test": 1415,
+        "test_start": "2026-01-01T11:40:05+00:00",
+        "test_end": "2026-06-16T17:10:05+00:00"
+      },
+      "model": {
+        "transform": "log1p_mm",
+        "coef": 2.2894481422484834,
+        "intercept": -3.0720015856182123,
+        "probability_threshold": 0.04673742995162345,
+        "equivalent_amount_threshold_mm": 0.02505555555555557
+      },
+      "selection_2025_tail": {
+        "weighted_n": 1309.0,
+        "hits": 68.0,
+        "misses": 82.0,
+        "false_alarms": 98.0,
+        "correct_rejections": 1061.0,
+        "POD": 0.45333,
+        "FAR": 0.59036,
+        "CSI": 0.27419,
+        "threshold": 0.04673742995162345
+      },
+      "test_2026": {
+        "calibrated_probability": {
+          "ROC_AUC": 0.77901,
+          "average_precision": 0.3858,
+          "Brier": 0.06067
+        },
+        "calibrated_signal": {
+          "weighted_n": 3125.0,
+          "hits": 150.0,
+          "misses": 90.0,
+          "false_alarms": 333.0,
+          "correct_rejections": 2552.0,
+          "POD": 0.625,
+          "FAR": 0.68944,
+          "CSI": 0.26178
+        },
+        "raw_amount_ge_0_1mm": {
+          "weighted_n": 3125.0,
+          "hits": 135.0,
+          "misses": 105.0,
+          "false_alarms": 218.0,
+          "correct_rejections": 2667.0,
+          "POD": 0.5625,
+          "FAR": 0.61756,
+          "CSI": 0.29476
+        },
+        "calibrated_minus_raw_CSI": -0.03298
+      },
+      "deployment_recommendation": "do_not_deploy"
+    },
+    "lead_48h": {
+      "coverage": {
+        "usable": 3465,
+        "fit": 1437,
+        "calibration": 479,
+        "test": 1549,
+        "test_start": "2026-01-01T11:40:05+00:00",
+        "test_end": "2026-06-16T17:10:05+00:00"
+      },
+      "model": {
+        "transform": "log1p_mm",
+        "coef": 1.6339193816150832,
+        "intercept": -3.1268043833575097,
+        "probability_threshold": 0.05163953980762139,
+        "equivalent_amount_threshold_mm": 0.1415833333333333
+      },
+      "selection_2025_tail": {
+        "weighted_n": 1258.0,
+        "hits": 61.0,
+        "misses": 87.0,
+        "false_alarms": 74.0,
+        "correct_rejections": 1036.0,
+        "POD": 0.41216,
+        "FAR": 0.54815,
+        "CSI": 0.27477,
+        "threshold": 0.05163953980762139
+      },
+      "test_2026": {
+        "calibrated_probability": {
+          "ROC_AUC": 0.6969,
+          "average_precision": 0.26776,
+          "Brier": 0.06025
+        },
+        "calibrated_signal": {
+          "weighted_n": 3753.0,
+          "hits": 98.0,
+          "misses": 163.0,
+          "false_alarms": 206.0,
+          "correct_rejections": 3286.0,
+          "POD": 0.37548,
+          "FAR": 0.67763,
+          "CSI": 0.20985
+        },
+        "raw_amount_ge_0_1mm": {
+          "weighted_n": 3753.0,
+          "hits": 101.0,
+          "misses": 160.0,
+          "false_alarms": 233.0,
+          "correct_rejections": 3259.0,
+          "POD": 0.38697,
+          "FAR": 0.6976,
+          "CSI": 0.20445
+        },
+        "calibrated_minus_raw_CSI": 0.0054
+      },
+      "deployment_recommendation": "do_not_deploy"
+    }
+  },
+  "deployment_note": "Anchors are approximately 0/24/48-hour forecast age. Interpolate calibration coefficients by live lead only after reviewing held-out scores."
+}

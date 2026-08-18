@@ -121,6 +121,20 @@ predviđaju >0.1 mm u bilo kom satu tog dana — consensus metrika. Satna
 kalibrisana PoP (izotonička kalibracija + prag) i kvantilna traka postoje
 kao poseban sloj u JSON-u kad su modeli trenirani.
 
+Satni JSON takođe izlaže eksplicitni `rain_signal`: konačnu binarnu odluku
+ITALIAMETEO ICON-2I + XGBoost + SKALA sistema, `rain_signal_confidence`,
+`italiameteo_rain_signal`, `italiameteo_rain_accepted`, convective/SKALA support
+zastavice i sirovi `italiameteo_precipitation`. Izolovani ljetnji ICON-2I signal
+se zadržava samo uz native lightning/thunder dokaz ili uz CAPE + slabi CIN i
+showers/neighborhood podršku. Tako klijent ne mora da zaključuje signal kiše iz
+zaokružene količine padavina.
+
+Odvojeni `rain_onset_signal` važi za svaki sat cijelog +48h horizonta. Uz njega
+se objavljuju kalibrisani `rain_onset_hazard`, vjerovatnoća do tog sata,
+validacionim onset/FAR/CSI skorovima izabrani prag i izvor. SKALA može potvrditi
+signal samo u prva dva sata; nakon toga odluku nose ITALIAMETEO i XGBoost onset
+model, bez prenošenja radarskog signala van njegovog provjerenog dometa.
+
 ## Autor
 
 Matija Ivanović · [@matko-iv](https://github.com/matko-iv)
