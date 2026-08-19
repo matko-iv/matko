@@ -1010,7 +1010,7 @@
     </p>
 
 	<p>
-        <b>POZOR!</b> Nova verzija modela bazirana je na treniranju na CUDA arhitekturi, te zahtijeva RTX grafičku kartu 2080 ili novije. U verziji 5.1 dodat je opcioni legacy flag <code>--cpu</code> koji omogućava treniranje na procesoru, ali se ne preporučuje od verzije 5 pa nadalje. Stari modeli idalje su dostupni u Commit history na Github-u.<br>Noviteti u verziji 5: model je unaprijeđen prelaskom treninga sa procesora na GPU, što omogućava brže treniranje, detaljniju optimizaciju i precizniju kalibraciju prognoze. Ispravljeni su problemi sa podacima o padavinama, curenjem informacija i probabilističkim proračunima, a uvedene su pouzdanije procjene vjerovatnoće kiše i raspona mogućih vrijednosti. Dodate su i strože provjere podataka i automatski testovi kako bi sistem bio stabilniji i pouzdaniji.
+        Sljedeća verzija modela, koja je trenutno u fazi treniranja, koristi prošireni skup podataka do avgusta 2026. i Optuna optimizaciju hiperparametara na GPU-u, uz sve modele iz glavnog pipelinea. Zbog ovoga ukupna veličina modela prevagnuće 1GB, a zahtijeva 6GB VRAM-a na CUDA podržanoj grafičkoj karti.
     </p>
 
     <p>
