@@ -72,5 +72,79 @@
    "precipitation": "WARN regression 0.251 -> 0.529 (rollback: trained_models_v2/_champion)",
    "shortwave_radiation": "promoted"
   }
+ },
+ {
+  "timestamp": "2026-08-19T02:42:00.441097",
+  "data_rows": 53706,
+  "data_end": "2026-08-18 15:00:00",
+  "lead_stack": true,
+  "trials": 50,
+  "metrics": {
+   "temperature_2m": {
+    "mae": 0.929,
+    "quantile_crps": 0.7348,
+    "method": "blend",
+    "rain_gate_mode": null
+   },
+   "dew_point_2m": {
+    "mae": 1.252,
+    "quantile_crps": null,
+    "method": "blend",
+    "rain_gate_mode": null
+   },
+   "relative_humidity_2m": {
+    "mae": 6.236,
+    "quantile_crps": null,
+    "method": "stacked",
+    "rain_gate_mode": null
+   },
+   "wind_speed_10m": {
+    "mae": 0.323,
+    "quantile_crps": 0.245,
+    "method": "stacked",
+    "rain_gate_mode": null
+   },
+   "wind_gusts_10m": {
+    "mae": 0.609,
+    "quantile_crps": 0.4753,
+    "method": "blend",
+    "rain_gate_mode": null
+   },
+   "pressure_msl": {
+    "mae": 0.335,
+    "quantile_crps": null,
+    "method": "blend",
+    "rain_gate_mode": null
+   },
+   "cloud_cover": {
+    "mae": 11.88,
+    "quantile_crps": null,
+    "method": "stacked",
+    "rain_gate_mode": null
+   },
+   "precipitation": {
+    "mae": 0.264,
+    "quantile_crps": 0.1359,
+    "method": "tweedie",
+    "rain_gate_mode": "trusted"
+   },
+   "shortwave_radiation": {
+    "mae": 37.386,
+    "quantile_crps": null,
+    "method": "stacked",
+    "rain_gate_mode": null
+   }
+  },
+  "champion_gate": {
+   "temperature_2m": "promoted",
+   "dew_point_2m": "WARN regression 0.977 -> 1.252 (rollback: trained_models_v2/_champion)",
+   "relative_humidity_2m": "promoted",
+   "wind_speed_10m": "promoted",
+   "wind_gusts_10m": "promoted",
+   "pressure_msl": "promoted",
+   "cloud_cover": "promoted",
+   "precipitation": "promoted",
+   "shortwave_radiation": "WARN regression 13.34 -> 37.386 (rollback: trained_models_v2/_champion)"
+  }
  }
 ]

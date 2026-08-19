@@ -8,3 +8,5 @@ catboost==1.2.10
 lightgbm==4.6.0
 scipy==1.18.0
 joblib==1.5.3
+beautifulsoup4==4.15.0
+lxml==6.1.1

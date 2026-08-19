@@ -1,0 +1,6 @@
+shard,key,origin_utc,selection_weight,tile_n_wet_frames,current_rain,observed_15,observed_30,observed_60,skala_pred60,skala_p15,skala_p30,skala_p60,skala_p120,italia_mm60,italia_pred01
+0,0,2023-05-23T05:45:03+00:00,20.0,0,False,False,False,False,False,0.0,0.0,0.0,0.0,,
+0,1,2023-05-23T06:40:05+00:00,20.0,0,False,False,False,False,False,0.0,0.0,0.0,0.0,,
+0,2,2023-05-23T11:30:05+00:00,1.0,22,False,False,False,False,False,0.0,0.0,0.0,0.0,,
+0,3,2023-05-23T12:25:03+00:00,1.0,22,False,False,False,False,False,0.0,0.0,0.0,0.52,,
+0,4,2023-05-23T13:20:05+00:00,1.0,22,False,False,False,False,False,0.0,0.0,0.054,0.337,,

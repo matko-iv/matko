@@ -1,0 +1,34 @@
+{
+  "generated_utc": "2026-08-14T11:04:04+00:00",
+  "partial": true,
+  "processed_shards": [
+    "budva-000000.tar"
+  ],
+  "elapsed_seconds": 5.94,
+  "sample_errors": 0,
+  "cases_total": 5,
+  "dry_origin_cases": 5,
+  "head_to_head_cases": 0,
+  "assumptions": {
+    "radar_truth": "any >=20 dBZ-equivalent echo within 5 km during next 60 minutes",
+    "dry_origin_only": true,
+    "dry_window_inverse_weight": 20.0,
+    "italiameteo_threshold_mm": 0.1,
+    "skala_replay": "2-D object tracking; no live RHOHV, Doppler, volume products, or scene-motion fallback"
+  },
+  "SKALA_all_archive": {
+    "weighted_n": 43.0,
+    "hits": 0.0,
+    "misses": 0.0,
+    "false_alarms": 0.0,
+    "correct_rejections": 43.0,
+    "POD": null,
+    "FAR": null,
+    "CSI": null,
+    "HSS": null
+  },
+  "SKALA_probability_all_archive": {
+    "n": 5,
+    "note": "only one observed class"
+  }
+}

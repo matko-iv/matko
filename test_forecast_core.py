@@ -134,7 +134,8 @@ class ForecastCoreTests(unittest.TestCase):
 
     def test_rain_consensus_excludes_missing_members_and_counts_hours(self):
         values = pd.DataFrame({
-            'a': [0.2, 0.2, np.nan, 0.0],
+            # Exactly 0.1 mm is wet everywhere else in the rain contract.
+            'a': [0.2, 0.1, np.nan, 0.0],
             'b': [0.3, np.nan, np.nan, 0.2],
             'c': [0.4, np.nan, np.nan, 0.0],
         })
@@ -159,6 +160,35 @@ class ForecastCoreTests(unittest.TestCase):
         self.assertEqual(engineered['rain_hours_6h'].iloc[0], 1.0)
         self.assertEqual(engineered['rain_hours_6h'].iloc[1], 2.0)
         self.assertTrue(np.isnan(engineered['rain_agreement'].iloc[2]))
+
+    def test_isolated_convection_requires_independent_support(self):
+        model = fc.TRUSTED_RAIN_MODEL
+        frame = pd.DataFrame({
+            f'{model}_cape_model': [100.0, 800.0, 800.0, 800.0, 2000.0, 800.0],
+            # Both CIN sign conventions represent the same inhibition strength.
+            f'{model}_convective_inhibition_model': [200.0, 50.0, 150.0, -50.0, 0.0, np.nan],
+            f'{model}_showers_model': [0.0, 0.3, 0.3, 0.0, 0.0, 0.0],
+            f'{model}_lightning_potential_model': [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            f'{model}_nbr_fwet': [0.0, 0.0, 0.0, 0.2, 0.0, 0.0],
+            'storm_wc_count': [0.0] * 6,
+        })
+        rescued = fc._convective_rescue_mask(frame, np.ones(6, dtype=bool))
+        np.testing.assert_array_equal(
+            rescued,
+            # lightning; showers+CAPE+low CIN; high-CIN rejected;
+            # neighborhood+CAPE+abs(CIN); CAPE-only and missing-CIN rejected.
+            [True, True, False, True, False, False],
+        )
+
+    def test_cin_engineering_uses_inhibition_magnitude(self):
+        frame = pd.DataFrame({
+            'datetime': pd.date_range('2026-08-01', periods=2, freq='h'),
+            'ITALIAMETEO_ICON2I_cape_model': [800.0, 800.0],
+            'ITALIAMETEO_ICON2I_convective_inhibition_model': [50.0, -150.0],
+        })
+        engineered = fc.engineer_features(frame)
+        np.testing.assert_allclose(engineered['cin_ens_mean'], [50.0, 150.0])
+        np.testing.assert_array_equal(engineered['low_cin_indicator'], [1.0, 0.0])
 
     def test_precip_label_qa_rejects_wet_only_missing_dry_data(self):
         n = 20
@@ -233,6 +263,51 @@ class ForecastCoreTests(unittest.TestCase):
             aligned['previous_run_humidity'], [48.0, 45.0, np.nan], equal_nan=True
         )
 
+    def test_onset_signal_covers_48h_and_uses_saved_threshold(self):
+        class ConstantHazard:
+            def predict_proba(self, X):
+                p = np.full(len(X), 0.15)
+                return np.column_stack([1.0 - p, p])
+
+        now = fc.local_now().floor('h')
+        frame = pd.DataFrame({
+            'datetime': pd.date_range(now, periods=52, freq='h'),
+            'precipitation_ens_mean': np.zeros(52),
+        })
+        info = fc.predict_onset_timing(frame, {
+            'model': ConstantHazard(), 'calibrator': None,
+            'features': ['dry_age'], 'declare_threshold': 0.14,
+            'band_threshold': 0.07,
+        })
+        self.assertEqual(len(info['prob_by_hour']), 48)
+        self.assertEqual(info['declare_threshold'], 0.14)
+        self.assertFalse(info['prob_by_hour'][0]['eligible'])
+        self.assertTrue(info['prob_by_hour'][2]['eligible'])
+        self.assertTrue(info['prob_by_hour'][2]['signal'])
+
+    def test_skala_only_supports_hourly_onset_in_first_two_hours(self):
+        now = fc.local_now().floor('h')
+        corrected = pd.DataFrame({
+            'datetime': pd.date_range(now, periods=3, freq='h'),
+            'rain_signal': [1.0, 1.0, 1.0],
+            'rain_signal_skala_support': [1.0, 1.0, 1.0],
+        })
+        onset = {'prob_by_hour': [
+            {'datetime': ts.isoformat(), 'lead_h': i + 1, 'eligible': True,
+             'hazard': 0.08, 'p_by_then': 0.08, 'threshold': 0.10,
+             'signal': False}
+            for i, ts in enumerate(corrected['datetime'])
+        ]}
+        attached = fc.attach_hourly_onset_signal(corrected, onset)
+        np.testing.assert_array_equal(
+            attached['rain_onset_signal'].values, [1.0, 1.0, 0.0]
+        )
+        np.testing.assert_array_equal(
+            attached['rain_onset_skala_support'].values, [1.0, 1.0, 0.0]
+        )
+        self.assertEqual(attached.iloc[0]['rain_onset_source'],
+                         'ITALIAMETEO_XGB_ONSET+SKALA')
+
     def test_shared_stack_and_blend_dispatcher(self):
         X = pd.DataFrame({'x': [0.0, 1.0]})
         frame = pd.DataFrame({'baseline': [10.0, 20.0]})
@@ -262,13 +337,36 @@ class ForecastCoreTests(unittest.TestCase):
     def test_cloud_postprocessor_is_shared_and_deterministic(self):
         frame = pd.DataFrame({
             'datetime': pd.to_datetime([
-                '2026-07-01 08:00', '2026-07-01 12:00', '2026-01-01 16:00'
+                '2026-07-01 08:00', '2026-07-01 12:00',
+                '2026-07-01 18:00', '2026-01-01 16:00'
             ]),
-            'cloud_cover_ens_mean': [20.0, 5.0, 95.0],
+            'cloud_cover_ens_mean': [20.0, 5.0, 20.0, 95.0],
         })
-        out = fc._postprocess_cloud_prediction([90.0, 90.0, 10.0], frame)
-        # Outside the seasonal windows use ensemble; inside, apply low-ensemble cap.
-        np.testing.assert_allclose(out, [20.0, 35.0, 95.0])
+        out = fc._postprocess_cloud_prediction([90.0, 90.0, 42.0, 10.0], frame)
+        # 17-18h terrain shading and weak winter sunlight fall back to the
+        # ensemble. Reliable daylight retains the ML correction and caps.
+        np.testing.assert_allclose(out, [90.0, 35.0, 20.0, 95.0])
+        legacy = fc._postprocess_cloud_prediction(
+            [90.0, 90.0, 42.0, 10.0], frame, station_target_version=1
+        )
+        # Existing un-retrained artifact falls back at all reported bad hours.
+        np.testing.assert_allclose(legacy, [90.0, 5.0, 20.0, 95.0])
+
+    def test_station_cloud_proxy_calibrates_hour_specific_shading(self):
+        times = pd.to_datetime([
+            '2024-07-01 12:00', '2024-07-02 12:00',
+            '2024-07-01 18:00', '2024-07-02 18:00',
+            '2026-07-01 12:00', '2026-07-01 18:00',
+        ])
+        # The station's clear 18h reading is only 200 W/m2, versus 800 at noon.
+        # Both held-out clear readings must map to the same near-clear sky state.
+        solar = pd.Series([800.0, 760.0, 200.0, 190.0, 780.0, 195.0])
+        fit = pd.Series([True, True, True, True, False, False])
+        cloud, envelope = fc.derive_cloud_cover_from_station_solar(
+            pd.Series(times), solar, fit_mask=fit, clear_quantile=1.0,
+            min_station_transmission=0.0,
+        )
+        np.testing.assert_allclose(cloud.iloc[-2:], [2.5, 2.5], atol=0.1)
 
     def test_quantile_tail_exceedance_decays(self):
         qdf = pd.DataFrame({
