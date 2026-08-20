@@ -13,3 +13,5 @@ trained_models_v2/api_cache/
 *.egg-info/
 dist/
 build/
+
+outlook_docs/era5_*.json
